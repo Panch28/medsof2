@@ -201,7 +201,7 @@ async function handleAuthSubmit() {
         if (isFirebaseReady()) {
             try {
                 if (!State._recaptcha) {
-                    State._recaptcha = new State._RecaptchaVerifier('recaptcha-container', { size: 'invisible' }, State._auth);
+                    State._recaptcha = new State._RecaptchaVerifier(State._auth, 'recaptcha-container', { size: 'invisible' });
                 }
                 State._confirmationResult = await State._signInWithPhoneNumber(State._auth, `+91${phone}`, State._recaptcha);
                 showToast('OTP sent', 'green');
