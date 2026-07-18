@@ -180,8 +180,7 @@ async function callGemini(imageBase64, apiKey) {
             topK: 1,
             topP: 1,
             maxOutputTokens: 8192,
-            responseMimeType: "application/json",
-            mediaResolution: "HIGH"
+            responseMimeType: "application/json"
         },
         safetySettings: [
             { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
