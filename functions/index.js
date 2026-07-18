@@ -167,8 +167,8 @@ async function callGemini(imageBase64, apiKey) {
                         text: EXTRACTION_PROMPT
                     },
                     {
-                        inline_data: {
-                            mime_type: imageBase64.mimeType,
+                        inlineData: {
+                            mimeType: imageBase64.mimeType,
                             data: imageBase64.data
                         }
                     }
@@ -181,7 +181,7 @@ async function callGemini(imageBase64, apiKey) {
             topP: 1,
             maxOutputTokens: 8192,
             responseMimeType: "application/json",
-            media_resolution: "media_resolution_high"
+            mediaResolution: "HIGH"
         },
         safetySettings: [
             { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
