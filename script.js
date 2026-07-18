@@ -82,11 +82,13 @@ async function initFirebase() {
     State._storage = storage.getStorage(State._app);
     State._functions = functions.getFunctions(State._app);
 
-    // Expose for use in other functions
+    // Store auth instance + classes needed at runtime
     State._fbAuth = auth;
     State._fbFirestore = firestore;
     State._fbStorage = storage;
     State._fbFunctions = functions;
+    State._RecaptchaVerifier = auth.RecaptchaVerifier;
+    State._signInWithPhoneNumber = auth.signInWithPhoneNumber;
 
     // Listen for auth state changes
     auth.onAuthStateChanged(State._auth, (user) => {
@@ -198,11 +200,10 @@ async function handleAuthSubmit() {
 
         if (isFirebaseReady()) {
             try {
-                const { signInWithPhoneNumber, RecaptchaVerifier } = State._fbAuth;
                 if (!State._recaptcha) {
-                    State._recaptcha = new RecaptchaVerifier('recaptcha-container', { size: 'invisible' }, State._auth);
+                    State._recaptcha = new State._RecaptchaVerifier('recaptcha-container', { size: 'invisible' }, State._auth);
                 }
-                State._confirmationResult = await signInWithPhoneNumber(State._auth, `+91${phone}`, State._recaptcha);
+                State._confirmationResult = await State._signInWithPhoneNumber(State._auth, `+91${phone}`, State._recaptcha);
                 showToast('OTP sent', 'green');
             } catch (e) {
                 console.error('[RxExpiry] OTP send error:', e);
