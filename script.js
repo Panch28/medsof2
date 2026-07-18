@@ -515,15 +515,16 @@ async function sendToExtractInvoice() {
 
         } catch (e) {
             console.error('[RxExpiry] Extraction failed:', e);
-            showToast('Cloud extraction failed — trying client-side fallback', 'amber');
+            closeReviewPanel();
+            showToast('Cloud extraction failed: ' + (e.message || 'Unknown error'), 'red');
+            failPrecheck('Extraction failed. Please check your connection and try again.');
+            return;
         }
-    }
-
-    // ── FALLBACK: Client-side Tesseract OCR (if Firebase not available) ──
-    if (!result) {
-        showToast('Running local OCR...', 'amber');
-        await new Promise(r => setTimeout(r, 1500));
-        result = getDemoExtraction();
+    } else {
+        closeReviewPanel();
+        showToast('Firebase not configured — cannot extract invoice', 'red');
+        failPrecheck('Extraction service unavailable. Please ensure Firebase is set up.');
+        return;
     }
 
     // ── Step 6: Check captureQuality.readable ──
@@ -538,42 +539,6 @@ async function sendToExtractInvoice() {
     State.extractedData = result;
     renderReviewPanel(result);
     showToast('Extraction complete — verify below', 'green');
-}
-
-function getDemoExtraction() {
-    const dists = ['Medico Pharma', 'HealthLine Dist.', 'Wellness Rx', 'Apollo Pharmacy Dist.'];
-    const meds = [
-        { name:'Azithral 500mg Tablet', batch:'AZ2214', expiry:'03/2026', qty:20, free:2, price:85.50, gst:12 },
-        { name:'Paracetamol 650mg Tab', batch:'PCM1188', expiry:'09/2025', qty:50, free:5, price:12.00, gst:12 },
-        { name:'Amoxicillin 250mg Cap', batch:'AMX5501', expiry:'02/2026', qty:30, free:3, price:45.00, gst:12 },
-        { name:'Pan-D Pantoprazole Tab', batch:'PAN9933', expiry:'11/2025', qty:40, free:4, price:120.00, gst:12 },
-        { name:'Montair LC 10mg Tab', batch:'MNL4421', expiry:'01/2026', qty:25, free:2, price:195.00, gst:12 },
-        { name:'Dolo 650mg Tablet', batch:'DLO8899', expiry:'12/2025', qty:100, free:10, price:30.00, gst:12 },
-    ];
-
-    const dist = dists[Math.floor(Math.random()*dists.length)];
-    const picked = meds.slice(0, 3+Math.floor(Math.random()*3));
-    let total = 0;
-    const lineItems = picked.map(m => {
-        const net = m.qty * m.price;
-        const gstAmt = +(net * m.gst / 100).toFixed(2);
-        total += net + gstAmt;
-        return {
-            medicineName: m.name, batchNumber: m.batch, expiryDate: m.expiry,
-            quantityBilled: m.qty, quantityFree: m.free, unitPrice: m.price,
-            netValue: +net.toFixed(2), gstRate: m.gst, gstValue: gstAmt,
-            confidence: +(0.75 + Math.random()*0.25).toFixed(2)
-        };
-    });
-
-    return {
-        distributor: dist,
-        invoiceNumber: `INV-${Date.now().toString(36).toUpperCase()}`,
-        invoiceTotal: +total.toFixed(2),
-        lineItems,
-        captureQuality: { readable: true, issues: [], missingPage: false },
-        source: 'demo'
-    };
 }
 
 // ═══════════════════════════════════════════════════════════════════

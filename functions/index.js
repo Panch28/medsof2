@@ -26,7 +26,7 @@ initializeApp();
 // Set the secret with:  firebase functions:secrets:set GEMINI_API_KEY
 // Never paste the API key into this file.
 const GEMINI_KEY = defineSecret("GEMINI_API_KEY");
-const GEMINI_MODEL = "gemini-3-flash-preview";
+const GEMINI_MODEL = "gemini-2.5-flash";
 
 // ─── Extraction Prompt for Gemini ──────────────────────────────────
 const EXTRACTION_PROMPT = `You are an OCR extraction engine for Indian pharmacy invoices.
