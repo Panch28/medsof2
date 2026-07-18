@@ -75,7 +75,6 @@ exports.extractInvoice = onCall(
         region: "us-central1",
         memory: "512MB",
         timeoutSeconds: 60,
-        cors: true,
         secrets: [GEMINI_KEY]  // Injected at runtime from Firebase Secrets
     },
     async (request) => {
