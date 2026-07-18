@@ -180,7 +180,8 @@ async function callGemini(imageBase64, apiKey) {
             topK: 1,
             topP: 1,
             maxOutputTokens: 8192,
-            responseMimeType: "application/json"
+            responseMimeType: "application/json",
+            media_resolution: "media_resolution_high"
         },
         safetySettings: [
             { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
@@ -198,14 +199,21 @@ async function callGemini(imageBase64, apiKey) {
 
     if (!response.ok) {
         const errorBody = await response.text();
+        logger.error(`[extractInvoice] Gemini API error ${response.status}:`, errorBody.substring(0, 500));
         throw new Error(`Gemini API error ${response.status}: ${errorBody.substring(0, 200)}`);
     }
 
     const result = await response.json();
+    logger.info("[extractInvoice] Gemini raw response:", JSON.stringify(result).substring(0, 1000));
 
     // Extract text from Gemini response
     const text = result?.candidates?.[0]?.content?.parts?.[0]?.text;
-    if (!text) throw new Error("Gemini returned empty response");
+    if (!text) {
+        const finishReason = result?.candidates?.[0]?.finishReason;
+        const blockReason = result?.promptFeedback?.blockReason;
+        logger.error("[extractInvoice] Empty response:", { finishReason, blockReason, fullResponse: JSON.stringify(result).substring(0, 500) });
+        throw new Error(`Gemini returned empty response (finishReason=${finishReason}, blockReason=${blockReason})`);
+    }
 
     return text;
 }
