@@ -1,0 +1,16 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // ─── Temp uploads: accessible by authenticated users, auto-cleanup after 30 days ───
+    match /temp/{fileId} {
+      allow read: if request.auth != null;
+      allow write: if request.auth != null
+                   && request.resource.size < 20 * 1024 * 1024  // 20MB limit
+                   && request.resource.contentType.matches('image/.*|application/pdf');
+    }
+
+    // ─── No permanent file storage — all confirmed data goes to Firestore ───
+    // Raw files are deleted after save (step 8 in flow)
+  }
+}
