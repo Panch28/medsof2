@@ -26,7 +26,7 @@ initializeApp();
 // Set the secret with:  firebase functions:secrets:set GEMINI_API_KEY
 // Never paste the API key into this file.
 const GEMINI_KEY = defineSecret("GEMINI_API_KEY");
-const GEMINI_MODEL = "gemini-3-flash-preview";
+const GEMINI_MODEL = "gemini-3.1-flash-lite";
 
 // ─── Extraction Prompt for Gemini ──────────────────────────────────
 const EXTRACTION_PROMPT = `You are an OCR extraction engine for Indian pharmacy invoices.
@@ -96,6 +96,7 @@ exports.extractInvoice = onCall(
             const imageBase64 = await downloadAndEncodeImage(fileUrl);
 
             // Step 2: Send to Gemini 3 Flash Preview (passing secret key at runtime)
+            console.log("BASE64 LENGTH:", imageBase64.data.length);
             const geminiResponse = await callGemini(imageBase64, geminiApiKey);
 
             // Step 3: Parse and validate the response
