@@ -37,6 +37,9 @@ Given this invoice image, extract ALL information and return ONLY a valid JSON o
   "distributor": "string — distributor/supplier name from invoice header",
   "invoiceNumber": "string — invoice/bill number",
   "invoiceTotal": "number — grand total amount declared on invoice",
+  "schemeDiscount": "number — total scheme/discount amount shown in invoice footer/summary (0 if not present)",
+  "cashDiscount": "number — cash discount amount shown separately in invoice footer/summary, distinct from scheme discount (0 if not present)",
+  "roundOff": "number — round off amount shown in invoice footer/summary (can be positive or negative, 0 if not present)",
   "lineItems": [
     {
       "medicineName": "string — full medicine/product name",
@@ -44,10 +47,11 @@ Given this invoice image, extract ALL information and return ONLY a valid JSON o
       "expiryDate": "string — expiry date in DD/MM/YYYY or MM/YYYY format",
       "quantityBilled": "number — quantity billed/purchased",
       "quantityFree": "number — free/complimentary pieces (0 if none)",
-      "unitPrice": "number — price per unit before tax",
-      "netValue": "number — taxable net value (qty × unitPrice)",
+      "tradePrice": "number — the Trade Price (per unit price before C.D.% discount) as printed on the invoice",
+      "cdPercent": "number — the C.D.% (cash discount percentage) column value for this line (0 if not present)",
+      "netValue": "number — Taxable Value for this line, computed as: tradePrice × quantityBilled × (1 - cdPercent/100)",
       "gstRate": "number — GST percentage (5, 12, 18, or 28)",
-      "gstValue": "number — GST amount for this line",
+      "gstValue": "number — GST amount for this line, computed as: netValue × gstRate / 100",
       "confidence": "number between 0 and 1 — how confident you are in this line's accuracy"
     }
   ],
@@ -62,7 +66,11 @@ Rules:
 - Extract EVERY line item visible on the invoice, even if partially visible
 - For confidence: 1.0 = perfectly clear, 0.9 = very clear, 0.8 = readable with minor doubt, 0.7 = partially readable, below 0.7 = uncertain
 - If a field is not visible, use null for strings and 0 for numbers
-- netValue should equal quantityBilled × unitPrice
+- CRITICAL — for EVERY line item, you MUST read both the Trade Price column AND the C.D.% column from the invoice table:
+  1. Read "tradePrice" = the per-unit Trade Price printed in that row
+  2. Read "cdPercent" = the C.D.% (cash discount percentage) printed in that row (often 4% or similar; if no C.D.% column exists on the invoice, use 0)
+  3. Calculate netValue = tradePrice × quantityBilled × (1 - cdPercent/100)
+  This formula MUST be applied to EVERY row without exception — do NOT use the printed "Unit Price" or "Taxable Value" columns directly, compute netValue yourself using the formula above to ensure consistency.
 - gstValue should equal netValue × gstRate / 100
 - invoiceTotal should be the grand total shown on the invoice
 - For captureQuality.readable: false if more than 30% of the invoice is unreadable`;
@@ -246,6 +254,9 @@ function parseGeminiResponse(text) {
         distributor: parsed.distributor || "",
         invoiceNumber: parsed.invoiceNumber || "",
         invoiceTotal: Number(parsed.invoiceTotal) || 0,
+        schemeDiscount: Number(parsed.schemeDiscount) || 0,
+        cashDiscount: Number(parsed.cashDiscount) || 0,
+        roundOff: Number(parsed.roundOff) || 0,
         lineItems: [],
         captureQuality: {
             readable: parsed.captureQuality?.readable !== false,
@@ -262,7 +273,8 @@ function parseGeminiResponse(text) {
             expiryDate: String(item.expiryDate || "").trim(),
             quantityBilled: Math.max(0, parseInt(item.quantityBilled) || 0),
             quantityFree: Math.max(0, parseInt(item.quantityFree) || 0),
-            unitPrice: Math.max(0, parseFloat(item.unitPrice) || 0),
+            tradePrice: Math.max(0, parseFloat(item.tradePrice) || 0),
+            cdPercent: Math.max(0, parseFloat(item.cdPercent) || 0),
             netValue: Math.max(0, parseFloat(item.netValue) || 0),
             gstRate: [5, 12, 18, 28].includes(Number(item.gstRate)) ? Number(item.gstRate) : 12,
             gstValue: Math.max(0, parseFloat(item.gstValue) || 0),
@@ -270,10 +282,11 @@ function parseGeminiResponse(text) {
         }));
     }
 
-    // Recompute netValue and gstValue if needed
+    // Recompute netValue using tradePrice × qty × (1 - cdPercent/100), then gstValue from netValue
     result.lineItems.forEach(item => {
-        if (item.unitPrice > 0 && item.quantityBilled > 0) {
-            const expectedNet = +(item.unitPrice * item.quantityBilled).toFixed(2);
+        if (item.tradePrice > 0 && item.quantityBilled > 0) {
+            const cdMultiplier = 1 - (item.cdPercent / 100);
+            const expectedNet = +(item.tradePrice * item.quantityBilled * cdMultiplier).toFixed(2);
             if (Math.abs(item.netValue - expectedNet) > 1) {
                 item.netValue = expectedNet;
             }

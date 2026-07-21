@@ -46,6 +46,10 @@ function isFirebaseReady() {
     return State._auth && State._db && State._storage && State._functions;
 }
 
+function isUserAuthenticated() {
+    return isFirebaseReady() && !!State._auth.currentUser;
+}
+
 // ─── Bootstrap ─────────────────────────────────────────────────────
 document.addEventListener('DOMContentLoaded', async () => {
     // Try to init Firebase
@@ -96,6 +100,29 @@ async function initFirebase() {
             console.log('[RxExpiry] Auth state:', user.phoneNumber);
         }
     });
+}
+
+async function fetchFirestoreData() {
+    if (!isUserAuthenticated()) return;
+    try {
+        const { collection, getDocs } = State._fbFirestore;
+        const pharmacyId = State.pharmacyId;
+        const medsSnap = await getDocs(collection(State._db, `pharmacies/${pharmacyId}/medicines`));
+        State.medicines = [];
+        medsSnap.forEach(doc => {
+            State.medicines.push({ id: doc.id, ...doc.data() });
+        });
+        const invoicesSnap = await getDocs(collection(State._db, `pharmacies/${pharmacyId}/invoices`));
+        State.invoices = [];
+        invoicesSnap.forEach(doc => {
+            State.invoices.push({ id: doc.id, ...doc.data() });
+        });
+        renderExpiringList();
+        updateStats();
+        console.log(`[RxExpiry] Loaded ${State.medicines.length} medicines, ${State.invoices.length} invoices from Firestore`);
+    } catch (e) {
+        console.error('[RxExpiry] Firestore fetch failed:', e);
+    }
 }
 
 function loadDemoData() {
@@ -251,17 +278,21 @@ async function handleAuthSubmit() {
     }
 }
 
-function loginSuccess() {
+async function loginSuccess() {
+    if (isFirebaseReady() && !State._auth.currentUser) {
+        try { await State._fbAuth.signInAnonymously(State._auth); } catch (e) { console.warn('[RxExpiry] Anonymous auth failed:', e); }
+    }
     State.user = {
         phone: $('#auth-phone').value,
         role: State.role,
         pharmacyId: State.pharmacyId,
-        uid: isFirebaseReady() ? State._auth.currentUser?.uid : 'demo-user'
+        uid: isFirebaseReady() && State._auth.currentUser ? State._auth.currentUser.uid : 'demo-user'
     };
     $('#header-pharmacy-name').textContent = getPharmacyLabel(State.pharmacyId);
     $('#header-user-status').textContent = State.role === 'owner' ? 'Owner Mode' : 'Staff Mode';
     showView('view-home');
-    showToast(`Welcome! (${isFirebaseReady() ? 'Live' : 'Demo'} mode)`, 'green');
+    showToast(`Welcome! (${isUserAuthenticated() ? 'Live' : 'Demo'} mode)`, 'green');
+    await fetchFirestoreData();
 }
 
 async function handleLogout() {
@@ -597,8 +628,8 @@ function renderReviewPanel(data) {
             </div>
             <div class="grid grid-cols-3 gap-2 text-[10px]">
                 <div class="space-y-0.5">
-                    <label class="text-slate-500 font-bold">Unit ₹</label>
-                    <input type="number" step="0.01" value="${item.unitPrice}" data-field="unitPrice" data-idx="${i}" min="0"
+                    <label class="text-slate-500 font-bold">Trade ₹ (C.D. ${item.cdPercent||0}%)</label>
+                    <input type="number" step="0.01" value="${item.tradePrice}" data-field="tradePrice" data-idx="${i}" min="0"
                         class="w-full bg-slate-900/60 border border-slate-700 rounded px-2 py-1 font-mono text-slate-200 focus:outline-none focus:border-indigo-500 line-total-input">
                 </div>
                 <div class="space-y-0.5">
@@ -621,6 +652,9 @@ function renderReviewPanel(data) {
 
     container.querySelectorAll('.line-total-input').forEach(inp => inp.addEventListener('input', () => window.triggerRecalculate()));
     $('#review-declared-total-input').value = data.invoiceTotal || 0;
+    $('#review-scheme-discount-input').value = data.schemeDiscount || 0;
+    $('#review-cash-discount-input').value = data.cashDiscount || 0;
+    $('#review-roundoff-input').value = data.roundOff || 0;
     window.triggerRecalculate();
 }
 
@@ -635,9 +669,23 @@ window.triggerRecalculate = function () {
         }
     });
 
+    // Recompute netValue from tradePrice × qty × (1 - cdPercent/100) if tradePrice or cdPercent changed
+    data.lineItems.forEach(m => {
+        if (m.tradePrice > 0 && m.quantityBilled > 0) {
+            const cdMultiplier = 1 - ((m.cdPercent || 0) / 100);
+            m.netValue = +(m.tradePrice * m.quantityBilled * cdMultiplier).toFixed(2);
+        }
+        if (m.netValue > 0 && m.gstRate > 0) {
+            m.gstValue = +(m.netValue * m.gstRate / 100).toFixed(2);
+        }
+    });
+
     let sumNet = 0, sumGst = 0;
     data.lineItems.forEach(m => { sumNet += +m.netValue||0; sumGst += +m.gstValue||0; });
-    const computed = sumNet + sumGst;
+    const schemeDiscount = parseFloat($('#review-scheme-discount-input')?.value) || 0;
+    const cashDiscount = parseFloat($('#review-cash-discount-input')?.value) || 0;
+    const roundOff = parseFloat($('#review-roundoff-input')?.value) || 0;
+    const computed = sumNet + sumGst - schemeDiscount + roundOff;
     const declared = parseFloat($('#review-declared-total-input').value) || 0;
 
     $('#review-subtotal-val').textContent = `₹${sumNet.toFixed(2)}`;
@@ -658,7 +706,7 @@ window.triggerRecalculate = function () {
     } else {
         badge.textContent = `Mismatch ₹${diff.toFixed(2)}`; badge.className = 'px-2 py-0.5 text-[9px] rounded font-bold uppercase tracking-wider bg-rose-500/15 text-rose-400 border border-rose-500/30';
         warn.classList.remove('hidden');
-        warn.innerHTML = `<span class="font-bold">Totals don't match!</span> Computed ₹${computed.toFixed(2)} vs Declared ₹${declared.toFixed(2)} (diff ₹${diff.toFixed(2)}).`;
+        warn.innerHTML = `<span class="font-bold">Totals don't match!</span> Computed ₹${computed.toFixed(2)} (Net + GST − Discount + Rounding) vs Declared ₹${declared.toFixed(2)} (diff ₹${diff.toFixed(2)}).`;
         ack.classList.remove('hidden'); ack.classList.add('flex');
     }
 };
@@ -679,7 +727,7 @@ async function saveConfirmedInvoice() {
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner spinner-white inline-block"></span> Saving...';
 
-    if (isFirebaseReady()) {
+    if (isUserAuthenticated()) {
         try {
             const { collection, addDoc, serverTimestamp } = State._fbFirestore;
             const { ref: storageRef, deleteObject } = State._fbStorage;
@@ -706,7 +754,9 @@ async function saveConfirmedInvoice() {
                     quantityBilled: parseInt(item.quantityBilled) || 0,
                     quantityFree: parseInt(item.quantityFree) || 0,
                     remainingQty: parseInt(item.quantityBilled) || 0,
-                    unitPrice: parseFloat(item.unitPrice) || 0,
+                    tradePrice: parseFloat(item.tradePrice) || 0,
+                    cdPercent: parseFloat(item.cdPercent) || 0,
+                    unitPrice: parseFloat(item.tradePrice) || 0,
                     netValue: parseFloat(item.netValue) || 0,
                     gstRate: parseFloat(item.gstRate) || 0,
                     gstValue: parseFloat(item.gstValue) || 0,
@@ -808,8 +858,9 @@ function parseExp(str) {
     if (!str) return null;
     const sep = str.includes('/') ? '/' : '-';
     const p = str.split(sep).map(Number);
-    if (p.length!==3) return null;
-    return p[0]>1900 ? new Date(p[0],p[1]-1,p[2]) : new Date(p[2]>1900?p[2]:2000+p[2],p[1]-1,p[0]);
+    if (p.length === 3) return p[0] > 1900 ? new Date(p[0], p[1]-1, p[2]) : new Date(p[2] > 1900 ? p[2] : 2000+p[2], p[1]-1, p[0]);
+    if (p.length === 2) return new Date(p[1] > 1900 ? p[1] : 2000+p[1], p[0]-1, 1);
+    return null;
 }
 
 // ═══════════════════════════════════════════════════════════════════
