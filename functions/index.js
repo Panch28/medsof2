@@ -110,6 +110,10 @@ exports.extractInvoice = onCall(
             // Step 3: Parse and validate the response
             const extracted = parseGeminiResponse(geminiResponse);
 
+            // Log full line items for debugging
+            console.log("[EXTRACTED LINE ITEMS]:", JSON.stringify(extracted.lineItems, null, 2));
+            console.log("[EXTRACTED TOTALS]:", JSON.stringify({ invoiceTotal: extracted.invoiceTotal, schemeDiscount: extracted.schemeDiscount, cashDiscount: extracted.cashDiscount, roundOff: extracted.roundOff }));
+
             // Step 4: Add metadata
             extracted.fileId = fileId;
             extracted.pharmacyId = pharmacyId;
@@ -340,5 +344,59 @@ exports.cleanupTempFiles = onSchedule(
 
         logger.info(`[cleanupTempFiles] Cleanup complete: ${deletedCount} files deleted`);
         return { deletedCount };
+    }
+);
+
+// ═══════════════════════════════════════════════════════════════════
+// testFirestoreWrite — diagnostic: test write via Admin SDK
+// ═══════════════════════════════════════════════════════════════════
+exports.testFirestoreWrite = onCall(
+    {
+        region: "us-central1",
+        memory: "256MB",
+        timeoutSeconds: 30
+    },
+    async (request) => {
+        const { getFirestore } = require("firebase-admin/firestore");
+        const db = getFirestore();
+        const results = {};
+
+        // Test 1: Admin SDK write (bypasses security rules)
+        try {
+            const testRef = db.collection("diagnostics").doc("admin-test");
+            await testRef.set({ test: true, source: "admin-sdk", timestamp: new Date().toISOString() });
+            const snap = await testRef.get();
+            results.adminWrite = { success: true, data: snap.data() };
+            logger.info("[testFirestoreWrite] Admin SDK write succeeded");
+        } catch (e) {
+            results.adminWrite = { success: false, error: e.message };
+            logger.error("[testFirestoreWrite] Admin SDK write failed:", e.message);
+        }
+
+        // Test 2: Check auth context of the caller
+        results.callerAuth = {
+            uid: request.auth?.uid || null,
+            phone: request.auth?.token?.phone_number || null,
+            isAnonymous: request.auth?.token?.firebase?.sign_in_provider === "anonymous",
+            tokenClaims: request.auth?.token ? Object.keys(request.auth.token) : []
+        };
+
+        // Test 3: Try client-context Firestore write using caller's token
+        try {
+            const testRef = db.collection("diagnostics").doc("client-context-test");
+            await testRef.set({
+                test: true,
+                source: "client-context",
+                callerUid: request.auth?.uid,
+                timestamp: new Date().toISOString()
+            });
+            results.clientContextWrite = { success: true };
+            logger.info("[testFirestoreWrite] Client context write succeeded");
+        } catch (e) {
+            results.clientContextWrite = { success: false, error: e.message };
+            logger.error("[testFirestoreWrite] Client context write failed:", e.message);
+        }
+
+        return results;
     }
 );

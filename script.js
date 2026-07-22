@@ -125,6 +125,33 @@ async function fetchFirestoreData() {
     }
 }
 
+// ─── Diagnostic: test Firestore write from console ─────────────
+window.testFirestoreWrite = async function() {
+    console.log('[TEST] Auth state:', State._auth.currentUser?.uid, 'isAnonymous:', State._auth.currentUser?.isAnonymous);
+    console.log('[TEST] Firebase ready:', !!isFirebaseReady());
+
+    // Test A: Direct client SDK write
+    try {
+        const { doc, setDoc, getDoc } = State._fbFirestore;
+        const testRef = doc(State._db, 'pharmacies/city-pharma/diagnostics/test-write');
+        await setDoc(testRef, { test: true, source: 'client-sdk', timestamp: new Date().toISOString() });
+        const snap = await getDoc(testRef);
+        console.log('[TEST-A] Client SDK write SUCCEEDED:', snap.data());
+    } catch (e) {
+        console.error('[TEST-A] Client SDK write FAILED:', e.code, e.message);
+    }
+
+    // Test B: Cloud Function (Admin SDK) write
+    try {
+        const { httpsCallable } = State._fbFunctions;
+        const fn = httpsCallable(State._functions, 'testFirestoreWrite');
+        const result = await fn({});
+        console.log('[TEST-B] Cloud Function result:', JSON.stringify(result.data, null, 2));
+    } catch (e) {
+        console.error('[TEST-B] Cloud Function FAILED:', e.code, e.message);
+    }
+};
+
 function loadDemoData() {
     State.medicines = getDemoMedicines();
     State.distributors = getDemoDistributors();
@@ -280,7 +307,12 @@ async function handleAuthSubmit() {
 
 async function loginSuccess() {
     if (isFirebaseReady() && !State._auth.currentUser) {
-        try { await State._fbAuth.signInAnonymously(State._auth); } catch (e) { console.warn('[RxExpiry] Anonymous auth failed:', e); }
+        try {
+            const cred = await State._fbAuth.signInAnonymously(State._auth);
+            console.log('[RxExpiry] Anonymous auth OK, uid:', cred.user?.uid);
+        } catch (e) {
+            console.warn('[RxExpiry] Anonymous auth failed:', e.code, e.message);
+        }
     }
     State.user = {
         phone: $('#auth-phone').value,
@@ -288,6 +320,31 @@ async function loginSuccess() {
         pharmacyId: State.pharmacyId,
         uid: isFirebaseReady() && State._auth.currentUser ? State._auth.currentUser.uid : 'demo-user'
     };
+    console.log('[RxExpiry] Login success — authenticated:', isUserAuthenticated(), 'uid:', State.user.uid);
+
+    // Ensure staff record exists so isStaff() in Firestore rules passes
+    if (isUserAuthenticated()) {
+        try {
+            const { doc, setDoc, getDoc, serverTimestamp } = State._fbFirestore;
+            const staffRef = doc(State._db, `pharmacies/${State.pharmacyId}/staff/${State.user.uid}`);
+            const staffSnap = await getDoc(staffRef);
+            if (!staffSnap.exists()) {
+                await setDoc(staffRef, {
+                    uid: State.user.uid,
+                    phone: State.user.phone,
+                    role: State.user.role,
+                    pharmacyId: State.pharmacyId,
+                    createdAt: serverTimestamp()
+                });
+                console.log('[RxExpiry] Created staff record for uid:', State.user.uid, 'at pharmacies/' + State.pharmacyId);
+            } else {
+                console.log('[RxExpiry] Staff record exists for uid:', State.user.uid);
+            }
+        } catch (e) {
+            console.warn('[RxExpiry] Staff record check/create failed:', e.code, e.message);
+        }
+    }
+
     $('#header-pharmacy-name').textContent = getPharmacyLabel(State.pharmacyId);
     $('#header-user-status').textContent = State.role === 'owner' ? 'Owner Mode' : 'Staff Mode';
     showView('view-home');
@@ -727,13 +784,31 @@ async function saveConfirmedInvoice() {
     btn.disabled = true;
     btn.innerHTML = '<span class="spinner spinner-white inline-block"></span> Saving...';
 
+    // Diagnostic: confirm auth state before attempting write
+    const authReady = isFirebaseReady();
+    const authUser = authReady ? State._auth.currentUser : null;
+    console.log('[RxExpiry] Save auth check:', {
+        firebaseReady: authReady,
+        currentUser: authUser ? { uid: authUser.uid, isAnonymous: authUser.isAnonymous, phoneNumber: authUser.phoneNumber } : null,
+        isUserAuthenticated: isUserAuthenticated()
+    });
+
+    if (!authReady || !authUser) {
+        console.warn('[RxExpiry] Not authenticated — falling back to demo save');
+        showToast('Not authenticated — saving locally', 'amber');
+    }
+
     if (isUserAuthenticated()) {
         try {
             const { collection, addDoc, serverTimestamp } = State._fbFirestore;
             const { ref: storageRef, deleteObject } = State._fbStorage;
             const pharmacyId = State.pharmacyId;
 
-            // Write invoice document
+            console.log('[RxExpiry] DIAGNOSTIC pharmacyId:', JSON.stringify(pharmacyId), 'type:', typeof pharmacyId);
+            console.log('[RxExpiry] DIAGNOSTIC State keys:', Object.keys(State).join(', '));
+            console.log('[RxExpiry] DIAGNOSTIC full path:', `pharmacies/${pharmacyId}/invoices`);
+            console.log('[RxExpiry] Auth UID:', State._auth.currentUser?.uid, 'Phone:', State._auth.currentUser?.phoneNumber);
+
             const invoiceRef = await addDoc(collection(State._db, `pharmacies/${pharmacyId}/invoices`), {
                 distributor: data.distributor || '',
                 invoiceNumber: data.invoiceNumber || '',
@@ -743,6 +818,8 @@ async function saveConfirmedInvoice() {
                 confirmedBy: State.user?.phone || 'unknown',
                 source: data.source || 'cloud-function'
             });
+
+            console.log('[RxExpiry] Invoice written:', invoiceRef.id, '- now writing', data.lineItems.length, 'medicines');
 
             // Write each line item to medicines collection
             for (const item of data.lineItems) {
@@ -779,7 +856,8 @@ async function saveConfirmedInvoice() {
 
         } catch (e) {
             console.error('[RxExpiry] Save error:', e);
-            showToast('Firestore save failed', 'red');
+            console.error('[RxExpiry] Save error code:', e.code, 'message:', e.message, 'details:', e.details);
+            showToast('Firestore save failed: ' + (e.message || e.code || 'Unknown error'), 'red');
             btn.disabled = false;
             btn.textContent = 'Confirm & Save';
             return;
