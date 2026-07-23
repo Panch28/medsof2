@@ -442,6 +442,31 @@ exports.saveInvoice = onCall(
 );
 
 // ═══════════════════════════════════════════════════════════════════
+// deleteMedicine — remove a medicine document via Admin SDK
+// ═══════════════════════════════════════════════════════════════════
+exports.deleteMedicine = onCall(
+    {
+        region: "us-central1",
+        memory: "256MB",
+        timeoutSeconds: 30
+    },
+    async (request) => {
+        if (!request.auth) {
+            throw new HttpsError("unauthenticated", "User must be signed in");
+        }
+        const { pharmacyId, medicineId } = request.data;
+        if (!pharmacyId || !medicineId) {
+            throw new HttpsError("invalid-argument", "pharmacyId and medicineId are required");
+        }
+        const { getFirestore } = require("firebase-admin/firestore");
+        const db = getFirestore();
+        await db.collection("pharmacies").doc(pharmacyId).collection("medicines").doc(medicineId).delete();
+        logger.info(`[deleteMedicine] Deleted ${medicineId} from ${pharmacyId}`);
+        return { success: true };
+    }
+);
+
+// ═══════════════════════════════════════════════════════════════════
 // testFirestoreWrite — diagnostic: test write via Admin SDK
 // ═══════════════════════════════════════════════════════════════════
 exports.testFirestoreWrite = onCall(

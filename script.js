@@ -1069,9 +1069,33 @@ function renderExpiringList() {
                 <p class="text-[10px] text-slate-400 font-mono">Batch: ${esc(m.batchNumber||'N/A')} · ${m.remainingQty||0} pkts · ${esc(m.distributor||'')}</p>
             </div>
             <span class="px-2 py-1 text-[9px] rounded font-bold shrink-0 ${cls}">${txt}</span>
+            <button onclick="deleteMedicine('${m.id}','${esc(m.medicineName)}')" class="shrink-0 p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 transition-all" title="Remove">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+            </button>
         </div>`;
     }).join('');
 }
+
+window.deleteMedicine = async function(id, name) {
+    if (!confirm(`Remove "${name}"? This can't be undone.`)) return;
+
+    if (isUserAuthenticated()) {
+        try {
+            const { httpsCallable } = State._fbFunctions;
+            const fn = httpsCallable(State._functions, 'deleteMedicine');
+            await fn({ pharmacyId: State.pharmacyId, medicineId: id });
+        } catch (e) {
+            console.error('[RxExpiry] Delete failed:', e);
+            showToast('Delete failed: ' + e.message, 'red');
+            return;
+        }
+    }
+
+    State.medicines = State.medicines.filter(m => m.id !== id);
+    renderExpiringList();
+    updateStats();
+    showToast(`Removed "${name}"`, 'green');
+};
 
 function updateStats() {
     const cut = new Date(Date.now() + 90*86400000);
@@ -1210,22 +1234,75 @@ async function saveManualBatch() {
 // ═══════════════════════════════════════════════════════════════════
 function renderDistributors() {
     const list = $('#distributors-list');
-    if (!State.distributors.length) { list.innerHTML='<div class="text-center py-8 text-xs text-slate-500">No distributors.</div>'; return; }
-    list.innerHTML = State.distributors.map(d => `
-        <div class="distributor-card bg-slate-800/60 border border-slate-700/50 rounded-xl p-4 space-y-2">
-            <div class="flex justify-between items-start">
-                <div>
-                    <h4 class="font-heading font-bold text-slate-100 text-sm">${esc(d.name)}</h4>
-                    <p class="text-[10px] text-slate-400">Contact: ${esc(d.contact||'N/A')}</p>
+    
+    // Build distributor map from medicines
+    const distMap = {};
+    State.medicines.forEach(m => {
+        const name = m.distributor || 'Unknown';
+        if (!distMap[name]) distMap[name] = { name, medicines: [], invoices: new Set() };
+        distMap[name].medicines.push(m);
+    });
+    // Count invoices per distributor
+    State.invoices.forEach(inv => {
+        const name = inv.distributor || 'Unknown';
+        if (distMap[name]) distMap[name].invoices.add(inv.id);
+    });
+
+    const dists = Object.values(distMap).sort((a, b) => b.medicines.length - a.medicines.length);
+    if (!dists.length) { list.innerHTML = '<div class="text-center py-8 text-xs text-slate-500">No distributors yet. Save an invoice to populate.</div>'; return; }
+
+    list.innerHTML = dists.map((d, i) => {
+        const invCount = d.invoices.size;
+        const medCount = d.medicines.length;
+        const now = Date.now();
+        const cut90 = new Date(now + 90 * 86400000);
+        const expiring = d.medicines.filter(m => { const e = parseExp(m.expiryDate); return e && e <= cut90; }).length;
+        return `<div class="distributor-card bg-slate-800/60 border border-slate-700/50 rounded-xl overflow-hidden">
+            <button onclick="toggleDistributor(${i})" class="w-full p-3 flex items-center justify-between gap-3 text-left hover:bg-slate-800/40 transition-colors">
+                <div class="flex-1 min-w-0">
+                    <h4 class="font-heading font-bold text-slate-100 text-xs">${esc(d.name)}</h4>
+                    <p class="text-[10px] text-slate-400">${medCount} medicine${medCount !== 1 ? 's' : ''} · ${invCount} invoice${invCount !== 1 ? 's' : ''}${expiring ? ` · <span class="text-amber-400">${expiring} expiring</span>` : ''}</p>
                 </div>
-                <span class="px-2 py-0.5 text-[9px] rounded font-bold bg-indigo-500/15 text-indigo-400 border border-indigo-500/30">${d.returnWindow||30}d return</span>
+                <svg id="dist-chevron-${i}" class="w-4 h-4 text-slate-500 transition-transform duration-200 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
+            </button>
+            <div id="dist-expand-${i}" class="hidden border-t border-slate-700/50 max-h-64 overflow-y-auto">
+                ${d.medicines.map(m => {
+                    const exp = parseExp(m.expiryDate);
+                    const days = exp ? Math.ceil((exp - now) / 86400000) : null;
+                    let badge = '';
+                    if (days !== null) {
+                        if (days <= 0) badge = '<span class="text-[8px] px-1.5 py-0.5 rounded font-bold bg-rose-500/20 text-rose-400">EXPIRED</span>';
+                        else if (days <= 30) badge = `<span class="text-[8px] px-1.5 py-0.5 rounded font-bold bg-amber-500/20 text-amber-400">${days}d</span>`;
+                        else badge = `<span class="text-[8px] px-1.5 py-0.5 rounded font-bold bg-emerald-500/20 text-emerald-400">${days}d</span>`;
+                    }
+                    return `<div class="px-3 py-2 border-b border-slate-800/50 last:border-0 flex items-center justify-between gap-2">
+                        <div class="min-w-0">
+                            <p class="text-[10px] font-bold text-slate-200 truncate">${esc(m.medicineName)}</p>
+                            <p class="text-[9px] text-slate-500 font-mono">Batch: ${esc(m.batchNumber||'N/A')} · Qty: ${m.remainingQty||0} · Exp: ${esc(m.expiryDate||'N/A')}</p>
+                        </div>
+                        ${badge}
+                    </div>`;
+                }).join('')}
             </div>
-            <div class="grid grid-cols-2 gap-2 text-[10px]">
-                <div class="bg-slate-900/50 p-2 rounded text-center"><span class="text-slate-500 block">Invoices</span><span class="font-bold text-slate-200">${d.totalInvoices||0}</span></div>
-                <div class="bg-slate-900/50 p-2 rounded text-center"><span class="text-slate-500 block">Active Batches</span><span class="font-bold text-indigo-400">${d.activeBatches||0}</span></div>
-            </div>
-        </div>`).join('');
+        </div>`;
+    }).join('');
 }
+
+window.toggleDistributor = function(idx) {
+    const expand = $(`#dist-expand-${idx}`);
+    const chevron = $(`#dist-chevron-${idx}`);
+    const isOpen = !expand.classList.contains('hidden');
+
+    // Collapse all
+    $$('.distributor-card [id^="dist-expand-"]').forEach(el => el.classList.add('hidden'));
+    $$('.distributor-card [id^="dist-chevron-"]').forEach(el => el.style.transform = '');
+
+    // If it was closed, open it (and rotate chevron)
+    if (!isOpen) {
+        expand.classList.remove('hidden');
+        chevron.style.transform = 'rotate(180deg)';
+    }
+};
 
 function populateDistSelects() {
     const sel = $('#manual-med-distributor');
