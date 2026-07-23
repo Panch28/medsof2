@@ -29,6 +29,10 @@ const State = {
     invoices: [],
     selectedBatch: null,
     isDark: true,
+    // Batch queue for multi-image extraction
+    imageQueue: [],          // Array of { file, blob, type } objects
+    extractedQueue: [],      // Array of extraction results (filled as each image is processed)
+    currentQueueIndex: 0,    // Which image in the queue is currently being reviewed
     // Firebase refs
     _app: null,
     _auth: null,
@@ -414,17 +418,41 @@ async function captureFromCamera() {
 }
 
 async function handleGalleryUpload(e) {
-    const file = e.target.files[0]; if (!file) return;
-    State.currentImageFile = file;
-    State.currentImageBlob = new Blob([await file.arrayBuffer()], { type: file.type });
-    await runQualityCheck(State.currentImageBlob, 'image');
+    const files = Array.from(e.target.files);
+    if (!files.length) return;
+
+    if (files.length === 1) {
+        // Single file — original flow
+        const file = files[0];
+        State.currentImageFile = file;
+        State.currentImageBlob = new Blob([await file.arrayBuffer()], { type: file.type });
+        await runQualityCheck(State.currentImageBlob, 'image');
+    } else {
+        // Multiple files — batch flow
+        State.imageQueue = files.map(f => ({ file: f, blob: null, type: 'image' }));
+        State.extractedQueue = [];
+        State.currentQueueIndex = 0;
+        showToast(`${files.length} images queued — processing...`, 'indigo');
+        processNextInQueue();
+    }
     e.target.value = '';
 }
 
 async function handlePdfUpload(e) {
-    const file = e.target.files[0]; if (!file) return;
-    State.currentImageFile = file;
-    await runQualityCheck(file, 'pdf');
+    const files = Array.from(e.target.files);
+    if (!files.length) return;
+
+    if (files.length === 1) {
+        const file = files[0];
+        State.currentImageFile = file;
+        await runQualityCheck(file, 'pdf');
+    } else {
+        State.imageQueue = files.map(f => ({ file: f, blob: null, type: 'pdf' }));
+        State.extractedQueue = [];
+        State.currentQueueIndex = 0;
+        showToast(`${files.length} PDFs queued — processing...`, 'indigo');
+        processNextInQueue();
+    }
     e.target.value = '';
 }
 
@@ -540,6 +568,124 @@ window.retryCapture = () => {
     State.currentImageFile = null; State.currentImageBlob = null;
 };
 
+// ═══════════════════════════════════════════════════════════════════
+// 5b. BATCH QUEUE — Process multiple images sequentially
+// ═══════════════════════════════════════════════════════════════════
+function updateBatchProgress(current, total, status) {
+    const panel = $('#batch-progress-panel');
+    panel.classList.remove('hidden');
+    const pct = total > 0 ? Math.round((current / total) * 100) : 0;
+    $('#batch-progress-count').textContent = `${current}/${total}`;
+    $('#batch-progress-bar').style.width = `${pct}%`;
+    $('#batch-progress-status').textContent = status;
+}
+
+function hideBatchProgress() {
+    $('#batch-progress-panel').classList.add('hidden');
+}
+
+async function processNextInQueue() {
+    const idx = State.currentQueueIndex;
+    if (idx >= State.imageQueue.length) {
+        // All done — start reviewing results one by one
+        hideBatchProgress();
+        State.currentQueueIndex = 0;
+        if (State.extractedQueue.length > 0) {
+            showToast(`All ${State.extractedQueue.length} invoices extracted — reviewing...`, 'green');
+            showNextReview();
+        } else {
+            showToast('No invoices could be extracted', 'red');
+        }
+        return;
+    }
+
+    const item = State.imageQueue[idx];
+    const total = State.imageQueue.length;
+    updateBatchProgress(idx, total, `Extracting image ${idx + 1} of ${total}...`);
+
+    // Create blob if needed
+    if (!item.blob) {
+        item.blob = item.type === 'pdf'
+            ? item.file
+            : new Blob([await item.file.arrayBuffer()], { type: item.file.type });
+    }
+
+    // Skip quality check in batch mode — just extract directly
+    try {
+        updateBatchProgress(idx, total, `Uploading image ${idx + 1}...`);
+        const result = await extractSingleImage(item.file, item.type);
+        if (result && result.lineItems && result.lineItems.length > 0) {
+            State.extractedQueue.push({ ...result, _queueIndex: idx, _file: item.file, _blob: item.blob, _type: item.type });
+            console.log(`[RxExpiry] Queue[${idx}] extracted ${result.lineItems.length} items`);
+        } else {
+            console.warn(`[RxExpiry] Queue[${idx}] returned no items — skipping`);
+        }
+    } catch (e) {
+        console.error(`[RxExpiry] Queue[${idx}] extraction failed:`, e);
+    }
+
+    State.currentQueueIndex++;
+    await processNextInQueue();
+}
+
+async function extractSingleImage(file, type) {
+    if (!isFirebaseReady()) return null;
+
+    const { ref: storageRef, uploadBytes, getDownloadURL } = State._fbStorage;
+    const { httpsCallable } = State._fbFunctions;
+
+    const fileId = `${State.pharmacyId}_${Date.now()}_${Math.random().toString(36).slice(2,6)}`;
+    const fileRef = storageRef(State._storage, `temp/${fileId}`);
+    await uploadBytes(fileRef, file);
+    const downloadURL = await getDownloadURL(fileRef);
+
+    const extractFn = httpsCallable(State._functions, 'extractInvoice');
+    const response = await extractFn({
+        fileUrl: downloadURL,
+        fileId: fileId,
+        pharmacyId: State.pharmacyId
+    });
+
+    return response.data;
+}
+
+function showNextReview() {
+    const idx = State.currentQueueIndex;
+    if (idx >= State.extractedQueue.length) {
+        // All reviews done
+        State.extractedQueue = [];
+        State.imageQueue = [];
+        State.currentQueueIndex = 0;
+        showToast('All invoices reviewed!', 'green');
+        return;
+    }
+
+    const result = State.extractedQueue[idx];
+    State.extractedData = result;
+
+    // Show batch indicator
+    const indicator = $('#review-batch-indicator');
+    indicator.classList.remove('hidden');
+    indicator.textContent = `Invoice ${idx + 1} of ${State.extractedQueue.length}`;
+
+    renderReviewPanel(result);
+
+    // Show the scanned image
+    if (result._blob && result._type !== 'pdf') {
+        $('#review-invoice-img').src = URL.createObjectURL(result._blob);
+        $('#review-invoice-img').classList.remove('hidden');
+        $('#review-invoice-pdf').classList.add('hidden');
+    } else if (result._type === 'pdf' && result._file) {
+        $('#review-invoice-pdf').src = URL.createObjectURL(result._file);
+        $('#review-invoice-pdf').classList.remove('hidden');
+        $('#review-invoice-img').classList.add('hidden');
+    }
+
+    const panel = $('#extraction-review-panel');
+    panel.classList.remove('hidden');
+    showToast(`Reviewing invoice ${idx + 1} of ${State.extractedQueue.length}`, 'indigo');
+}
+
 $('#btn-cancel-scan')?.addEventListener('click', () => {
     $('#precheck-feedback-panel').classList.add('hidden');
 });
@@ -648,7 +794,19 @@ function bindReview() {
 
 function closeReviewPanel() {
     $('#extraction-review-panel').classList.add('hidden');
+    $('#review-batch-indicator').classList.add('hidden');
     State.extractedData = null; State.currentImageFile = null; State.currentImageBlob = null;
+
+    // If batch queue has more items, advance to next review
+    if (State.extractedQueue.length > 0 && State.currentQueueIndex < State.extractedQueue.length - 1) {
+        State.currentQueueIndex++;
+        setTimeout(() => showNextReview(), 300);
+    } else if (State.extractedQueue.length > 0) {
+        // Last item reviewed — clear queue
+        State.extractedQueue = [];
+        State.imageQueue = [];
+        State.currentQueueIndex = 0;
+    }
 }
 
 function renderReviewPanel(data) {
@@ -834,8 +992,13 @@ async function saveConfirmedInvoice() {
 
             console.log('[RxExpiry] Save result:', result.data);
 
-            closeReviewPanel();
             showToast(`Saved ${data.lineItems.length} items to Firestore!`, 'green');
+
+            // Reset button before closing (needed for batch queue)
+            btn.disabled = false;
+            btn.textContent = 'Confirm & Save';
+
+            closeReviewPanel();
 
             // Reload data from Firestore
             await fetchFirestoreData();

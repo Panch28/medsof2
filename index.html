@@ -175,15 +175,15 @@
                                     <svg class="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
                                     </svg>
-                                    Gallery Photos
-                                    <input type="file" id="upload-gallery" accept="image/*" class="hidden">
+                                    Gallery Photos (multi)
+                                    <input type="file" id="upload-gallery" accept="image/*" multiple class="hidden">
                                 </label>
                                 <label class="flex items-center justify-center gap-2 py-2 px-3 bg-slate-800/80 border border-slate-700/60 rounded-lg text-xs font-semibold text-slate-300 hover:bg-slate-800 cursor-pointer active:scale-95 transition-all">
                                     <svg class="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                                     </svg>
                                     Invoice PDFs
-                                    <input type="file" id="upload-pdf" accept="application/pdf" class="hidden">
+                                    <input type="file" id="upload-pdf" accept="application/pdf" multiple class="hidden">
                                 </label>
                             </div>
                         </div>
@@ -215,6 +215,21 @@
                             </div>
                         </div>
                         <div id="precheck-status-msg" class="text-xs font-semibold py-1.5 px-3 rounded text-center"></div>
+                    </div>
+
+                    <!-- Batch Extraction Progress -->
+                    <div id="batch-progress-panel" class="hidden bg-slate-900 border border-indigo-500/30 rounded-2xl p-4 space-y-3">
+                        <div class="flex justify-between items-center">
+                            <span class="text-xs font-bold uppercase tracking-wider text-indigo-400 flex items-center gap-1.5">
+                                <span class="w-2 h-2 rounded-full bg-indigo-500 animate-ping"></span>
+                                Batch Extraction
+                            </span>
+                            <span id="batch-progress-count" class="text-[10px] text-slate-400 font-mono font-bold">0/0</span>
+                        </div>
+                        <div class="w-full bg-slate-800 rounded-full h-2 overflow-hidden">
+                            <div id="batch-progress-bar" class="bg-indigo-500 h-full transition-all duration-500" style="width: 0%"></div>
+                        </div>
+                        <div id="batch-progress-status" class="text-[10px] text-slate-400 text-center font-semibold">Preparing...</div>
                     </div>
 
                     <!-- Live Camera Feed -->
@@ -254,6 +269,7 @@
                                     <div>
                                         <h3 class="text-xs font-heading font-extrabold text-slate-100">Verify Parsed Invoice</h3>
                                         <p id="review-distributor-lbl" class="text-[9px] text-indigo-400 font-bold">Distributor: Loading...</p>
+                                        <p id="review-batch-indicator" class="text-[9px] text-slate-500 font-bold hidden"></p>
                                     </div>
                                     <div class="flex items-center gap-2">
                                         <button id="btn-toggle-to-scan" class="md:hidden px-3 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-[10px] font-bold">Show Invoice Scan</button>
