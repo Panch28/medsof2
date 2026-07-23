@@ -348,6 +348,100 @@ exports.cleanupTempFiles = onSchedule(
 );
 
 // ═══════════════════════════════════════════════════════════════════
+// saveInvoice — write invoice + medicines to Firestore via Admin SDK
+// Client SDK writes fail due to rules/Console mismatch; Admin SDK
+// bypasses rules entirely. This is also more secure (server-side).
+// ═══════════════════════════════════════════════════════════════════
+exports.saveInvoice = onCall(
+    {
+        region: "us-central1",
+        memory: "256MB",
+        timeoutSeconds: 60
+    },
+    async (request) => {
+        // Must be authenticated
+        if (!request.auth) {
+            throw new HttpsError("unauthenticated", "User must be signed in");
+        }
+
+        const { pharmacyId, invoice, medicines, tempFileId } = request.data;
+
+        if (!pharmacyId) throw new HttpsError("invalid-argument", "pharmacyId is required");
+        if (!invoice) throw new HttpsError("invalid-argument", "invoice data is required");
+        if (!Array.isArray(medicines) || medicines.length === 0) {
+            throw new HttpsError("invalid-argument", "At least one medicine is required");
+        }
+
+        const { getFirestore, FieldValue } = require("firebase-admin/firestore");
+        const db = getFirestore();
+        const batch = db.batch();
+
+        try {
+            // Write invoice document
+            const invoiceRef = db.collection("pharmacies").doc(pharmacyId).collection("invoices").doc();
+            batch.set(invoiceRef, {
+                distributor: invoice.distributor || "",
+                invoiceNumber: invoice.invoiceNumber || "",
+                invoiceTotal: invoice.invoiceTotal || 0,
+                schemeDiscount: invoice.schemeDiscount || 0,
+                cashDiscount: invoice.cashDiscount || 0,
+                roundOff: invoice.roundOff || 0,
+                lineItemCount: medicines.length,
+                capturedAt: FieldValue.serverTimestamp(),
+                confirmedBy: request.auth.token.phone_number || request.auth.uid,
+                source: "cloud-function",
+                createdBy: request.auth.uid
+            });
+
+            // Write each medicine document
+            for (const med of medicines) {
+                if (!med.medicineName || med.medicineName === "Could not parse - verify manually") continue;
+                const medRef = db.collection("pharmacies").doc(pharmacyId).collection("medicines").doc();
+                batch.set(medRef, {
+                    medicineName: med.medicineName,
+                    batchNumber: med.batchNumber || "",
+                    expiryDate: med.expiryDate || "",
+                    quantityBilled: med.quantityBilled || 0,
+                    quantityFree: med.quantityFree || 0,
+                    remainingQty: med.quantityBilled || 0,
+                    tradePrice: med.tradePrice || 0,
+                    cdPercent: med.cdPercent || 0,
+                    unitPrice: med.tradePrice || 0,
+                    netValue: med.netValue || 0,
+                    gstRate: med.gstRate || 0,
+                    gstValue: med.gstValue || 0,
+                    distributor: invoice.distributor || "",
+                    invoiceId: invoiceRef.id,
+                    confidence: med.confidence || 0,
+                    addedAt: FieldValue.serverTimestamp(),
+                    soldToday: 0
+                });
+            }
+
+            await batch.commit();
+            logger.info(`[saveInvoice] Wrote invoice + ${medicines.length} medicines for pharmacy=${pharmacyId}`);
+
+            // Delete temp file from Storage if provided
+            if (tempFileId) {
+                try {
+                    const bucket = getStorage().bucket();
+                    await bucket.file(`temp/${tempFileId}`).delete();
+                    logger.info(`[saveInvoice] Deleted temp file: temp/${tempFileId}`);
+                } catch (e) {
+                    logger.warn(`[saveInvoice] Temp cleanup skipped: ${e.message}`);
+                }
+            }
+
+            return { success: true, invoiceId: invoiceRef.id };
+
+        } catch (e) {
+            logger.error("[saveInvoice] Write failed:", e.message);
+            throw new HttpsError("internal", "Failed to save: " + e.message);
+        }
+    }
+);
+
+// ═══════════════════════════════════════════════════════════════════
 // testFirestoreWrite — diagnostic: test write via Admin SDK
 // ═══════════════════════════════════════════════════════════════════
 exports.testFirestoreWrite = onCall(

@@ -800,59 +800,45 @@ async function saveConfirmedInvoice() {
 
     if (isUserAuthenticated()) {
         try {
-            const { collection, addDoc, serverTimestamp } = State._fbFirestore;
-            const { ref: storageRef, deleteObject } = State._fbStorage;
+            const { httpsCallable } = State._fbFunctions;
             const pharmacyId = State.pharmacyId;
 
-            console.log('[RxExpiry] DIAGNOSTIC pharmacyId:', JSON.stringify(pharmacyId), 'type:', typeof pharmacyId);
-            console.log('[RxExpiry] DIAGNOSTIC State keys:', Object.keys(State).join(', '));
-            console.log('[RxExpiry] DIAGNOSTIC full path:', `pharmacies/${pharmacyId}/invoices`);
-            console.log('[RxExpiry] Auth UID:', State._auth.currentUser?.uid, 'Phone:', State._auth.currentUser?.phoneNumber);
+            console.log('[RxExpiry] Saving via Cloud Function:', { pharmacyId, medicineCount: data.lineItems.length });
 
-            const invoiceRef = await addDoc(collection(State._db, `pharmacies/${pharmacyId}/invoices`), {
-                distributor: data.distributor || '',
-                invoiceNumber: data.invoiceNumber || '',
-                invoiceTotal: parseFloat($('#review-declared-total-input').value) || 0,
-                lineItemCount: data.lineItems.length,
-                capturedAt: serverTimestamp(),
-                confirmedBy: State.user?.phone || 'unknown',
-                source: data.source || 'cloud-function'
-            });
-
-            console.log('[RxExpiry] Invoice written:', invoiceRef.id, '- now writing', data.lineItems.length, 'medicines');
-
-            // Write each line item to medicines collection
-            for (const item of data.lineItems) {
-                if (!item.medicineName || item.medicineName === 'Could not parse - verify manually') continue;
-                await addDoc(collection(State._db, `pharmacies/${pharmacyId}/medicines`), {
+            const saveFn = httpsCallable(State._functions, 'saveInvoice');
+            const result = await saveFn({
+                pharmacyId: pharmacyId,
+                invoice: {
+                    distributor: data.distributor || '',
+                    invoiceNumber: data.invoiceNumber || '',
+                    invoiceTotal: parseFloat($('#review-declared-total-input').value) || 0,
+                    schemeDiscount: parseFloat($('#review-scheme-discount-input')?.value) || 0,
+                    cashDiscount: parseFloat($('#review-cash-discount-input')?.value) || 0,
+                    roundOff: parseFloat($('#review-roundoff-input')?.value) || 0
+                },
+                medicines: data.lineItems.filter(item => item.medicineName && item.medicineName !== 'Could not parse - verify manually').map(item => ({
                     medicineName: item.medicineName,
                     batchNumber: item.batchNumber || '',
                     expiryDate: item.expiryDate || '',
                     quantityBilled: parseInt(item.quantityBilled) || 0,
                     quantityFree: parseInt(item.quantityFree) || 0,
-                    remainingQty: parseInt(item.quantityBilled) || 0,
                     tradePrice: parseFloat(item.tradePrice) || 0,
                     cdPercent: parseFloat(item.cdPercent) || 0,
-                    unitPrice: parseFloat(item.tradePrice) || 0,
                     netValue: parseFloat(item.netValue) || 0,
                     gstRate: parseFloat(item.gstRate) || 0,
                     gstValue: parseFloat(item.gstValue) || 0,
-                    distributor: data.distributor || '',
-                    invoiceId: invoiceRef.id,
-                    confidence: item.confidence || 0,
-                    addedAt: serverTimestamp(),
-                    soldToday: 0
-                });
-            }
+                    confidence: item.confidence || 0
+                })),
+                tempFileId: data.fileId || null
+            });
 
-            // Delete temp file from Storage
-            try {
-                const tempRef = storageRef(State._storage, `temp/${data.fileId || ''}`);
-                await deleteObject(tempRef);
-            } catch (e) { console.warn('[RxExpiry] Temp cleanup skipped:', e); }
+            console.log('[RxExpiry] Save result:', result.data);
 
             closeReviewPanel();
             showToast(`Saved ${data.lineItems.length} items to Firestore!`, 'green');
+
+            // Reload data from Firestore
+            await fetchFirestoreData();
 
         } catch (e) {
             console.error('[RxExpiry] Save error:', e);
