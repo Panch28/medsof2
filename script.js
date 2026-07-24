@@ -33,6 +33,9 @@ const State = {
     imageQueue: [],          // Array of { file, blob, type } objects
     extractedQueue: [],      // Array of extraction results (filled as each image is processed)
     currentQueueIndex: 0,    // Which image in the queue is currently being reviewed
+    // Bulk selection
+    selectedMedIds: new Set(),
+    selectMode: false,
     // Firebase refs
     _app: null,
     _auth: null,
@@ -1054,26 +1057,65 @@ function renderExpiringList() {
 
     if (!expiring.length) {
         list.innerHTML = '<div class="text-center py-6 text-xs text-slate-500">No expiring items. Record an invoice to populate.</div>';
+        State.selectedMedIds.clear();
+        updateBulkActionBar();
         return;
     }
 
-    list.innerHTML = expiring.map(m => {
+    // Bulk action toolbar (above list)
+    const expiredCount = expiring.filter(m => { const e = parseExp(m.expiryDate); return e && e <= new Date(now); }).length;
+    const selectedCount = State.selectedMedIds.size;
+
+    let toolbarHtml = '';
+    if (State.selectMode) {
+        toolbarHtml = `
+        <div class="bg-slate-800/60 border border-indigo-500/30 rounded-xl p-3 flex flex-wrap items-center gap-2 mb-2">
+            <span class="text-[10px] text-indigo-400 font-bold">${selectedCount} selected</span>
+            <div class="flex-1"></div>
+            <button onclick="selectAllExpiring()" class="text-[10px] px-2 py-1 rounded-md bg-slate-700 text-slate-300 font-bold hover:bg-slate-600 transition-all">Select All</button>
+            ${expiredCount > 0 ? `<button onclick="selectExpiredOnly()" class="text-[10px] px-2 py-1 rounded-md bg-amber-600/20 text-amber-400 font-bold hover:bg-amber-600/30 transition-all">Select Expired (${expiredCount})</button>` : ''}
+            <button onclick="clearSelection()" class="text-[10px] px-2 py-1 rounded-md bg-slate-700 text-slate-400 font-bold hover:bg-slate-600 transition-all">Clear</button>
+            <button onclick="exitSelectMode()" class="text-[10px] px-2 py-1 rounded-md bg-slate-700 text-slate-400 font-bold hover:bg-slate-600 transition-all">Cancel</button>
+        </div>`;
+    } else {
+        toolbarHtml = `
+        <div class="flex items-center justify-between mb-1">
+            <button onclick="enterSelectMode()" class="text-[10px] px-2.5 py-1 rounded-md bg-slate-800 border border-slate-700 text-slate-400 font-bold hover:text-indigo-400 hover:border-indigo-500/50 transition-all flex items-center gap-1">
+                <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>
+                Select
+            </button>
+        </div>`;
+    }
+
+    list.innerHTML = toolbarHtml + expiring.map(m => {
         const days = Math.ceil((parseExp(m.expiryDate) - now) / 86400000);
         let cls, txt;
         if (days <= 0) { cls='badge-expired'; txt='EXPIRED'; }
         else if (days <= 30) { cls='badge-expiring'; txt=`${days}d left`; }
         else { cls='badge-safe'; txt=`${days}d left`; }
-        return `<div class="bg-slate-800/60 border border-slate-700/50 rounded-xl p-3 flex items-center justify-between gap-3">
+
+        const isSelected = State.selectedMedIds.has(m.id);
+        const checkbox = State.selectMode ? `
+            <label class="shrink-0 cursor-pointer" onclick="event.stopPropagation()">
+                <input type="checkbox" ${isSelected ? 'checked' : ''} onchange="toggleMedSelect('${m.id}')" class="accent-indigo-500 w-4 h-4 rounded border-slate-600 bg-slate-800">
+            </label>` : '';
+
+        const rowCls = isSelected ? 'border-indigo-500/60 bg-indigo-500/10' : 'border-slate-700/50';
+
+        return `<div class="bg-slate-800/60 border ${rowCls} rounded-xl p-3 flex items-center justify-between gap-3 transition-all ${isSelected ? 'ring-1 ring-indigo-500/30' : ''}">
+            ${checkbox}
             <div class="flex-1 min-w-0">
                 <h4 class="font-heading font-bold text-slate-100 text-xs truncate">${esc(m.medicineName)}</h4>
                 <p class="text-[10px] text-slate-400 font-mono">Batch: ${esc(m.batchNumber||'N/A')} · ${m.remainingQty||0} pkts · ${esc(m.distributor||'')}</p>
             </div>
             <span class="px-2 py-1 text-[9px] rounded font-bold shrink-0 ${cls}">${txt}</span>
-            <button onclick="deleteMedicine('${m.id}','${esc(m.medicineName)}')" class="shrink-0 p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 transition-all" title="Remove">
+            ${State.selectMode ? '' : `<button onclick="deleteMedicine('${m.id}','${esc(m.medicineName)}')" class="shrink-0 p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 transition-all" title="Remove">
                 <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
-            </button>
+            </button>`}
         </div>`;
     }).join('');
+
+    updateBulkActionBar();
 }
 
 window.deleteMedicine = async function(id, name) {
@@ -1096,6 +1138,103 @@ window.deleteMedicine = async function(id, name) {
     updateStats();
     showToast(`Removed "${name}"`, 'green');
 };
+
+// ═══════════════════════════════════════════════════════════════════
+// 9b. BULK SELECT + DELETE
+// ═══════════════════════════════════════════════════════════════════
+window.enterSelectMode = function() {
+    State.selectMode = true;
+    State.selectedMedIds.clear();
+    renderExpiringList();
+};
+
+window.exitSelectMode = function() {
+    State.selectMode = false;
+    State.selectedMedIds.clear();
+    renderExpiringList();
+};
+
+window.toggleMedSelect = function(id) {
+    if (State.selectedMedIds.has(id)) {
+        State.selectedMedIds.delete(id);
+    } else {
+        State.selectedMedIds.add(id);
+    }
+    renderExpiringList();
+};
+
+window.selectAllExpiring = function() {
+    const now = Date.now();
+    const cut = new Date(now + 90*86400000);
+    State.medicines.forEach(m => {
+        if (!m.expiryDate) return;
+        const exp = parseExp(m.expiryDate);
+        if (exp && exp <= cut && (m.remainingQty||0) > 0) {
+            State.selectedMedIds.add(m.id);
+        }
+    });
+    renderExpiringList();
+};
+
+window.selectExpiredOnly = function() {
+    const now = Date.now();
+    State.selectedMedIds.clear();
+    State.medicines.forEach(m => {
+        if (!m.expiryDate) return;
+        const exp = parseExp(m.expiryDate);
+        if (exp && exp <= now && (m.remainingQty||0) > 0) {
+            State.selectedMedIds.add(m.id);
+        }
+    });
+    renderExpiringList();
+};
+
+window.clearSelection = function() {
+    State.selectedMedIds.clear();
+    renderExpiringList();
+};
+
+window.bulkDeleteSelected = async function() {
+    const ids = Array.from(State.selectedMedIds);
+    if (!ids.length) return;
+    if (!confirm(`Delete ${ids.length} selected medicine${ids.length>1?'s':''}? This can't be undone.`)) return;
+
+    const btn = $('#btn-bulk-delete');
+    if (btn) { btn.disabled = true; btn.textContent = 'Deleting...'; }
+
+    if (isUserAuthenticated()) {
+        try {
+            const { httpsCallable } = State._fbFunctions;
+            const fn = httpsCallable(State._functions, 'bulkDeleteMedicines');
+            await fn({ pharmacyId: State.pharmacyId, medicineIds: ids });
+        } catch (e) {
+            console.error('[RxExpiry] Bulk delete failed:', e);
+            showToast('Bulk delete failed: ' + e.message, 'red');
+            if (btn) { btn.disabled = false; btn.textContent = 'Delete Selected'; }
+            return;
+        }
+    }
+
+    State.medicines = State.medicines.filter(m => !State.selectedMedIds.has(m.id));
+    const count = State.selectedMedIds.size;
+    State.selectedMedIds.clear();
+    State.selectMode = false;
+    renderExpiringList();
+    updateStats();
+    showToast(`Deleted ${count} medicine${count>1?'s':''}`, 'green');
+};
+
+function updateBulkActionBar() {
+    const bar = $('#bulk-action-bar');
+    if (!bar) return;
+    const count = State.selectedMedIds.size;
+    if (State.selectMode && count > 0) {
+        bar.classList.remove('hidden');
+        $('#bulk-count-text').textContent = `${count} item${count>1?'s':''} selected`;
+    } else {
+        bar.classList.add('hidden');
+    }
+}
 
 function updateStats() {
     const cut = new Date(Date.now() + 90*86400000);

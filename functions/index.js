@@ -467,6 +467,36 @@ exports.deleteMedicine = onCall(
 );
 
 // ═══════════════════════════════════════════════════════════════════
+// bulkDeleteMedicines — delete multiple medicine documents at once
+// ═══════════════════════════════════════════════════════════════════
+exports.bulkDeleteMedicines = onCall(
+    {
+        region: "us-central1",
+        memory: "256MB",
+        timeoutSeconds: 60
+    },
+    async (request) => {
+        if (!request.auth) {
+            throw new HttpsError("unauthenticated", "User must be signed in");
+        }
+        const { pharmacyId, medicineIds } = request.data;
+        if (!pharmacyId || !Array.isArray(medicineIds) || medicineIds.length === 0) {
+            throw new HttpsError("invalid-argument", "pharmacyId and medicineIds array are required");
+        }
+        const { getFirestore } = require("firebase-admin/firestore");
+        const db = getFirestore();
+        const batch = db.batch();
+        for (const id of medicineIds) {
+            const ref = db.collection("pharmacies").doc(pharmacyId).collection("medicines").doc(id);
+            batch.delete(ref);
+        }
+        await batch.commit();
+        logger.info(`[bulkDeleteMedicines] Deleted ${medicineIds.length} medicines from ${pharmacyId}`);
+        return { success: true, deletedCount: medicineIds.length };
+    }
+);
+
+// ═══════════════════════════════════════════════════════════════════
 // testFirestoreWrite — diagnostic: test write via Admin SDK
 // ═══════════════════════════════════════════════════════════════════
 exports.testFirestoreWrite = onCall(
