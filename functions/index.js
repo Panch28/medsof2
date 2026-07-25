@@ -2,7 +2,7 @@
  * RxExpiry — extractInvoice Cloud Function
  *
  * Trigger: HTTPS Callable from frontend (step 4 in flow)
- * Model:   gemini-3-flash-preview (the ONLY AI model in this app)
+ * Model:   gemini-2.0-flash (vision-capable model for dense invoice parsing)
  * Input:   { fileUrl, fileId, pharmacyId }
  * Output:  { distributor, invoiceNumber, invoiceTotal, lineItems[], captureQuality }
  *
@@ -26,54 +26,149 @@ initializeApp();
 // Set the secret with:  firebase functions:secrets:set GEMINI_API_KEY
 // Never paste the API key into this file.
 const GEMINI_KEY = defineSecret("GEMINI_API_KEY");
-const GEMINI_MODEL = "gemini-3.1-flash-lite";
+const GEMINI_MODEL = "gemini-2.0-flash";
 
 // ─── Extraction Prompt for Gemini ──────────────────────────────────
-const EXTRACTION_PROMPT = `You are an OCR extraction engine for Indian pharmacy invoices.
+// Matches Gemini's natural output format from AI Studio
+const EXTRACTION_PROMPT = `You are an expert OCR and financial data extraction engine specialized in Indian Pharmaceutical/Medical Distributor Invoices (B2B GST Invoices).
 
-Given this invoice image, extract ALL information and return ONLY a valid JSON object (no markdown, no code fences, no explanation) with this exact structure:
+TASK:
+1. Extract every single line item from the main product table. Do not skip any rows.
+2. Extract the summary financial totals precisely.
+3. Perform or verify the mathematical calculations to ensure financial accuracy.
+4. Return ONLY a valid JSON object (no markdown, no code fences, no explanation) with this exact structure:
 
 {
-  "distributor": "string — distributor/supplier name from invoice header",
-  "invoiceNumber": "string — invoice/bill number",
-  "invoiceTotal": "number — grand total amount declared on invoice",
-  "schemeDiscount": "number — total scheme/discount amount shown in invoice footer/summary (0 if not present)",
-  "cashDiscount": "number — cash discount amount shown separately in invoice footer/summary, distinct from scheme discount (0 if not present)",
-  "roundOff": "number — round off amount shown in invoice footer/summary (can be positive or negative, 0 if not present)",
+  "distributor_name": "string — Supplier/Distributor name from invoice header",
+  "buyer_name": "string — Buyer/Retailer pharmacy name (from 'To:', 'Sold To:', or similar; null if not visible)",
+  "invoice_no": "string — Invoice/Bill number",
+  "invoice_date": "string — Invoice date in DD/MM/YYYY or MM/YYYY format (null if not visible)",
+  "grand_total": "number — Grand Total / Amount Payable as printed on invoice",
+  "total_taxable_amount": "number — Total Taxable Amount from invoice footer (should equal sum of all line taxable_values)",
+  "cgst_total": "number — Total CGST amount from invoice footer (0 if not present)",
+  "sgst_total": "number — Total SGST amount from invoice footer (0 if not present)",
+  "scheme_discount": "number — Total scheme/trade discount from footer (0 if not present)",
+  "cash_discount": "number — Cash discount from footer (0 if not present)",
+  "round_off": "number — Round off from footer (positive or negative, 0 if not present)",
+  "pending_invoices_count": "number — Number of pending/unpaid invoices shown on invoice (0 if not visible)",
+  "pending_total_amount": "number — Total pending/unpaid balance amount (0 if not visible)",
   "lineItems": [
     {
-      "medicineName": "string — full medicine/product name",
-      "batchNumber": "string — batch/lot number",
-      "expiryDate": "string — expiry date in DD/MM/YYYY or MM/YYYY format",
-      "quantityBilled": "number — quantity billed/purchased",
-      "quantityFree": "number — free/complimentary pieces (0 if none)",
-      "tradePrice": "number — the Trade Price (per unit price before C.D.% discount) as printed on the invoice",
-      "cdPercent": "number — the C.D.% (cash discount percentage) column value for this line (0 if not present)",
-      "netValue": "number — Taxable Value for this line, computed as: tradePrice × quantityBilled × (1 - cdPercent/100)",
-      "gstRate": "number — GST percentage (5, 12, 18, or 28)",
-      "gstValue": "number — GST amount for this line, computed as: netValue × gstRate / 100",
-      "confidence": "number between 0 and 1 — how confident you are in this line's accuracy"
+      "rack": "string — Rack/Shelf location code (null if not present)",
+      "medicineName": "string — Product/Medicine name and strength",
+      "qty_billed": "number — Quantity billed/purchased",
+      "free_scm": "number — Free quantity or scheme percentage (0 if none)",
+      "pack": "string — Packaging type e.g. 10'S, 15'S, 15ML, 60'S",
+      "batch_no": "string — Batch/Lot number",
+      "exp_date": "string — Expiry date in MM/YY or DD/MM/YYYY format",
+      "mrp": "number — Maximum Retail Price per pack",
+      "trade_price": "number — Trade Price per unit (before C.D.% discount)",
+      "cd_percent": "number — C.D.% (cash discount percentage, usually 4.00%; 0 if absent)",
+      "scm_dis_value": "number — Per-line scheme discount value in ₹ (0 if not present)",
+      "taxable_value": "number — READ the printed Taxable Value from the invoice column (do NOT compute — use the actual printed number)",
+      "gst_percent": "number — GST rate for THIS row (12, 18, 5, or 28 — read from each row individually)",
+      "net_value": "number — READ the printed Net Value / Amount from the invoice column (do NOT compute — use the actual printed number)",
+      "mfac": "string — Manufacturer code/abbreviation (e.g. CIPL, MICR, ALKE; null if not visible)",
+      "hsn_code": "string — HSN code for GST classification (null if not visible)",
+      "confidence": "number between 0 and 1 — how confident you are in this line's extraction accuracy"
     }
   ],
   "captureQuality": {
     "readable": "boolean — can you read the invoice clearly?",
-    "issues": ["array of strings — specific problems if not readable, e.g. 'partial page', 'text cut off', 'blurry section'"],
-    "missingPage": "boolean — does this appear to be a multi-page invoice with pages missing?"
+    "issues": ["array of strings — specific problems if not readable"],
+    "missingPage": "boolean — multi-page invoice with pages missing?",
+    "pageInfo": { "current": "number — page number of this page if 'Page X of Y' or 'X/Y' is visible (null if not visible)", "total": "number — total page count if visible (null if not visible)" }
   }
 }
 
-Rules:
-- Extract EVERY line item visible on the invoice, even if partially visible
-- For confidence: 1.0 = perfectly clear, 0.9 = very clear, 0.8 = readable with minor doubt, 0.7 = partially readable, below 0.7 = uncertain
+═══ COLUMN MAPPING RULES (STRICT — CRITICAL) ═══
+The invoice table has fixed columns printed in this exact left-to-right order. You MUST anchor each value to its correct column header. DO NOT shift values left or right.
+
+TYPICAL COLUMN ORDER (left to right):
+[RACK] → [DESCRIPTION] → [QTY BILLED] → [FREE/SCM] → [PACK] → [BATCH] → [EXP] → [MRP] → [TRADE PRICE] → [C.D.%] → [SCM DIS] → [TAXABLE VALUE] → [GST%] → [NET VALUE]
+
+CRITICAL ANTI-SHIFT RULES:
+- If a column is EMPTY or blank for a row, put 0 (for numbers) or "" (for strings). Do NOT let subsequent column values slide into the empty slot.
+- Example: If C.D.% is blank, taxable_value is NOT placed in the C.D.% slot. taxable_value stays in its own column.
+- Example: If SCM DIS is blank, the taxable value stays in the TAXABLE VALUE column, NOT in the SCM DIS column.
+- Each value belongs to the column directly ABOVE it in the header row. Trace vertically from the header, not horizontally from the previous cell.
+
+FIELD-TO-COLUMN MAP:
+- rack → Rack/Shelf location code (e.g. C0194, E0387)
+- medicineName → Description / Product Name column
+- qty_billed → Qty Billed / Quantity column
+- free_scm → Free Qty / Scheme Qty / Scm% column (0 if absent)
+- pack → Pack / Pack Size column (e.g. 10'S, 15ML, 60'S)
+- batch_no → Batch No. / Lot No. column
+- exp_date → Exp. Date / Expiry Date column
+- mrp → M.R.P. column (per pack)
+- trade_price → Trade Price / T.Rate / Rate column (per unit BEFORE C.D.%)
+- cd_percent → C.D.% column (cash discount percentage, usually 4%)
+- scm_dis_value → Scm Dis Value / Scheme Discount Value column (absolute ₹, 0 if absent)
+- taxable_value → Taxable Value column (read the printed number from this column)
+- gst_percent → GST % column (read from EACH ROW individually — do NOT use a flat rate)
+- net_value → Net Value / Amount column (the final amount including GST)
+- mfac → Mfac / Manufacturer / Company code column
+- hsn_code → HSN Code column
+
+SELF-CHECK AFTER EXTRACTION: For each row, verify that taxable_value is a reasonable number (typically between ₹10 and ₹50,000 for a single line item). If taxable_value looks like a quantity, batch number, or discount percentage, you have placed it in the wrong column — re-examine the row.
+
+═══ FEW-SHOT EXAMPLE (how to correctly anchor columns) ═══
+Below is a sample row as it appears on a printed invoice, and the correct JSON output. Note how empty columns get 0 — values do NOT slide left.
+
+INVOICE ROW (left to right):
+| Rack   | Description      | Qty | Free | Pack | Batch    | Exp    | MRP  | Trade  | C.D.% | Scm Dis | Taxable  | GST% | Net     |
+| C0194  | ESSRYL M1 TAB   | 5   | 1    | 10'S | AB1234   | 03/27  | 185  | 172.80 | 4     | 0       | 829.44   | 12   | 929.97  |
+
+CORRECT JSON for this row:
+{
+  "rack": "C0194",
+  "medicineName": "ESSRYL M1 TAB",
+  "qty_billed": 5,
+  "free_scm": 1,
+  "pack": "10'S",
+  "batch_no": "AB1234",
+  "exp_date": "03/27",
+  "mrp": 185,
+  "trade_price": 172.80,
+  "cd_percent": 4,
+  "scm_dis_value": 0,
+  "taxable_value": 829.44,
+  "gst_percent": 12,
+  "net_value": 929.97
+}
+
+NOTICE: trade_price (172.80) is in the TRADE PRICE column. taxable_value (829.44) is in the TAXABLE VALUE column. Even though trade_price and qty_billed are close in the row, they go to DIFFERENT fields. Do NOT put 172.80 into taxable_value.
+
+═══ ARITHMETIC FORMULA (MUST be applied to EVERY row) ═══
+1. taxable_value = trade_price × qty_billed × (1 - cd_percent/100)
+2. gst_amount = taxable_value × gst_percent / 100
+3. net_value = taxable_value + gst_amount
+Use the printed values from the invoice columns as the primary source. Only apply these formulas as a fallback when a printed value is missing or unreadable. If a printed value exists but differs from the formula result, use the printed value — distributors may apply scheme adjustments or tiered discounts that change the standard formula.
+
+═══ GST BREAKDOWN (Summary Level) ═══
+CGST and SGST are split equally. If GST is 12%, CGST = 6% and SGST = 6%.
+Group taxable amounts by their GST slabs and compute exact CGST/SGST totals.
+- 12% GST slab → 6% CGST + 6% SGST
+- 18% GST slab → 9% CGST + 9% SGST
+
+═══ CROSS-VERIFICATION (MUST DO BEFORE OUTPUTTING) ═══
+Before you output the final JSON, perform these checks internally and CORRECT any mismatches:
+1. Sum all line taxable_values → this MUST match total_taxable_amount from the footer. If it doesn't, re-examine each line — you likely shifted a column.
+2. Sum all line net_values → this should be close to grand_total (within ₹10 for rounding).
+3. grand_total ≈ total_taxable_amount + cgst_total + sgst_total - scheme_discount - cash_discount + round_off
+4. If any line's taxable_value is less than ₹5 and trade_price > ₹20, you almost certainly put the trade price or quantity in the wrong column. Fix it before outputting.
+5. Report any remaining discrepancies as a note, but always use the printed value from the invoice column.
+
+═══ GENERAL RULES ═══
+- Extract EVERY line item visible, even if partially visible
+- For confidence: 1.0 = perfect, 0.9 = very clear, 0.8 = minor doubt, 0.7 = partially readable, <0.7 = uncertain
 - If a field is not visible, use null for strings and 0 for numbers
-- CRITICAL — for EVERY line item, you MUST read both the Trade Price column AND the C.D.% column from the invoice table:
-  1. Read "tradePrice" = the per-unit Trade Price printed in that row
-  2. Read "cdPercent" = the C.D.% (cash discount percentage) printed in that row (often 4% or similar; if no C.D.% column exists on the invoice, use 0)
-  3. Calculate netValue = tradePrice × quantityBilled × (1 - cdPercent/100)
-  This formula MUST be applied to EVERY row without exception — do NOT use the printed "Unit Price" or "Taxable Value" columns directly, compute netValue yourself using the formula above to ensure consistency.
-- gstValue should equal netValue × gstRate / 100
-- invoiceTotal should be the grand total shown on the invoice
-- For captureQuality.readable: false if more than 30% of the invoice is unreadable`;
+- Read gst_percent from EACH ROW — do NOT apply a single flat GST rate to all lines
+- mfac should be the manufacturer abbreviation/code as printed (CIPL, MICR, ALKE, etc.)
+- pack should include the unit (10'S, 15'S, 15ML, 60'S, 3'S, 120'S, etc.)
+- For captureQuality.readable: false if >30% of invoice is unreadable
+- If "Page X of Y" or "X/Y" appears in header/footer, extract into captureQuality.pageInfo as {current: X, total: Y}. Null if not visible.`;
 
 // ═══════════════════════════════════════════════════════════════════
 // extractInvoice Cloud Function
@@ -81,8 +176,8 @@ Rules:
 exports.extractInvoice = onCall(
     {
         region: "us-central1",
-        memory: "512MB",
-        timeoutSeconds: 60,
+        memory: "1GB",
+        timeoutSeconds: 120,
         secrets: [GEMINI_KEY]  // Injected at runtime from Firebase Secrets
     },
     async (request) => {
@@ -103,7 +198,7 @@ exports.extractInvoice = onCall(
             // Step 1: Download image from Firebase Storage and convert to base64
             const imageBase64 = await downloadAndEncodeImage(fileUrl);
 
-            // Step 2: Send to Gemini 3 Flash Preview (passing secret key at runtime)
+            // Step 2: Send to Gemini 2.0 Flash (passing secret key at runtime)
             console.log("BASE64 LENGTH:", imageBase64.data.length);
             const geminiResponse = await callGemini(imageBase64, geminiApiKey);
 
@@ -168,7 +263,7 @@ async function downloadAndEncodeImage(fileUrl) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Helper: Call Gemini 3 Flash Preview API
+// Helper: Call Gemini 2.0 Flash API
 // ═══════════════════════════════════════════════════════════════════
 async function callGemini(imageBase64, apiKey) {
     const url = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`;
@@ -232,6 +327,7 @@ async function callGemini(imageBase64, apiKey) {
 
 // ═══════════════════════════════════════════════════════════════════
 // Helper: Parse and validate Gemini's JSON response
+// Handles Gemini's natural snake_case output and maps to internal fields
 // ═══════════════════════════════════════════════════════════════════
 function parseGeminiResponse(text) {
     // Strip any markdown code fences if present
@@ -253,55 +349,161 @@ function parseGeminiResponse(text) {
         }
     }
 
-    // Validate and normalize structure
+    // Map Gemini's snake_case output to internal camelCase fields
+    // Gemini outputs: distributor_name, buyer_name, invoice_no, invoice_date, grand_total, etc.
+    // Also accept camelCase fallbacks for flexibility
     const result = {
-        distributor: parsed.distributor || "",
-        invoiceNumber: parsed.invoiceNumber || "",
-        invoiceTotal: Number(parsed.invoiceTotal) || 0,
-        schemeDiscount: Number(parsed.schemeDiscount) || 0,
-        cashDiscount: Number(parsed.cashDiscount) || 0,
-        roundOff: Number(parsed.roundOff) || 0,
+        distributor: parsed.distributor_name || parsed.distributor || "",
+        buyerName: (parsed.buyer_name || parsed.buyerName) ? String(parsed.buyer_name || parsed.buyerName).trim() : null,
+        invoiceNumber: parsed.invoice_no || parsed.invoiceNumber || "",
+        invoiceDate: parsed.invoice_date || parsed.invoiceDate || null,
+        invoiceTotal: Number(parsed.grand_total || parsed.invoiceTotal) || 0,
+        totalTaxableAmount: Number(parsed.total_taxable_amount || parsed.totalTaxableAmount) || 0,
+        cgstTotal: Number(parsed.cgst_total || parsed.cgstTotal) || 0,
+        sgstTotal: Number(parsed.sgst_total || parsed.sgstTotal) || 0,
+        schemeDiscount: Number(parsed.scheme_discount || parsed.schemeDiscount) || 0,
+        cashDiscount: Number(parsed.cash_discount || parsed.cashDiscount) || 0,
+        roundOff: Number(parsed.round_off || parsed.roundOff) || 0,
+        pendingInvoicesCount: Math.max(0, parseInt(parsed.pending_invoices_count || parsed.pendingInvoicesCount) || 0),
+        pendingTotalAmount: Math.max(0, parseFloat(parsed.pending_total_amount || parsed.pendingTotalAmount) || 0),
         lineItems: [],
         captureQuality: {
             readable: parsed.captureQuality?.readable !== false,
             issues: Array.isArray(parsed.captureQuality?.issues) ? parsed.captureQuality.issues : [],
-            missingPage: parsed.captureQuality?.missingPage === true
+            missingPage: parsed.captureQuality?.missingPage === true,
+            pageInfo: parsed.captureQuality?.pageInfo || null
         }
     };
 
-    // Process line items
+    // Process line items — map Gemini's snake_case fields to internal fields
+    // Gemini outputs: qty_billed, free_scm, batch_no, exp_date, trade_price,
+    //   cd_percent, scm_dis_value, taxable_value, gst_percent, net_value, mfac, hsn_code, pack
+    // Internal fields: quantityBilled, quantityFree, batchNumber, expiryDate, tradePrice,
+    //   cdPercent, scmDiscount, netValue (taxable), gstRate, gstValue (computed), lineTotal, mfac, hsnCode, packSize
     if (Array.isArray(parsed.lineItems)) {
-        result.lineItems = parsed.lineItems.map(item => ({
-            medicineName: String(item.medicineName || "").trim(),
-            batchNumber: String(item.batchNumber || "").trim(),
-            expiryDate: String(item.expiryDate || "").trim(),
-            quantityBilled: Math.max(0, parseInt(item.quantityBilled) || 0),
-            quantityFree: Math.max(0, parseInt(item.quantityFree) || 0),
-            tradePrice: Math.max(0, parseFloat(item.tradePrice) || 0),
-            cdPercent: Math.max(0, parseFloat(item.cdPercent) || 0),
-            netValue: Math.max(0, parseFloat(item.netValue) || 0),
-            gstRate: [5, 12, 18, 28].includes(Number(item.gstRate)) ? Number(item.gstRate) : 12,
-            gstValue: Math.max(0, parseFloat(item.gstValue) || 0),
-            confidence: Math.max(0, Math.min(1, parseFloat(item.confidence) || 0.5))
-        }));
+        result.lineItems = parsed.lineItems.map(item => {
+            const tradePrice = Math.max(0, parseFloat(item.trade_price || item.tradePrice) || 0);
+            const quantityBilled = Math.max(0, parseInt(item.qty_billed || item.quantityBilled) || 0);
+            const cdPercent = Math.max(0, parseFloat(item.cd_percent || item.cdPercent) || 0);
+            const gstRate = [5, 12, 18, 28].includes(Number(item.gst_percent || item.gstRate))
+                ? Number(item.gst_percent || item.gstRate) : 12;
+
+            // Gemini's taxable_value = trade_price × qty × (1 - cd%) = our netValue
+            const netValue = Math.max(0, parseFloat(item.taxable_value || item.netValue) || 0);
+            // Gemini's net_value = taxable_value + GST = our lineTotal
+            const lineTotal = Math.max(0, parseFloat(item.net_value || item.lineTotal) || 0);
+            // Compute gstValue from the difference (net_value - taxable_value)
+            const gstValue = Math.max(0, +(lineTotal - netValue).toFixed(2));
+
+            return {
+                medicineName: String(item.medicineName || item.description || "").trim(),
+                batchNumber: String(item.batch_no || item.batchNumber || "").trim(),
+                expiryDate: String(item.exp_date || item.expiryDate || "").trim(),
+                quantityBilled,
+                quantityFree: Math.max(0, parseInt(item.free_scm || item.quantityFree) || 0),
+                tradePrice,
+                cdPercent,
+                scmDiscount: Math.max(0, parseFloat(item.scm_dis_value || item.scmDiscount) || 0),
+                netValue,
+                gstRate,
+                gstValue,
+                mrp: Math.max(0, parseFloat(item.mrp) || 0),
+                packSize: (item.pack || item.packSize) ? String(item.pack || item.packSize).trim() : null,
+                hsnCode: (item.hsn_code || item.hsnCode) ? String(item.hsn_code || item.hsnCode).trim() : null,
+                rack: item.rack ? String(item.rack).trim() : null,
+                ptr: Math.max(0, parseFloat(item.ptr) || 0),
+                mfac: item.mfac ? String(item.mfac).trim() : null,
+                lineTotal,
+                confidence: Math.max(0, Math.min(1, parseFloat(item.confidence) || 0.5))
+            };
+        });
     }
 
-    // Recompute netValue using tradePrice × qty × (1 - cdPercent/100), then gstValue from netValue
-    result.lineItems.forEach(item => {
-        if (item.tradePrice > 0 && item.quantityBilled > 0) {
-            const cdMultiplier = 1 - (item.cdPercent / 100);
-            const expectedNet = +(item.tradePrice * item.quantityBilled * cdMultiplier).toFixed(2);
-            if (Math.abs(item.netValue - expectedNet) > 1) {
-                item.netValue = expectedNet;
-            }
-        }
-        if (item.netValue > 0 && item.gstRate > 0) {
-            const expectedGst = +(item.netValue * item.gstRate / 100).toFixed(2);
-            if (Math.abs(item.gstValue - expectedGst) > 1) {
-                item.gstValue = expectedGst;
-            }
+    // Post-mapping sanity check: detect column-shifted values.
+    // If taxable_value is suspiciously low compared to trade_price × qty,
+    // Gemini likely shifted a value from an adjacent column (qty, discount, etc.)
+    // into the taxable_value slot. Flag these for review.
+    result.lineItems.forEach((item) => {
+        const formulaNet = item.tradePrice > 0 && item.quantityBilled > 0
+            ? +(item.tradePrice * item.quantityBilled * (1 - item.cdPercent / 100)).toFixed(2)
+            : 0;
+        // If extracted taxable is < 20% of formula estimate AND formula estimate > ₹50,
+        // the extracted value is almost certainly a column-shift error
+        if (formulaNet > 50 && item.netValue > 0 && item.netValue < formulaNet * 0.2) {
+            item.columnShiftSuspected = true;
+            item.validationNote = `Possible column shift: taxable ₹${item.netValue} looks too low (expected ~₹${formulaNet} based on trade ₹${item.tradePrice} × ${item.quantityBilled} pcs)`;
+            item.confidence = Math.max(0.2, item.confidence - 0.3); // Lower confidence
+            logger.warn(`[parseGeminiResponse] Column shift suspected for "${item.medicineName}": got taxable ₹${item.netValue}, formula suggests ~₹${formulaNet}`);
         }
     });
+
+    // Soft-validate each line item against arithmetic formula
+    // Printed invoice values are the source of truth — formula is only used
+    // to detect large discrepancies (likely OCR errors), not distributor rounding.
+    // Tolerance: ₹10 per line (pharma distributors apply scheme/cd adjustments
+    // that shift taxable values by a few rupees from the base formula).
+    let flaggedCount = 0;
+    result.lineItems.forEach((item) => {
+        const expectedNet = item.tradePrice > 0 && item.quantityBilled > 0
+            ? +(item.tradePrice * item.quantityBilled * (1 - item.cdPercent / 100)).toFixed(2)
+            : item.netValue;
+        const expectedGst = item.netValue > 0 && item.gstRate > 0
+            ? +(item.netValue * item.gstRate / 100).toFixed(2)
+            : item.gstValue;
+        const expectedLineTotal = +(item.netValue + expectedGst).toFixed(2);
+
+        const netMismatch = Math.abs(item.netValue - expectedNet) > 10;
+        const gstMismatch = Math.abs(item.gstValue - expectedGst) > 10;
+        const lineTotalMismatch = Math.abs(item.lineTotal - expectedLineTotal) > 10;
+
+        if (netMismatch || gstMismatch || lineTotalMismatch) {
+            item.lineValidationFailed = true;
+            item.expectedNetValue = expectedNet;
+            item.expectedGstValue = expectedGst;
+            item.expectedLineTotal = expectedLineTotal;
+            item.validationNote = netMismatch
+                ? `Expected taxable ₹${expectedNet} (got ₹${item.netValue})`
+                : gstMismatch
+                    ? `Expected GST ₹${expectedGst} (got ₹${item.gstValue})`
+                    : `Expected total ₹${expectedLineTotal} (got ₹${item.lineTotal})`;
+            flaggedCount++;
+        } else {
+            item.lineValidationFailed = false;
+            item.expectedNetValue = expectedNet;
+        }
+    });
+
+    if (flaggedCount > 0) {
+        logger.info(`[parseGeminiResponse] ${flaggedCount} of ${result.lineItems.length} lines have large formula discrepancies (likely OCR errors)`);
+    }
+
+    // Grand-total cross-verification: compare sum of extracted line totals
+    // against the printed grand total. If they diverge massively, columns are
+    // likely shifted across multiple rows (systemic extraction error).
+    if (result.invoiceTotal > 0 && result.lineItems.length > 0) {
+        let sumNet = 0, sumGst = 0;
+        result.lineItems.forEach(item => {
+            sumNet += item.netValue || 0;
+            sumGst += item.gstValue || 0;
+        });
+        const extractedTotal = sumNet + sumGst - (result.schemeDiscount || 0) - (result.cashDiscount || 0) + (result.roundOff || 0);
+        const totalRatio = extractedTotal / result.invoiceTotal;
+
+        if (totalRatio < 0.5 || totalRatio > 2.0) {
+            // Massive divergence — almost certainly a systemic column-shift problem
+            logger.warn(`[parseGeminiResponse] Grand total mismatch: extracted ₹${extractedTotal.toFixed(2)} vs printed ₹${result.invoiceTotal} (ratio ${totalRatio.toFixed(2)})`);
+            result.lineItems.forEach(item => {
+                if (!item.columnShiftSuspected) {
+                    item.columnShiftSuspected = true;
+                    item.validationNote = `Systemic extraction issue: line totals sum to ₹${extractedTotal.toFixed(2)} but invoice declares ₹${result.invoiceTotal}`;
+                    item.confidence = Math.max(0.2, item.confidence - 0.2);
+                }
+            });
+        } else if (totalRatio < 0.8 || totalRatio > 1.2) {
+            // Moderate divergence — flag as informational
+            logger.info(`[parseGeminiResponse] Grand total moderate divergence: extracted ₹${extractedTotal.toFixed(2)} vs printed ₹${result.invoiceTotal} (ratio ${totalRatio.toFixed(2)})`);
+        }
+    }
 
     return result;
 }
@@ -377,16 +579,26 @@ exports.saveInvoice = onCall(
         const batch = db.batch();
 
         try {
-            // Write invoice document
+            // Write invoice document (includes lineItems for client-side continuation merging)
             const invoiceRef = db.collection("pharmacies").doc(pharmacyId).collection("invoices").doc();
             batch.set(invoiceRef, {
                 distributor: invoice.distributor || "",
+                buyerName: invoice.buyerName || null,
+                distributorId: invoice.distributorId || invoice.distributor || "",
                 invoiceNumber: invoice.invoiceNumber || "",
+                invoiceDate: invoice.invoiceDate || null,
                 invoiceTotal: invoice.invoiceTotal || 0,
+                totalTaxableAmount: invoice.totalTaxableAmount || 0,
+                cgstTotal: invoice.cgstTotal || 0,
+                sgstTotal: invoice.sgstTotal || 0,
                 schemeDiscount: invoice.schemeDiscount || 0,
                 cashDiscount: invoice.cashDiscount || 0,
                 roundOff: invoice.roundOff || 0,
+                pendingInvoicesCount: invoice.pendingInvoicesCount || 0,
+                pendingTotalAmount: invoice.pendingTotalAmount || 0,
+                imageHash: invoice.imageHash || "",
                 lineItemCount: medicines.length,
+                lineItems: medicines,
                 capturedAt: FieldValue.serverTimestamp(),
                 confirmedBy: request.auth.token.phone_number || request.auth.uid,
                 source: "cloud-function",
@@ -407,9 +619,17 @@ exports.saveInvoice = onCall(
                     tradePrice: med.tradePrice || 0,
                     cdPercent: med.cdPercent || 0,
                     unitPrice: med.tradePrice || 0,
+                    scmDiscount: med.scmDiscount || 0,
                     netValue: med.netValue || 0,
                     gstRate: med.gstRate || 0,
                     gstValue: med.gstValue || 0,
+                    lineTotal: med.lineTotal || 0,
+                    mrp: med.mrp || 0,
+                    packSize: med.packSize || "",
+                    hsnCode: med.hsnCode || "",
+                    rack: med.rack || "",
+                    ptr: med.ptr || 0,
+                    mfac: med.mfac || null,
                     distributor: invoice.distributor || "",
                     invoiceId: invoiceRef.id,
                     confidence: med.confidence || 0,
@@ -463,6 +683,41 @@ exports.deleteMedicine = onCall(
         await db.collection("pharmacies").doc(pharmacyId).collection("medicines").doc(medicineId).delete();
         logger.info(`[deleteMedicine] Deleted ${medicineId} from ${pharmacyId}`);
         return { success: true };
+    }
+);
+
+// ═══════════════════════════════════════════════════════════════════
+// saveDistributor — create or update a distributor document
+// ═══════════════════════════════════════════════════════════════════
+exports.saveDistributor = onCall(
+    {
+        region: "us-central1",
+        memory: "256MB",
+        timeoutSeconds: 30
+    },
+    async (request) => {
+        if (!request.auth) {
+            throw new HttpsError("unauthenticated", "User must be signed in");
+        }
+        const { pharmacyId, distributorId, name, phone, returnWindowDays } = request.data;
+        if (!pharmacyId || !name) {
+            throw new HttpsError("invalid-argument", "pharmacyId and name are required");
+        }
+        const { getFirestore, FieldValue } = require("firebase-admin/firestore");
+        const db = getFirestore();
+        const distRef = distributorId
+            ? db.collection("pharmacies").doc(pharmacyId).collection("distributors").doc(distributorId)
+            : db.collection("pharmacies").doc(pharmacyId).collection("distributors").doc();
+        const data = {
+            name: name,
+            phone: phone || "",
+            returnWindowDays: returnWindowDays || 0,
+            updatedAt: FieldValue.serverTimestamp()
+        };
+        if (!distributorId) data.createdAt = FieldValue.serverTimestamp();
+        await distRef.set(data, { merge: true });
+        logger.info(`[saveDistributor] Saved distributor ${distRef.id} for pharmacy=${pharmacyId}`);
+        return { success: true, distributorId: distRef.id };
     }
 );
 
