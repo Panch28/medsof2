@@ -1705,6 +1705,39 @@ function renderReviewPanel(data) {
     if (sgstEl) sgstEl.textContent = `₹${(data.sgstTotal || 0).toFixed(2)}`;
     if (taxableEl) taxableEl.textContent = `₹${(data.totalTaxableAmount || 0).toFixed(2)}`;
 
+    // Computed Summary (from reconcileAndCalculateInvoice on server)
+    const cs = data.computedSummary;
+    const csPanel = $('#computed-summary-panel');
+    if (cs && cs.totalItemsCount > 0) {
+        csPanel.classList.remove('hidden');
+        $('#computed-items-count').textContent = cs.totalItemsCount;
+        $('#computed-total-qty').textContent = cs.totalQty;
+        $('#computed-total-gst').textContent = `₹${(cs.totalGst || 0).toFixed(2)}`;
+        $('#computed-grand-total').textContent = `₹${(cs.grandTotalComputed || 0).toFixed(2)}`;
+        $('#computed-declared-total').textContent = `₹${(cs.grandTotalDeclared || 0).toFixed(2)}`;
+        const badge = $('#computed-summary-badge');
+        const discRow = $('#computed-discrepancy-row');
+        const discVal = $('#computed-discrepancy-val');
+        const disc = Math.abs(cs.discrepancy || 0);
+        if (cs.grandTotalDeclared === 0) {
+            badge.textContent = 'No Declared Total';
+            badge.className = 'px-2 py-0.5 text-[9px] rounded font-bold uppercase tracking-wider bg-slate-800 text-slate-400';
+            discRow.classList.add('hidden');
+        } else if (disc <= 10) {
+            badge.textContent = 'Matched';
+            badge.className = 'px-2 py-0.5 text-[9px] rounded font-bold uppercase tracking-wider bg-emerald-500/15 text-emerald-400 border border-emerald-500/30';
+            discRow.classList.add('hidden');
+        } else {
+            badge.textContent = `Diff ₹${disc.toFixed(2)}`;
+            badge.className = 'px-2 py-0.5 text-[9px] rounded font-bold uppercase tracking-wider bg-rose-500/15 text-rose-400 border border-rose-500/30';
+            discRow.classList.remove('hidden');
+            discVal.textContent = `₹${cs.discrepancy > 0 ? '+' : ''}${cs.discrepancy.toFixed(2)}`;
+            discVal.className = `font-mono font-bold ${disc > 10 ? 'text-rose-400' : 'text-amber-400'}`;
+        }
+    } else {
+        csPanel.classList.add('hidden');
+    }
+
     window.triggerRecalculate();
 }
 

@@ -292,6 +292,38 @@
                                 
                                 <div class="flex-1 overflow-y-auto p-4 space-y-4 min-h-0">
                                     <div id="pipeline-alerts" class="space-y-1"></div>
+                                    <div id="computed-summary-panel" class="hidden bg-slate-800/40 border border-slate-700/50 rounded-xl p-3 space-y-2">
+                                        <div class="flex items-center justify-between">
+                                            <span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Reconciliation Summary</span>
+                                            <span id="computed-summary-badge" class="px-2 py-0.5 text-[9px] rounded font-bold uppercase tracking-wider"></span>
+                                        </div>
+                                        <div class="grid grid-cols-3 gap-2 text-[10px]">
+                                            <div>
+                                                <span class="text-slate-500">Items</span>
+                                                <span id="computed-items-count" class="block font-mono text-slate-200 font-bold">0</span>
+                                            </div>
+                                            <div>
+                                                <span class="text-slate-500">Total Qty</span>
+                                                <span id="computed-total-qty" class="block font-mono text-slate-200 font-bold">0</span>
+                                            </div>
+                                            <div>
+                                                <span class="text-slate-500">GST Computed</span>
+                                                <span id="computed-total-gst" class="block font-mono text-slate-200 font-bold">₹0.00</span>
+                                            </div>
+                                        </div>
+                                        <div class="flex justify-between items-center text-[10px] pt-1 border-t border-slate-700/50">
+                                            <span class="text-slate-500">Computed Grand Total</span>
+                                            <span id="computed-grand-total" class="font-mono font-bold text-slate-100">₹0.00</span>
+                                        </div>
+                                        <div class="flex justify-between items-center text-[10px]">
+                                            <span class="text-slate-500">Declared Grand Total</span>
+                                            <span id="computed-declared-total" class="font-mono font-bold text-indigo-400">₹0.00</span>
+                                        </div>
+                                        <div id="computed-discrepancy-row" class="hidden flex justify-between items-center text-[10px] pt-1 border-t border-slate-700/50">
+                                            <span class="text-slate-500">Discrepancy</span>
+                                            <span id="computed-discrepancy-val" class="font-mono font-bold text-emerald-400">₹0.00</span>
+                                        </div>
+                                    </div>
                                     <div id="review-line-items" class="space-y-3"></div>
                                 </div>
                                 
