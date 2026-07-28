@@ -1,28 +1,4 @@
 {
-  "indexes": [
-    {
-      "collectionGroup": "medicines",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "addedAt", "order": "DESCENDING" },
-        { "fieldPath": "expiryDate", "order": "ASCENDING" }
-      ]
-    },
-    {
-      "collectionGroup": "medicines",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "medicineName", "order": "ASCENDING" }
-      ]
-    },
-    {
-      "collectionGroup": "medicines",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "distributor", "order": "ASCENDING" },
-        { "fieldPath": "addedAt", "order": "DESCENDING" }
-      ]
-    }
-  ],
+  "indexes": [],
   "fieldOverrides": []
 }

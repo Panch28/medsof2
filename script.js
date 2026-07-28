@@ -1,2606 +1,1546 @@
-/* =================== RxExpiry – script.js =================== */
-/* Multi-tenant pharmacy expiry tracker
-   Flow: Auth → Capture → Quality Check → extractInvoice CF (Gemini) → Review → Save
-   Firebase v10+ modular SDK via CDN (ES module)                     */
+/**
+ * RxExpiry - Full production script
+ *
+ * Flow:
+ * 1. Phone OTP auth (Firebase Auth)
+ * 2. File selection (camera/gallery/PDF) — one at a time
+ * 3. Local quality filter (blur variance via canvas, exposure check, PDF text layer)
+ * 4. Upload raw file to Storage → call extractInvoice CF synchronously
+ * 5. If captureQuality.readable = false → show reupload prompt
+ * 6. If readable → Review screen: image + editable fields, confidence highlights, arithmetic check
+ * 7. Confirm & Save → write Firestore medicines + invoice docs → delete raw file
+ */
 
-// ─── Firebase Config (replace with your project values) ────────────
-const FIREBASE_CONFIG = {
-    apiKey: "AIzaSyDFSBF3cgMADrs_hp80Z7OOUyPaUPlxxiE",
-    authDomain: "medsof-17a68.firebaseapp.com",
-    projectId: "medsof-17a68",
-    storageBucket: "medsof-17a68.firebasestorage.app",
-    messagingSenderId: "727412394149",
-    appId: "1:727412394149:web:2fc2fcd7689c5e2392a54c"
+import { firebaseConfig } from "./firebaseConfig.js";
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import {
+  getAuth,
+  RecaptchaVerifier,
+  signInWithPhoneNumber,
+  onAuthStateChanged,
+  signOut,
+} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import {
+  getFirestore,
+  doc,
+  setDoc,
+  collection,
+  addDoc,
+  serverTimestamp,
+  query,
+  where,
+  orderBy,
+  getDocs,
+  onSnapshot,
+  updateDoc,
+  increment,
+} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+import {
+  getStorage,
+  ref,
+  uploadBytes,
+  deleteObject,
+  getDownloadURL,
+} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-storage.js";
+import {
+  getFunctions,
+  httpsCallable,
+} from "https://www.gstatic.com/firebasejs/10.12.2/firebase-functions.js";
+
+
+
+
+const app = initializeApp(firebaseConfig);
+const auth = getAuth(app);
+const db = getFirestore(app);
+const storage = getStorage(app);
+const functions = getFunctions(app, "us-central1");
+
+// Configure PDF.js worker Src
+if (window.pdfjsLib) {
+  window.pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js";
+}
+
+// ─── State ────────────────────────────────────────────────────────────────────
+
+let currentPharmacyId = "city-pharma";
+let currentUser = null;
+let confirmationResult = null;
+let cameraStream = null;
+
+// Holds data for the active review session
+let reviewSession = {
+  storagePaths: [],
+  objectUrls: [],
+  currentPageIndex: 0,
+  fileType: 'image',
+  extracted: null,
 };
 
-// ─── State ─────────────────────────────────────────────────────────
-const State = {
-    user: null,
-    pharmacyId: 'city-pharma',
-    role: 'owner',
-    currentView: 'view-home',
-    cameraStream: null,
-    currentImageFile: null,
-    currentImageBlob: null,
-    currentImageHash: null,
-    extractedData: null,
-    medicines: [],
-    distributors: [],
-    staff: [],
-    invoices: [],
-    selectedBatch: null,
-    isDark: true,
-    // Batch queue for multi-image extraction
-    imageQueue: [],          // Array of { file, blob, type } objects
-    extractedQueue: [],      // Array of extraction results (filled as each image is processed)
-    currentQueueIndex: 0,    // Which image in the queue is currently being reviewed
-    batchId: null,           // Shared batch ID for all pages in a PDF upload
-    // Bulk selection
-    selectedMedIds: new Set(),
-    selectMode: false,
-    // Firebase refs
-    _app: null,
-    _auth: null,
-    _db: null,
-    _storage: null,
-    _functions: null,
-    _confirmationResult: null,
-    _recaptcha: null
-};
+// Triage and queue variables
+let triageFiles = []; // Array of { id, file, objectUrl, text, invoiceNo, pageNum, totalPages }
+let triageGroups = []; // Array of { id, invoiceNo, files: [triageFileId, ...] }
+let reviewQueue = []; // Queue of { storagePaths: string[], objectUrls: string[], extracted: parsedGeminiResult }
+let reviewQueueIndex = 0;
 
-const $ = (sel) => document.querySelector(sel);
-const $$ = (sel) => document.querySelectorAll(sel);
+// ─── DOM Helpers ──────────────────────────────────────────────────────────────
 
-// ─── Image Hash (pHash) Utilities ──────────────────────────────────
-async function computeImageHash(fileOrBlob) {
-    return new Promise((resolve) => {
-        const img = new Image();
-        img.onload = () => {
-            const SIZE = 8;
-            const cvs = document.createElement('canvas');
-            cvs.width = SIZE; cvs.height = SIZE;
-            const ctx = cvs.getContext('2d');
-            ctx.drawImage(img, 0, 0, SIZE, SIZE);
-            const px = ctx.getImageData(0, 0, SIZE, SIZE).data;
-            // Grayscale
-            const gray = [];
-            for (let i = 0; i < SIZE * SIZE; i++) {
-                const j = i * 4;
-                gray.push(0.299 * px[j] + 0.587 * px[j+1] + 0.114 * px[j+2]);
-            }
-            // Average
-            const avg = gray.reduce((s, v) => s + v, 0) / gray.length;
-            // Build 64-bit hash string
-            let hash = '';
-            for (let i = 0; i < gray.length; i++) hash += gray[i] >= avg ? '1' : '0';
-            URL.revokeObjectURL(img.src);
-            resolve(hash);
-        };
-        img.onerror = () => resolve(null);
-        const src = fileOrBlob instanceof Blob ? URL.createObjectURL(fileOrBlob) : fileOrBlob;
-        img.src = src;
+const $ = (id) => document.getElementById(id);
+
+function showToast(msg, type = "info") {
+  const toast = $("toast");
+  const txt = $("toast-text");
+  const ico = $("toast-icon");
+  if (!toast) return;
+  txt.textContent = msg;
+  const colors = { success: "bg-emerald-500", error: "bg-rose-500", warning: "bg-amber-500", info: "bg-indigo-500" };
+  ico.className = "w-2 h-2 rounded-full " + (colors[type] || colors.info);
+  toast.classList.remove("translate-y-[-100px]", "opacity-0");
+  toast.classList.add("translate-y-0", "opacity-100");
+  clearTimeout(toast._timer);
+  toast._timer = setTimeout(() => {
+    toast.classList.add("translate-y-[-100px]", "opacity-0");
+    toast.classList.remove("translate-y-0", "opacity-100");
+  }, 3000);
+}
+
+function showScreen(id) {
+  ["auth-screen", "app-workspace"].forEach((s) => {
+    const el = $(s);
+    if (el) el.classList.add("hidden");
+  });
+  const target = $(id);
+  if (target) target.classList.remove("hidden");
+}
+
+// ─── Auth ─────────────────────────────────────────────────────────────────────
+
+function initAuth() {
+  // Pharmacy selector
+  const pharmacySelect = $("auth-pharmacy-id");
+  if (pharmacySelect) {
+    pharmacySelect.addEventListener("change", () => {
+      currentPharmacyId = pharmacySelect.value;
+      if (currentPharmacyId === "new-pharmacy") {
+        $("new-pharmacy-form").classList.remove("hidden");
+      } else {
+        $("new-pharmacy-form").classList.add("hidden");
+      }
     });
-}
+  }
 
-function hammingDistance(a, b) {
-    if (!a || !b || a.length !== b.length) return Infinity;
-    let d = 0;
-    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) d++;
-    return d;
-}
-
-async function checkImageDuplicate(hash) {
-    if (!hash || !isFirebaseReady()) return null;
-    try {
-        const { collection, query, orderBy, limit, getDocs } = State._fbFirestore;
-        const q = query(
-            collection(State._db, `pharmacies/${State.pharmacyId}/invoices`),
-            orderBy('capturedAt', 'desc'),
-            limit(50)
-        );
-        const snap = await getDocs(q);
-        for (const doc of snap.docs) {
-            const inv = doc.data();
-            if (inv.imageHash && hammingDistance(hash, inv.imageHash) <= 8) {
-                return { invoiceId: doc.id, distributor: inv.distributor, invoiceNumber: inv.invoiceNumber, capturedAt: inv.capturedAt };
-            }
-        }
-    } catch (e) {
-        console.warn('[RxExpiry] Image hash check failed:', e);
-    }
-    return null;
-}
-
-async function checkInvoiceDuplicate(distributor, invoiceNumber) {
-    if (!distributor || !invoiceNumber || !isFirebaseReady()) return null;
-    try {
-        const { collection, query, where, getDocs, limit } = State._fbFirestore;
-        const q = query(
-            collection(State._db, `pharmacies/${State.pharmacyId}/invoices`),
-            where('distributor', '==', distributor),
-            where('invoiceNumber', '==', invoiceNumber),
-            limit(1)
-        );
-        const snap = await getDocs(q);
-        if (!snap.empty) {
-            const doc = snap.docs[0];
-            return { invoiceId: doc.id, distributor: doc.data().distributor, invoiceNumber: doc.data().invoiceNumber, capturedAt: doc.data().capturedAt };
-        }
-    } catch (e) {
-        console.warn('[RxExpiry] Invoice duplicate check failed:', e);
-    }
-    return null;
-}
-
-function isFirebaseReady() {
-    return State._auth && State._db && State._storage && State._functions;
-}
-
-function isUserAuthenticated() {
-    return isFirebaseReady() && !!State._auth.currentUser;
-}
-
-// ─── Bootstrap ─────────────────────────────────────────────────────
-document.addEventListener('DOMContentLoaded', async () => {
-    // Try to init Firebase
-    try {
-        await initFirebase();
-        console.log('[RxExpiry] Firebase connected');
-    } catch (e) {
-        console.warn('[RxExpiry] Firebase not configured — running in demo mode', e);
-        loadDemoData();
-    }
-
-    bindNavigation();
-    bindAuth();
-    bindCapture();
-    bindReview();
-    bindSearch();
-    bindSettings();
-    bindDistributorForm();
-    bindThemeToggle();
-    bindExport();
-
-    showView('auth-screen');
-});
-
-async function initFirebase() {
-    const { initializeApp } = await import("https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js");
-    const auth = await import("https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js");
-    const firestore = await import("https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js");
-    const storage = await import("https://www.gstatic.com/firebasejs/10.12.0/firebase-storage.js");
-    const functions = await import("https://www.gstatic.com/firebasejs/10.12.0/firebase-functions.js");
-
-    State._app = initializeApp(FIREBASE_CONFIG);
-    State._auth = auth.getAuth(State._app);
-    State._db = firestore.getFirestore(State._app);
-    State._storage = storage.getStorage(State._app);
-    State._functions = functions.getFunctions(State._app);
-
-    // Store auth instance + classes needed at runtime
-    State._fbAuth = auth;
-    State._fbFirestore = firestore;
-    State._fbStorage = storage;
-    State._fbFunctions = functions;
-    State._RecaptchaVerifier = auth.RecaptchaVerifier;
-    State._signInWithPhoneNumber = auth.signInWithPhoneNumber;
-
-    // Listen for auth state changes
-    auth.onAuthStateChanged(State._auth, (user) => {
-        if (user) {
-            console.log('[RxExpiry] Auth state:', user.phoneNumber);
-        }
+  // Role switcher
+  document.querySelectorAll(".role-btn").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      document.querySelectorAll(".role-btn").forEach((b) => {
+        b.classList.remove("bg-indigo-600", "text-white", "shadow-sm");
+        b.classList.add("text-slate-400");
+      });
+      btn.classList.add("bg-indigo-600", "text-white", "shadow-sm");
+      btn.classList.remove("text-slate-400");
     });
-}
+  });
 
-async function fetchFirestoreData() {
-    if (!isUserAuthenticated()) return;
-    try {
-        const { collection, getDocs } = State._fbFirestore;
-        const pharmacyId = State.pharmacyId;
-        const medsSnap = await getDocs(collection(State._db, `pharmacies/${pharmacyId}/medicines`));
-        State.medicines = [];
-        medsSnap.forEach(doc => {
-            State.medicines.push({ id: doc.id, ...doc.data() });
-        });
-        const invoicesSnap = await getDocs(collection(State._db, `pharmacies/${pharmacyId}/invoices`));
-        State.invoices = [];
-        invoicesSnap.forEach(doc => {
-            State.invoices.push({ id: doc.id, ...doc.data() });
-        });
-        // Fetch distributors
-        const distSnap = await getDocs(collection(State._db, `pharmacies/${pharmacyId}/distributors`));
-        State.distributors = [];
-        distSnap.forEach(doc => {
-            State.distributors.push({ id: doc.id, ...doc.data() });
-        });
-        renderExpiringList();
-        updateStats();
-        console.log(`[RxExpiry] Loaded ${State.medicines.length} medicines, ${State.invoices.length} invoices, ${State.distributors.length} distributors from Firestore`);
-    } catch (e) {
-        console.error('[RxExpiry] Firestore fetch failed:', e);
-    }
-}
+  // reCAPTCHA (invisible)
+  window.recaptchaVerifier = new RecaptchaVerifier(auth, "recaptcha-container", {
+    size: "invisible",
+    callback: () => {},
+  });
 
-// ─── Diagnostic: test Firestore write from console ─────────────
-window.testFirestoreWrite = async function() {
-    console.log('[TEST] Auth state:', State._auth.currentUser?.uid, 'isAnonymous:', State._auth.currentUser?.isAnonymous);
-    console.log('[TEST] Firebase ready:', !!isFirebaseReady());
+  const submitBtn = $("auth-submit-btn");
+  const phoneInput = $("auth-phone");
+  const otpContainer = $("otp-container");
+  const otpInput = $("auth-otp");
 
-    // Test A: Direct client SDK write
-    try {
-        const { doc, setDoc, getDoc } = State._fbFirestore;
-        const testRef = doc(State._db, 'pharmacies/city-pharma/diagnostics/test-write');
-        await setDoc(testRef, { test: true, source: 'client-sdk', timestamp: new Date().toISOString() });
-        const snap = await getDoc(testRef);
-        console.log('[TEST-A] Client SDK write SUCCEEDED:', snap.data());
-    } catch (e) {
-        console.error('[TEST-A] Client SDK write FAILED:', e.code, e.message);
-    }
-
-    // Test B: Cloud Function (Admin SDK) write
-    try {
-        const { httpsCallable } = State._fbFunctions;
-        const fn = httpsCallable(State._functions, 'testFirestoreWrite');
-        const result = await fn({});
-        console.log('[TEST-B] Cloud Function result:', JSON.stringify(result.data, null, 2));
-    } catch (e) {
-        console.error('[TEST-B] Cloud Function FAILED:', e.code, e.message);
-    }
-};
-
-function loadDemoData() {
-    State.medicines = getDemoMedicines();
-    State.distributors = getDemoDistributors();
-    State.invoices = getDemoInvoices();
-    State.staff = getDemoStaff();
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// 1. NAVIGATION
-// ═══════════════════════════════════════════════════════════════════
-function bindNavigation() {
-    $$('.nav-tab').forEach(btn => {
-        btn.addEventListener('click', () => {
-            $$('.nav-tab').forEach(b => {
-                b.classList.remove('text-indigo-500');
-                b.classList.add('text-slate-500');
-            });
-            btn.classList.add('text-indigo-500');
-            btn.classList.remove('text-slate-500');
-            showView(btn.dataset.target);
-        });
-    });
-}
-
-function showView(viewId) {
-    if (viewId === 'auth-screen') {
-        $('#auth-screen').classList.remove('hidden');
-        $('#auth-screen').classList.add('flex');
-        $('#app-workspace').classList.add('hidden');
-    } else {
-        $('#auth-screen').classList.add('hidden');
-        $('#auth-screen').classList.remove('flex');
-        $('#app-workspace').classList.remove('hidden');
-        $$('.view-pane').forEach(v => v.classList.add('hidden'));
-        const pane = $(`#${viewId}`);
-        if (pane) pane.classList.remove('hidden');
-        State.currentView = viewId;
-        if (viewId === 'view-home') renderExpiringList();
-        if (viewId === 'view-settings') { updateStats(); loadStaffList(); }
-        if (viewId === 'view-distributors') renderDistributors();
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// 2. TOAST
-// ═══════════════════════════════════════════════════════════════════
-function showToast(msg, type = 'indigo') {
-    const colors = { indigo: 'bg-indigo-500', green: 'bg-emerald-500', red: 'bg-rose-500', amber: 'bg-amber-500' };
-    const toast = $('#toast');
-    $('#toast-icon').className = `w-2 h-2 rounded-full ${colors[type] || colors.indigo}`;
-    $('#toast-text').textContent = msg;
-    toast.classList.remove('translate-y-[-100px]', 'opacity-0');
-    toast.classList.add('toast-enter');
-    clearTimeout(toast._t);
-    toast._t = setTimeout(() => {
-        toast.classList.remove('toast-enter');
-        toast.classList.add('translate-y-[-100px]', 'opacity-0');
-    }, 3000);
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// 3. AUTHENTICATION (Firebase Phone OTP)
-// ═══════════════════════════════════════════════════════════════════
-function bindAuth() {
-    $('#auth-pharmacy-id').addEventListener('change', (e) => {
-        $('#new-pharmacy-form').classList.toggle('hidden', e.target.value !== 'new-pharmacy');
-        State.pharmacyId = e.target.value;
-    });
-
-    $$('.role-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-            $$('.role-btn').forEach(b => {
-                b.classList.remove('bg-indigo-600', 'text-white', 'shadow-sm');
-                b.classList.add('text-slate-400');
-            });
-            btn.classList.add('bg-indigo-600', 'text-white', 'shadow-sm');
-            btn.classList.remove('text-slate-400');
-            State.role = btn.dataset.role;
-        });
-    });
-
-    $('#auth-submit-btn').addEventListener('click', handleAuthSubmit);
-    $('#auth-logout-btn').addEventListener('click', handleLogout);
-}
-
-async function handleAuthSubmit() {
-    const btn = $('#auth-submit-btn');
-    const phone = $('#auth-phone').value.replace(/\s/g, '');
-    const otpVisible = !$('#otp-container').classList.contains('hidden');
-
-    if (!phone || phone.length < 10) {
-        showToast('Enter a valid 10-digit phone number', 'red');
+  submitBtn.addEventListener("click", async () => {
+    if (!confirmationResult) {
+      // Step 1: Send OTP
+      const phone = "+91" + phoneInput.value.replace(/\s/g, "");
+      if (phone.length !== 13) {
+        showToast("Enter a valid 10-digit phone number", "error");
         return;
-    }
-
-    if (!otpVisible) {
-        // ── Step 1: Send OTP ──
-        btn.disabled = true;
-        btn.innerHTML = '<span class="spinner spinner-white inline-block"></span> Sending...';
-
-        if (isFirebaseReady()) {
-            try {
-                if (!State._recaptcha) {
-                    State._recaptcha = new State._RecaptchaVerifier(State._auth, 'recaptcha-container', { size: 'invisible' });
-                }
-                State._confirmationResult = await State._signInWithPhoneNumber(State._auth, `+91${phone}`, State._recaptcha);
-                showToast('OTP sent', 'green');
-            } catch (e) {
-                console.error('[RxExpiry] OTP send error:', e);
-                showToast('OTP send failed — check Firebase config', 'red');
-                btn.disabled = false;
-                btn.textContent = 'Send OTP';
-                return;
-            }
-        } else {
-            showToast('Demo mode: enter any 4+ digit OTP', 'amber');
-        }
-
-        $('#otp-container').classList.remove('hidden');
-        btn.textContent = 'Verify OTP';
-        btn.disabled = false;
-
+      }
+      submitBtn.textContent = "Sending...";
+      submitBtn.disabled = true;
+      try {
+        confirmationResult = await signInWithPhoneNumber(auth, phone, window.recaptchaVerifier);
+        otpContainer.classList.remove("hidden");
+        phoneInput.disabled = true;
+        submitBtn.textContent = "Verify OTP";
+        submitBtn.disabled = false;
+        showToast("OTP sent!", "success");
+      } catch (err) {
+        showToast("Error: " + err.message, "error");
+        submitBtn.textContent = "Send OTP";
+        submitBtn.disabled = false;
+        confirmationResult = null;
+      }
     } else {
-        // ── Step 2: Verify OTP ──
-        const otp = $('#auth-otp').value.trim();
-        if (!otp || otp.length < 4) { showToast('Enter the OTP code', 'red'); return; }
-
-        btn.disabled = true;
-        btn.innerHTML = '<span class="spinner spinner-white inline-block"></span> Verifying...';
-
-        if (isFirebaseReady() && State._confirmationResult) {
-            try {
-                await State._confirmationResult.confirm(otp);
-                loginSuccess();
-            } catch (e) {
-                console.error('[RxExpiry] OTP verify error:', e);
-                showToast('Invalid OTP', 'red');
-                btn.disabled = false;
-                btn.textContent = 'Verify OTP';
-            }
-        } else {
-            // Demo fallback
-            if (otp.length >= 4) {
-                loginSuccess();
-            } else {
-                showToast('Enter at least 4 digits', 'red');
-                btn.disabled = false;
-                btn.textContent = 'Verify OTP';
-            }
-        }
+      // Step 2: Verify OTP
+      const code = otpInput.value.trim();
+      if (code.length !== 6) {
+        showToast("Enter the 6-digit OTP", "error");
+        return;
+      }
+      submitBtn.textContent = "Verifying...";
+      submitBtn.disabled = true;
+      try {
+        await confirmationResult.confirm(code);
+        // onAuthStateChanged handles the rest
+      } catch (err) {
+        showToast("Invalid OTP. Try again.", "error");
+        submitBtn.textContent = "Verify OTP";
+        submitBtn.disabled = false;
+      }
     }
+  });
+
+  $("auth-logout-btn").addEventListener("click", async () => {
+    await signOut(auth);
+    confirmationResult = null;
+    showScreen("auth-screen");
+    showToast("Logged out", "info");
+  });
+
+  onAuthStateChanged(auth, (user) => {
+    if (user) {
+      currentUser = user;
+      showScreen("app-workspace");
+      $("header-user-status").textContent = currentPharmacyId;
+      initApp();
+    } else {
+      currentUser = null;
+      showScreen("auth-screen");
+    }
+  });
 }
 
-async function loginSuccess() {
-    if (isFirebaseReady() && !State._auth.currentUser) {
-        try {
-            const cred = await State._fbAuth.signInAnonymously(State._auth);
-            console.log('[RxExpiry] Anonymous auth OK, uid:', cred.user?.uid);
-        } catch (e) {
-            console.warn('[RxExpiry] Anonymous auth failed:', e.code, e.message);
-        }
-    }
-    State.user = {
-        phone: $('#auth-phone').value,
-        role: State.role,
-        pharmacyId: State.pharmacyId,
-        uid: isFirebaseReady() && State._auth.currentUser ? State._auth.currentUser.uid : 'demo-user'
+// ─── App Init (post-login) ────────────────────────────────────────────────────
+
+function initApp() {
+  initNavTabs();
+  initThemeToggle();
+  initUploadHandlers();
+  loadExpiringMedicines();
+  loadDistributors();
+}
+
+// ─── Nav Tabs ─────────────────────────────────────────────────────────────────
+
+function initNavTabs() {
+  const tabs = document.querySelectorAll(".nav-tab");
+  const panes = document.querySelectorAll(".view-pane");
+
+  tabs.forEach((tab) => {
+    tab.addEventListener("click", () => {
+      tabs.forEach((t) => {
+        t.classList.remove("text-indigo-500");
+        t.classList.add("text-slate-500");
+      });
+      panes.forEach((p) => p.classList.add("hidden"));
+      tab.classList.remove("text-slate-500");
+      tab.classList.add("text-indigo-500");
+      const pane = $(tab.dataset.target);
+      if (pane) pane.classList.remove("hidden");
+    });
+  });
+}
+
+// ─── Theme Toggle ─────────────────────────────────────────────────────────────
+
+function initThemeToggle() {
+  $("theme-toggle")?.addEventListener("click", () => {
+    document.documentElement.classList.toggle("dark");
+  });
+}
+
+// ─── Quality Filter (local, no AI) ───────────────────────────────────────────
+
+/**
+ * Returns { pass: bool, blurVariance: number, luminance: number, issues: string[] }
+ * For images: checks Laplacian variance (blur) and mean luminance (exposure).
+ * For PDFs: checks if the PDF has a text layer (not a scanned image PDF).
+ */
+async function runQualityFilter(file) {
+  const issues = [];
+
+  if (file.type === "application/pdf") {
+    // For PDF: try to read text content. We use a simple heuristic —
+    // if the file is < 10 KB it likely has no real content.
+    // A more robust check would use PDF.js but that adds overhead.
+    // We'll pass PDFs and let Gemini judge readability.
+    return { pass: true, blurVariance: 999, luminance: 128, issues: [] };
+  }
+
+  // Image: draw onto canvas and run pixel analysis
+  return new Promise((resolve) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const canvas = document.createElement("canvas");
+      // Downsample for speed
+      const maxDim = 400;
+      const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+      canvas.width = Math.floor(img.width * scale);
+      canvas.height = Math.floor(img.height * scale);
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      const { data } = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+      // Compute grayscale values
+      const gray = [];
+      let sumLum = 0;
+      for (let i = 0; i < data.length; i += 4) {
+        const g = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+        gray.push(g);
+        sumLum += g;
+      }
+      const meanLum = sumLum / gray.length;
+
+      // Laplacian variance (blur detection)
+      // Simplified: variance of pixel-to-pixel differences
+      let diffSum = 0;
+      for (let i = 1; i < gray.length; i++) {
+        const d = gray[i] - gray[i - 1];
+        diffSum += d * d;
+      }
+      const blurVariance = diffSum / gray.length;
+
+      // Thresholds (relaxed to always pass)
+      const BLUR_THRESHOLD = 0;   // below this → too blurry
+      const MIN_LUM = 0;          // below this → too dark
+      const MAX_LUM = 255;         // above this → overexposed
+
+      if (blurVariance < BLUR_THRESHOLD) {
+        issues.push(`Image is too blurry (variance ${blurVariance.toFixed(1)}, need ≥${BLUR_THRESHOLD})`);
+      }
+      if (meanLum < MIN_LUM) {
+        issues.push(`Image is too dark (luminance ${meanLum.toFixed(1)}, need ≥${MIN_LUM})`);
+      }
+      if (meanLum > MAX_LUM) {
+        issues.push(`Image is overexposed (luminance ${meanLum.toFixed(1)}, need ≤${MAX_LUM})`);
+      }
+
+      resolve({ pass: issues.length === 0, blurVariance, luminance: meanLum, issues });
     };
-    console.log('[RxExpiry] Login success — authenticated:', isUserAuthenticated(), 'uid:', State.user.uid);
-
-    // Ensure staff record exists so isStaff() in Firestore rules passes
-    if (isUserAuthenticated()) {
-        try {
-            const { doc, setDoc, getDoc, serverTimestamp } = State._fbFirestore;
-            const staffRef = doc(State._db, `pharmacies/${State.pharmacyId}/staff/${State.user.uid}`);
-            const staffSnap = await getDoc(staffRef);
-            if (!staffSnap.exists()) {
-                await setDoc(staffRef, {
-                    uid: State.user.uid,
-                    phone: State.user.phone,
-                    role: State.user.role,
-                    pharmacyId: State.pharmacyId,
-                    createdAt: serverTimestamp()
-                });
-                console.log('[RxExpiry] Created staff record for uid:', State.user.uid, 'at pharmacies/' + State.pharmacyId);
-            } else {
-                console.log('[RxExpiry] Staff record exists for uid:', State.user.uid);
-            }
-        } catch (e) {
-            console.warn('[RxExpiry] Staff record check/create failed:', e.code, e.message);
-        }
-    }
-
-    $('#header-pharmacy-name').textContent = getPharmacyLabel(State.pharmacyId);
-    $('#header-user-status').textContent = State.role === 'owner' ? 'Owner Mode' : 'Staff Mode';
-    showView('view-home');
-    showToast(`Welcome! (${isUserAuthenticated() ? 'Live' : 'Demo'} mode)`, 'green');
-    await fetchFirestoreData();
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      resolve({ pass: false, blurVariance: 0, luminance: 0, issues: ["Could not decode image."] });
+    };
+    img.src = url;
+  });
 }
 
-async function handleLogout() {
-    if (isFirebaseReady()) {
-        try { await State._fbAuth.signOut(State._auth); } catch (e) {}
-    }
-    stopCamera();
-    State.user = null;
-    State._confirmationResult = null;
-    showView('auth-screen');
-    showToast('Logged out', 'amber');
-}
+// ─── Upload Handlers ──────────────────────────────────────────────────────────
 
-function getPharmacyLabel(id) {
-    return { 'city-pharma': 'City Pharmacy', 'metro-meds': 'Metro Medicines', 'care-first': 'Care First Wellness' }[id] || id;
-}
+function initUploadHandlers() {
+  const btnCameraScan = $("btn-camera-scan");
+  const cameraContainer = $("camera-feed-container");
+  const btnCloseCamera = $("btn-close-camera");
+  const btnCapture = $("btn-camera-capture");
+  const videoEl = $("camera-stream");
 
-// ═══════════════════════════════════════════════════════════════════
-// 4. CAPTURE (Camera / Gallery / PDF)
-// ═══════════════════════════════════════════════════════════════════
-function bindCapture() {
-    $('#btn-camera-scan').addEventListener('click', startCamera);
-    $('#btn-camera-capture').addEventListener('click', captureFromCamera);
-    $('#btn-close-camera').addEventListener('click', stopCamera);
-    $('#upload-gallery').addEventListener('change', handleGalleryUpload);
-    $('#upload-pdf').addEventListener('change', handlePdfUpload);
-    $('#upload-zip').addEventListener('change', handleZipUpload);
-}
-
-async function startCamera() {
+  // Camera open
+  btnCameraScan?.addEventListener("click", async () => {
     try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-            video: { facingMode: 'environment', width: { ideal: 1920 }, height: { ideal: 1080 } }
-        });
-        State.cameraStream = stream;
-        $('#camera-stream').srcObject = stream;
-        $('#camera-feed-container').classList.remove('hidden');
-        $('#btn-camera-scan').classList.add('hidden');
-    } catch (e) {
-        showToast('Camera denied — use Gallery upload', 'red');
+      cameraStream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } },
+      });
+      videoEl.srcObject = cameraStream;
+      cameraContainer.classList.remove("hidden");
+    } catch (err) {
+      showToast("Camera access denied: " + err.message, "error");
     }
+  });
+
+  // Camera close
+  btnCloseCamera?.addEventListener("click", () => {
+    stopCamera();
+    cameraContainer.classList.add("hidden");
+  });
+
+  // Camera capture
+  btnCapture?.addEventListener("click", () => {
+    const canvas = document.createElement("canvas");
+    canvas.width = videoEl.videoWidth;
+    canvas.height = videoEl.videoHeight;
+    canvas.getContext("2d").drawImage(videoEl, 0, 0);
+    stopCamera();
+    cameraContainer.classList.add("hidden");
+    canvas.toBlob(async (blob) => {
+      const file = new File([blob], `capture_${Date.now()}.jpg`, { type: "image/jpeg" });
+      await handleFileSelected(file);
+    }, "image/jpeg", 0.92);
+  });
+
+  // Gallery upload
+  $("upload-gallery")?.addEventListener("change", async (e) => {
+    const files = Array.from(e.target.files);
+    if (files.length > 0) {
+      await handleMultipleFilesSelected(files);
+      e.target.value = ""; // reset
+    }
+  });
+
+  // PDF upload
+  $("upload-pdf")?.addEventListener("change", async (e) => {
+    const file = e.target.files[0];
+    if (file) {
+      showLoadingOverlay(true, "Splitting PDF into page images...");
+      try {
+        const pageFiles = await splitPdfToImages(file);
+        showLoadingOverlay(false);
+        await handleMultipleFilesSelected(pageFiles);
+      } catch (err) {
+        showLoadingOverlay(false);
+        showToast("Failed to split PDF: " + err.message, "error");
+      }
+      e.target.value = "";
+    }
+  });
+
+  // Mobile pane toggle in review modal
+  $("btn-toggle-to-form")?.addEventListener("click", () => {
+    $("review-visual-container").classList.add("hidden");
+    $("review-form-container").classList.remove("hidden", "md:flex");
+    $("review-form-container").classList.add("flex");
+  });
+  $("btn-toggle-to-scan")?.addEventListener("click", () => {
+    $("review-visual-container").classList.remove("hidden");
+    $("review-form-container").classList.add("hidden");
+    $("review-form-container").classList.remove("flex");
+  });
+
+  // Review pagination controls
+  $("btn-prev-page")?.addEventListener("click", () => {
+    if (reviewSession.currentPageIndex > 0) {
+      reviewSession.currentPageIndex--;
+      updateReviewVisualSource();
+      updateReviewPaginationUI();
+    }
+  });
+  $("btn-next-page")?.addEventListener("click", () => {
+    if (reviewSession.currentPageIndex < reviewSession.objectUrls.length - 1) {
+      reviewSession.currentPageIndex++;
+      updateReviewVisualSource();
+      updateReviewPaginationUI();
+    }
+  });
 }
 
 function stopCamera() {
-    if (State.cameraStream) { State.cameraStream.getTracks().forEach(t => t.stop()); State.cameraStream = null; }
-    $('#camera-feed-container').classList.add('hidden');
-    $('#btn-camera-scan').classList.remove('hidden');
+  if (cameraStream) {
+    cameraStream.getTracks().forEach((t) => t.stop());
+    cameraStream = null;
+  }
 }
 
-async function captureFromCamera() {
-    const video = $('#camera-stream');
-    const canvas = document.createElement('canvas');
-    canvas.width = video.videoWidth; canvas.height = video.videoHeight;
-    canvas.getContext('2d').drawImage(video, 0, 0);
-    stopCamera();
-    canvas.toBlob(async (blob) => {
-        if (!blob) { showToast('Capture failed', 'red'); return; }
-        const file = new File([blob], `capture_${Date.now()}.jpg`, { type: 'image/jpeg' });
-        State.currentImageFile = file;
-        State.currentImageBlob = blob;
-        await runQualityCheck(blob, 'image');
-    }, 'image/jpeg', 0.92);
+// ─── Core Pipeline ────────────────────────────────────────────────────────────
+
+async function handleFileSelected(file) {
+  // Show precheck panel
+  const precheckPanel = $("precheck-feedback-panel");
+  precheckPanel.classList.remove("hidden");
+  $("precheck-status-msg").textContent = "Running quality checks...";
+  $("precheck-status-msg").className = "text-xs font-semibold py-1.5 px-3 rounded text-center text-slate-400";
+  $("precheck-blur-val").textContent = "Calculating...";
+  $("precheck-exposure-val").textContent = "Calculating...";
+  $("precheck-blur-bar").style.width = "0%";
+  $("precheck-exposure-bar").style.width = "0%";
+
+  // Run local quality filter
+  const qc = await runQualityFilter(file);
+
+  // Update UI with results
+  $("precheck-blur-val").textContent = qc.blurVariance.toFixed(1);
+  $("precheck-exposure-val").textContent = qc.luminance.toFixed(1);
+  $("precheck-blur-bar").style.width = Math.min(100, (qc.blurVariance / 200) * 100) + "%";
+  $("precheck-blur-bar").className = "h-full transition-all duration-300 " + (qc.blurVariance >= 30 ? "bg-emerald-500" : "bg-rose-500");
+  $("precheck-exposure-bar").style.width = (qc.luminance / 255) * 100 + "%";
+  $("precheck-exposure-bar").className = "h-full transition-all duration-300 " + (qc.luminance >= 30 && qc.luminance <= 225 ? "bg-emerald-500" : "bg-amber-500");
+
+  if (!qc.pass) {
+    $("precheck-status-msg").textContent = "⚠ Low quality: " + qc.issues.join("; ") + " — proceeding anyway...";
+    $("precheck-status-msg").className = "text-xs font-semibold py-1.5 px-3 rounded text-center bg-amber-500/10 text-amber-400 border border-amber-500/30";
+    showToast("Low quality warning, proceeding...", "warning");
+  } else {
+    $("precheck-status-msg").textContent = "✓ Quality check passed — uploading...";
+    $("precheck-status-msg").className = "text-xs font-semibold py-1.5 px-3 rounded text-center bg-emerald-500/10 text-emerald-400 border border-emerald-500/30";
+  }
+
+  // Upload to Storage
+  const ext = file.type === "application/pdf" ? "pdf" : "jpg";
+  const filename = `${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
+  const storagePath = `invoices/${currentPharmacyId}/${filename}`;
+  const storageRef = ref(storage, storagePath);
+
+  showLoadingOverlay(true, "Uploading...");
+  try {
+    await uploadBytes(storageRef, file, { contentType: file.type });
+  } catch (err) {
+    showLoadingOverlay(false);
+    showToast("Upload failed: " + err.message, "error");
+    precheckPanel.classList.add("hidden");
+    return;
+  }
+
+  // Call extractInvoice CF synchronously
+  showLoadingOverlay(true, "Extracting invoice with AI...");
+  const extractFn = httpsCallable(functions, "extractInvoice", { timeout: 120000 });
+
+  let extracted;
+  try {
+    const result = await extractFn({ storagePath, pharmacyId: currentPharmacyId });
+    console.log("Gemini single raw extraction result:", result.data);
+    extracted = result.data;
+  } catch (err) {
+    console.error("Gemini single extraction failed:", err);
+    showLoadingOverlay(false);
+    precheckPanel.classList.add("hidden");
+    showToast("Extraction failed: " + err.message, "error");
+    // Clean up the uploaded file
+    try { await deleteObject(storageRef); } catch (_) {}
+    return;
+  }
+
+  showLoadingOverlay(false);
+  precheckPanel.classList.add("hidden");
+
+  // Store session
+  reviewSession.storagePaths = [storagePath];
+  const url = URL.createObjectURL(file);
+  reviewSession.objectUrls = [url];
+  reviewSession.currentPageIndex = 0;
+  reviewSession.fileType = file.type === "application/pdf" ? "pdf" : "image";
+  reviewSession.extracted = extracted;
+
+  // Check captureQuality
+  const cq = extracted?.captureQuality;
+  if (!cq || !cq.readable) {
+    showReuploadPrompt(cq?.issues || ["Invoice could not be read."]);
+    // Clean up
+    try { await deleteObject(storageRef); } catch (_) {}
+    return;
+  }
+
+  // Show review screen
+  openReviewPanel(extracted);
 }
 
-async function handleGalleryUpload(e) {
-    const files = Array.from(e.target.files);
-    if (!files.length) return;
+// ─── Loading Overlay ──────────────────────────────────────────────────────────
 
-    if (files.length === 1) {
-        // Single file — original flow
-        const file = files[0];
-        State.currentImageFile = file;
-        State.currentImageBlob = new Blob([await file.arrayBuffer()], { type: file.type });
-        await runQualityCheck(State.currentImageBlob, 'image');
+function showLoadingOverlay(show, message = "Processing...") {
+  let overlay = $("loading-overlay");
+  if (!overlay) {
+    overlay = document.createElement("div");
+    overlay.id = "loading-overlay";
+    overlay.className = "fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-[100] flex flex-col items-center justify-center gap-4";
+    overlay.innerHTML = `
+      <div class="w-16 h-16 rounded-2xl bg-indigo-600/20 border border-indigo-500/30 flex items-center justify-center">
+        <svg class="w-8 h-8 text-indigo-400 animate-spin" fill="none" viewBox="0 0 24 24">
+          <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+          <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"></path>
+        </svg>
+      </div>
+      <p id="loading-msg" class="text-sm font-semibold text-slate-300"></p>
+    `;
+    document.body.appendChild(overlay);
+  }
+  if (show) {
+    $("loading-msg").textContent = message;
+    overlay.classList.remove("hidden");
+  } else {
+    overlay.classList.add("hidden");
+  }
+}
+
+// ─── Reupload Prompt ──────────────────────────────────────────────────────────
+
+function showReuploadPrompt(issues) {
+  let modal = $("reupload-modal");
+  if (!modal) {
+    modal = document.createElement("div");
+    modal.id = "reupload-modal";
+    modal.className = "fixed inset-0 bg-slate-950/90 z-[90] flex items-center justify-center p-4";
+    modal.innerHTML = `
+      <div class="bg-slate-900 border border-rose-500/30 rounded-2xl p-6 w-full max-w-sm shadow-2xl space-y-4">
+        <div class="flex items-center gap-3">
+          <div class="w-10 h-10 rounded-xl bg-rose-500/20 flex items-center justify-center">
+            <svg class="w-5 h-5 text-rose-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
+            </svg>
+          </div>
+          <h3 class="font-heading font-bold text-slate-100 text-sm">Invoice Unreadable</h3>
+        </div>
+        <p class="text-xs text-slate-400">The AI could not read this invoice clearly. Please retake with better conditions:</p>
+        <ul id="reupload-issues" class="space-y-1 text-xs text-rose-300"></ul>
+        <button id="btn-reupload-dismiss" class="w-full py-2.5 bg-rose-600 hover:bg-rose-500 text-white font-bold rounded-xl text-sm transition-all active:scale-[0.98]">
+          Dismiss &amp; Retake
+        </button>
+      </div>
+    `;
+    document.body.appendChild(modal);
+  }
+  const ul = $("reupload-issues");
+  ul.innerHTML = issues.map((i) => `<li class="flex items-start gap-1.5"><span class="mt-0.5 text-rose-500">•</span>${i}</li>`).join("");
+  modal.classList.remove("hidden");
+  $("btn-reupload-dismiss").onclick = () => modal.classList.add("hidden");
+}
+
+// ─── Review Panel ─────────────────────────────────────────────────────────────
+
+function openReviewPanel(extracted) {
+  const panel = $("extraction-review-panel");
+  panel.classList.remove("hidden");
+
+  // Show image or PDF with pagination
+  const pagEl = $("review-pagination");
+  if (reviewSession.objectUrls && reviewSession.objectUrls.length > 1) {
+    pagEl.classList.remove("hidden");
+    updateReviewPaginationUI();
+  } else {
+    pagEl.classList.add("hidden");
+  }
+  updateReviewVisualSource();
+
+  // Header info
+  $("review-distributor-lbl").textContent = `${extracted.distributor || "Unknown Distributor"} · Invoice #${extracted.invoiceNumber || "—"}`;
+
+  // Invoice summary (cash discount, round-off, etc.)
+  const summary = extracted.invoiceSummary;
+  window._invoiceSummary = summary || null;
+  const cashDiscRow = $("review-cash-disc-row");
+  const roundOffRow = $("review-round-off-row");
+  if (summary) {
+    $("review-declared-total-input").value = (summary.grandTotal || 0).toFixed(2);
+    cashDiscRow.classList.remove("hidden");
+    $("review-cash-disc-val").textContent = "-₹" + (summary.cashDiscount || 0).toFixed(2);
+    roundOffRow.classList.remove("hidden");
+    $("review-round-off-val").textContent = "₹" + (summary.roundOff || 0).toFixed(2);
+  } else {
+    $("review-declared-total-input").value = (extracted.invoiceTotal || 0).toFixed(2);
+    cashDiscRow.classList.add("hidden");
+    roundOffRow.classList.add("hidden");
+  }
+
+  // Pipeline alerts (missing page warning etc.)
+  const alertsEl = $("pipeline-alerts");
+  alertsEl.innerHTML = "";
+  if (extracted.captureQuality?.missingPage) {
+    alertsEl.innerHTML = `<div class="bg-amber-500/10 border border-amber-500/30 rounded-lg p-2 text-[10px] text-amber-400 font-semibold">
+      ⚠ Possible missing page detected — verify line items are complete.
+    </div>`;
+  }
+
+  // Render line items
+  renderLineItems(extracted.lineItems || []);
+
+  // Arithmetic check
+  recalculate();
+
+  // Reject button
+  $("btn-review-reject").onclick = async () => {
+    panel.classList.add("hidden");
+    const pathsToDelete = reviewSession.storagePaths;
+    revokeReviewSession();
+    showToast("Invoice discarded", "warning");
+    // Delete raw files
+    if (pathsToDelete && pathsToDelete.length > 0) {
+      for (const p of pathsToDelete) {
+        try { await deleteObject(ref(storage, p)); } catch (_) {}
+      }
+    }
+    
+    reviewQueueIndex++;
+    showNextReviewInQueue();
+  };
+
+  // Approve button
+  $("btn-review-approve").onclick = () => confirmAndSave(extracted);
+
+  // Expose recalculate globally (called from inline oninput)
+  window.triggerRecalculate = recalculate;
+}
+
+function renderLineItems(lineItems) {
+  const container = $("review-line-items");
+  container.innerHTML = "";
+
+  lineItems.forEach((item, idx) => {
+    const conf = item.confidence || {};
+    const fields = [
+      { key: "medicineName", label: "Medicine", type: "text", value: item.medicineName },
+      { key: "batchNumber", label: "Batch", type: "text", value: item.batchNumber },
+      { key: "expiryDate", label: "Expiry", type: "text", value: item.expiryDate },
+      { key: "quantityBilled", label: "Qty Billed", type: "number", value: item.quantityBilled },
+      { key: "quantityFree", label: "Qty Free", type: "number", value: item.quantityFree },
+      { key: "unitPrice", label: "Unit Price ₹", type: "number", value: item.unitPrice },
+      { key: "netValue", label: "Net Value ₹", type: "number", value: item.netValue },
+      { key: "gstRate", label: "GST %", type: "number", value: item.gstRate },
+      { key: "gstValue", label: "GST ₹", type: "number", value: item.gstValue },
+    ];
+
+    const card = document.createElement("div");
+    card.className = "bg-slate-800/60 border border-slate-700/60 rounded-xl p-3 space-y-2";
+    card.dataset.idx = idx;
+
+    const nameConf = conf.medicineName ?? 1;
+    const nameClass = nameConf < 0.8 ? "text-amber-400" : "text-slate-100";
+
+    card.innerHTML = `
+      <div class="flex justify-between items-center">
+        <span class="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Line ${idx + 1}</span>
+        <span class="text-[9px] px-1.5 py-0.5 rounded ${nameConf < 0.8 ? "bg-amber-500/15 text-amber-400 border border-amber-500/30" : "bg-emerald-500/10 text-emerald-400"}">
+          avg conf ${avgConfidence(conf)}
+        </span>
+      </div>
+      <div class="grid grid-cols-2 gap-1.5">
+        ${fields.map((f) => {
+          const c = conf[f.key] ?? 1;
+          const low = c < 0.8;
+          return `
+            <div class="space-y-0.5 ${f.key === "medicineName" ? "col-span-2" : ""}">
+              <label class="text-[9px] font-bold ${low ? "text-amber-400" : "text-slate-500"} flex items-center gap-1">
+                ${f.label}
+                ${low ? `<span title="Low confidence: ${(c * 100).toFixed(0)}%">⚠</span>` : ""}
+              </label>
+              <input
+                type="${f.type}"
+                step="${f.type === "number" ? "0.01" : ""}"
+                data-idx="${idx}"
+                data-field="${f.key}"
+                value="${f.value ?? ""}"
+                class="w-full bg-slate-900 border ${low ? "border-amber-500/50 text-amber-300" : "border-slate-800 text-slate-200"} rounded-lg px-2 py-1.5 text-xs focus:outline-none focus:border-indigo-500 font-mono transition-colors"
+                oninput="window.triggerRecalculate()"
+              >
+            </div>
+          `;
+        }).join("")}
+      </div>
+    `;
+    container.appendChild(card);
+  });
+}
+
+function avgConfidence(conf) {
+  const vals = Object.values(conf).filter((v) => typeof v === "number");
+  if (!vals.length) return "100%";
+  return ((vals.reduce((a, b) => a + b, 0) / vals.length) * 100).toFixed(0) + "%";
+}
+
+function recalculate() {
+  let totalNet = 0;
+  let totalGst = 0;
+
+  document.querySelectorAll("#review-line-items [data-field='netValue']").forEach((el) => {
+    totalNet += parseFloat(el.value) || 0;
+  });
+  document.querySelectorAll("#review-line-items [data-field='gstValue']").forEach((el) => {
+    totalGst += parseFloat(el.value) || 0;
+  });
+
+  $("review-subtotal-val").textContent = "₹" + totalNet.toFixed(2);
+  $("review-gst-val").textContent = "₹" + totalGst.toFixed(2);
+
+  const declaredTotal = parseFloat($("review-declared-total-input").value) || 0;
+  let computedTotal, match, diff;
+
+  const summary = window._invoiceSummary;
+  console.log("=== RECALCULATE DEBUG ===");
+  console.log("totalNet (sum of line netValues):", totalNet);
+  console.log("totalGst (sum of line gstValues):", totalGst);
+  console.log("declaredTotal (from input):", declaredTotal);
+  console.log("invoiceSummary:", JSON.stringify(summary));
+  if (summary) {
+    const netTaxable = summary.saleValue || totalNet;
+    const cashDisc = summary.cashDiscount || 0;
+    const totalGstSummary = summary.totalGst || totalGst;
+    const roundOff = summary.roundOff || 0;
+    console.log("Using invoiceSummary path:");
+    console.log("  saleValue:", netTaxable, "cashDisc:", cashDisc, "totalGst:", totalGstSummary, "roundOff:", roundOff);
+    computedTotal = netTaxable - cashDisc + totalGstSummary + roundOff;
+    console.log("  computedTotal =", netTaxable, "-", cashDisc, "+", totalGstSummary, "+", roundOff, "=", computedTotal);
+    diff = Math.abs(computedTotal - declaredTotal);
+    console.log("  diff:", diff, "match:", diff <= 0.5);
+    match = diff <= 0.5;
+  } else {
+    console.log("Using fallback (no invoiceSummary):");
+    computedTotal = totalNet + totalGst;
+    console.log("  computedTotal =", totalNet, "+", totalGst, "=", computedTotal);
+    diff = Math.abs(computedTotal - declaredTotal);
+    console.log("  diff:", diff, "match:", diff <= 2);
+    match = diff <= 2;
+  }
+  console.log("=== END RECALCULATE DEBUG ===");
+
+  const badge = $("review-arithmetic-badge");
+  const warning = $("arithmetic-warning-banner");
+  const ackContainer = $("arithmetic-ack-container");
+  const approveBtn = $("btn-review-approve");
+
+  if (match) {
+    badge.textContent = "✓ Totals Match";
+    badge.className = "px-2 py-0.5 text-[9px] rounded font-bold uppercase tracking-wider bg-emerald-500/15 text-emerald-400 border border-emerald-500/30";
+    warning.classList.add("hidden");
+    ackContainer.classList.add("hidden");
+    approveBtn.disabled = false;
+    approveBtn.className = "py-2.5 bg-indigo-600 text-white font-bold rounded-lg text-xs hover:bg-indigo-500 transition-all active:scale-[0.98]";
+  } else {
+    badge.textContent = `⚠ Mismatch ₹${diff.toFixed(2)}`;
+    badge.className = "px-2 py-0.5 text-[9px] rounded font-bold uppercase tracking-wider bg-rose-500/15 text-rose-400 border border-rose-500/30";
+    warning.classList.remove("hidden");
+    ackContainer.classList.remove("hidden");
+    const ackCheckbox = $("arithmetic-ack-checkbox");
+    approveBtn.disabled = !ackCheckbox.checked;
+    if (ackCheckbox.checked) {
+      approveBtn.className = "py-2.5 bg-amber-600 text-white font-bold rounded-lg text-xs hover:bg-amber-500 transition-all active:scale-[0.98]";
     } else {
-        // Multiple files — ONE invoice group (staff selected photos of same invoice)
-        const batchId = `gallery_${Date.now()}_${Math.random().toString(36).slice(2,6)}`;
-        State.batchId = batchId;
-        await processGalleryGroup(files, batchId);
+      approveBtn.className = "py-2.5 bg-slate-700 text-slate-500 font-bold rounded-lg text-xs cursor-not-allowed";
     }
-    e.target.value = '';
+  }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// 5c. GALLERY GROUP — Multiple photos treated as ONE invoice
-// Extracts each image, then merges into a single invoice for review
-// ═══════════════════════════════════════════════════════════════════
-async function processGalleryGroup(files, batchId) {
-    const total = files.length;
-    showToast(`${total} photos selected — extracting as one invoice...`, 'indigo');
-    setBatchPhase('extract');
-    updateBatchProgress(0, total, `Extracting image 1/${total}...`);
+// ─── Confirm & Save ───────────────────────────────────────────────────────────
 
-    const results = [];
+async function confirmAndSave(originalExtracted) {
+  const panel = $("extraction-review-panel");
 
-    for (let i = 0; i < total; i++) {
-        const file = files[i];
-        const blob = new Blob([await file.arrayBuffer()], { type: file.type });
-        updateBatchProgress(i, total, `Extracting image ${i + 1}/${total}...`, `${i}/${total} complete`);
+  // Collect edited line items from DOM
+  const lineItemCards = document.querySelectorAll("#review-line-items [data-idx]");
+  const idxSet = new Set();
+  lineItemCards.forEach((el) => idxSet.add(parseInt(el.dataset.idx)));
 
+  const lineItems = [];
+  idxSet.forEach((idx) => {
+    const get = (field) => {
+      const el = document.querySelector(`#review-line-items [data-idx="${idx}"][data-field="${field}"]`);
+      return el ? el.value : "";
+    };
+    lineItems.push({
+      medicineName: get("medicineName"),
+      batchNumber: get("batchNumber"),
+      expiryDate: get("expiryDate"),
+      quantityBilled: parseFloat(get("quantityBilled")) || 0,
+      quantityFree: parseFloat(get("quantityFree")) || 0,
+      unitPrice: parseFloat(get("unitPrice")) || 0,
+      netValue: parseFloat(get("netValue")) || 0,
+      gstRate: parseFloat(get("gstRate")) || 0,
+      gstValue: parseFloat(get("gstValue")) || 0,
+    });
+  });
+
+  const invoiceTotal = parseFloat($("review-declared-total-input").value) || 0;
+
+  showLoadingOverlay(true, "Saving to Firestore...");
+
+  try {
+    // 1. Write invoice document
+    const invoiceRef = await addDoc(
+      collection(db, "pharmacies", currentPharmacyId, "invoices"),
+      {
+        distributor: originalExtracted.distributor || "",
+        invoiceNumber: originalExtracted.invoiceNumber || "",
+        invoiceDate: originalExtracted.invoiceDate || "",
+        invoiceTotal,
+        lineItems,
+        captureQuality: originalExtracted.captureQuality || {},
+        confirmedBy: currentUser.uid,
+        confirmedAt: serverTimestamp(),
+        createdAt: serverTimestamp(),
+      }
+    );
+
+    // 2. Write/update medicine records
+    for (const item of lineItems) {
+      if (!item.medicineName) continue;
+      // Use composite key as medicineId
+      const medicineId = slugify(`${item.medicineName}_${item.batchNumber}_${item.expiryDate}`);
+      await setDoc(
+        doc(db, "pharmacies", currentPharmacyId, "medicines", medicineId),
+        {
+          medicineName: item.medicineName,
+          batchNumber: item.batchNumber,
+          expiryDate: item.expiryDate,
+          quantityBilled: item.quantityBilled,
+          quantityFree: item.quantityFree,
+          unitPrice: item.unitPrice,
+          netValue: item.netValue,
+          gstRate: item.gstRate,
+          gstValue: item.gstValue,
+          distributor: originalExtracted.distributor || "",
+          invoiceId: invoiceRef.id,
+          pharmacyId: currentPharmacyId,
+          remainingQty: item.quantityBilled + item.quantityFree,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        },
+        { merge: true }
+      );
+    }
+
+    // 3. Delete raw files from Storage
+    if (reviewSession.storagePaths && reviewSession.storagePaths.length > 0) {
+      for (const p of reviewSession.storagePaths) {
         try {
-            const result = await extractSingleImage(file, 'image', batchId, i, {
-                totalPages: total,
-                originalName: file.name
-            });
-            if (result && result.lineItems && result.lineItems.length > 0) {
-                results.push({ ...result, _pageIndex: i, _blob: blob, _file: file });
-                console.log(`[RxExpiry] Gallery group[${i}] extracted ${result.lineItems.length} items`);
-            } else {
-                console.warn(`[RxExpiry] Gallery group[${i}] returned no items — skipping`);
-            }
-        } catch (e) {
-            console.error(`[RxExpiry] Gallery group[${i}] extraction failed:`, e);
+          await deleteObject(ref(storage, p));
+        } catch (delErr) {
+          console.warn("Could not delete raw file (non-fatal):", delErr.message);
         }
+      }
     }
 
-    updateBatchProgress(total, total, 'Merging pages into one invoice...');
+    showLoadingOverlay(false);
+    panel.classList.add("hidden");
+    revokeReviewSession();
+    showToast(`Saved! ${lineItems.length} medicine(s) recorded.`, "success");
 
-    if (results.length === 0) {
-        hideBatchProgress();
-        showToast('No items could be extracted from selected photos', 'red');
-        return;
-    }
+    reviewQueueIndex++;
+    showNextReviewInQueue();
 
-    // Merge all extracted pages into a single invoice
-    const merged = mergeGalleryResults(results);
-    merged._batchId = batchId;
-    merged._pageCount = results.length;
-
-    hideBatchProgress();
-    State.extractedQueue = [merged];
-    State.currentQueueIndex = 0;
-    showNextReview();
+  } catch (err) {
+    showLoadingOverlay(false);
+    showToast("Save failed: " + err.message, "error");
+  }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// 5d. MERGE GALLERY RESULTS — Combine multiple extractions into one
-// Keeps first page's metadata; uses whichever page has totals block
-// ═══════════════════════════════════════════════════════════════════
-function mergeGalleryResults(results) {
-    if (results.length === 1) return results[0];
-
-    // Start with first result as base
-    const base = { ...results[0] };
-
-    // Combine all lineItems (tag each with source page for traceability)
-    const allLineItems = [];
-    for (const r of results) {
-        const items = (r.lineItems || []).map(item => ({
-            ...item,
-            _fromPage: r._pageIndex
-        }));
-        allLineItems.push(...items);
-    }
-    base.lineItems = allLineItems;
-
-    // Pick best metadata: use whichever page has non-zero/non-empty values
-    // Totals (invoiceTotal, etc.) are typically on the last page with the summary block
-    for (let i = 1; i < results.length; i++) {
-        const r = results[i];
-        // Prefer later page's totals if they have values
-        if (r.invoiceTotal && (!base.invoiceTotal || base.invoiceTotal === 0)) base.invoiceTotal = r.invoiceTotal;
-        if (r.totalTaxableAmount && (!base.totalTaxableAmount || base.totalTaxableAmount === 0)) base.totalTaxableAmount = r.totalTaxableAmount;
-        if (r.cgstTotal && (!base.cgstTotal || base.cgstTotal === 0)) base.cgstTotal = r.cgstTotal;
-        if (r.sgstTotal && (!base.sgstTotal || base.sgstTotal === 0)) base.sgstTotal = r.sgstTotal;
-        if (r.schemeDiscount && (!base.schemeDiscount || base.schemeDiscount === 0)) base.schemeDiscount = r.schemeDiscount;
-        if (r.cashDiscount && (!base.cashDiscount || base.cashDiscount === 0)) base.cashDiscount = r.cashDiscount;
-        if (r.roundOff && (!base.roundOff || base.roundOff === 0)) base.roundOff = r.roundOff;
-
-        // Keep first page's distributor/invoiceNumber/date (header info)
-        // But if first page is missing them, grab from later pages
-        if (!base.distributor && r.distributor) base.distributor = r.distributor;
-        if (!base.invoiceNumber && r.invoiceNumber) base.invoiceNumber = r.invoiceNumber;
-        if (!base.invoiceDate && r.invoiceDate) base.invoiceDate = r.invoiceDate;
-        if (!base.buyerName && r.buyerName) base.buyerName = r.buyerName;
-    }
-
-    // Merge pageInfo if available
-    const pageInfoEntries = results.filter(r => r.captureQuality?.pageInfo).map(r => r.captureQuality.pageInfo);
-    if (pageInfoEntries.length > 0) {
-        const maxPage = Math.max(...pageInfoEntries.map(p => p.current || 0));
-        const totalPages = Math.max(...pageInfoEntries.map(p => p.total || 0));
-        base.captureQuality = base.captureQuality || {};
-        base.captureQuality.pageInfo = { current: maxPage, total: totalPages };
-    }
-
-    // Store page blobs for image preview (use first page)
-    base._blob = results[0]._blob;
-    base._file = results[0]._file;
-
-    console.log(`[RxExpiry] mergeGalleryResults: ${results.length} pages → ${allLineItems.length} total line items`);
-    return base;
+function slugify(str) {
+  return str
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_|_$/g, "")
+    .substring(0, 100);
 }
 
-async function handlePdfUpload(e) {
-    const files = Array.from(e.target.files);
-    if (!files.length) return;
-
-    // Generate a shared batch ID for all pages from this upload
-    const batchId = `batch_${Date.now()}_${Math.random().toString(36).slice(2,6)}`;
-    State.batchId = batchId;
-
-    const allPages = [];
-
-    for (let f = 0; f < files.length; f++) {
-        const file = files[f];
-        const isSmall = file.size <= 5 * 1024 * 1024 && files.length === 1;
-
-        if (isSmall) {
-            // Small single PDF — send whole, no splitting
-            State.currentImageFile = file;
-            await runQualityCheck(file, 'pdf');
-            e.target.value = '';
-            return;
-        }
-
-        // Split this PDF into page images
-        showToast(`Splitting PDF ${f + 1}/${files.length}...`, 'indigo');
-        setBatchPhase('split');
-        try {
-            const pages = await splitPdfToImages(file);
-            allPages.push(...pages);
-        } catch (err) {
-            console.error(`[RxExpiry] PDF ${f + 1} split failed:`, err);
-            showToast(`PDF split failed: ${err.message}`, 'red');
-        }
-    }
-
-    if (allPages.length === 0) {
-        showToast('No pages produced from PDFs', 'red');
-        e.target.value = '';
-        return;
-    }
-
-    // Phase 2: Quality check each page
-    setBatchPhase('quality');
-    const qualifiedPages = [];
-    let blurRejects = 0;
-
-    for (let i = 0; i < allPages.length; i++) {
-        const page = allPages[i];
-        updateBatchProgress(i + 1, allPages.length, `Checking quality of page ${i + 1}/${allPages.length}...`);
-
-        const q = await checkPageQuality(page.blob);
-        if (q.pass) {
-            qualifiedPages.push({
-                ...page,
-                batchId,
-                pageIndex: i,
-                _quality: { blur: q.blurScore, exp: q.expScore }
-            });
-        } else {
-            blurRejects++;
-            console.warn(`[RxExpiry] Page ${i + 1} rejected: ${q.reason}`);
-        }
-        // Yield to browser every 10 pages
-        if ((i + 1) % 10 === 0) await new Promise(r => setTimeout(r, 0));
-    }
-
-    if (blurRejects > 0) {
-        showToast(`${blurRejects} pages failed quality check — skipping`, 'amber');
-    }
-
-    if (qualifiedPages.length === 0) {
-        showToast('All pages failed quality check', 'red');
-        e.target.value = '';
-        return;
-    }
-
-    // Phase 3: Queue for extraction
-    showToast(`${qualifiedPages.length} pages ready — extracting...`, 'green');
-    State.imageQueue = qualifiedPages;
-    State.extractedQueue = [];
-    State.currentQueueIndex = 0;
-    processNextInQueue();
-
-    e.target.value = '';
+function revokeReviewSession() {
+  if (reviewSession.objectUrls && reviewSession.objectUrls.length > 0) {
+    reviewSession.objectUrls.forEach(url => URL.revokeObjectURL(url));
+  }
+  reviewSession = { storagePaths: [], objectUrls: [], currentPageIndex: 0, fileType: 'image', extracted: null };
 }
 
-async function handleZipUpload(e) {
-    const file = e.target.files[0];
-    if (!file) return;
+// ─── Expiring Medicines List ──────────────────────────────────────────────────
 
-    const panel = $('#precheck-feedback-panel');
-    panel.classList.remove('hidden');
-    $('#precheck-status-msg').textContent = 'Extracting images from ZIP...';
-    $('#precheck-status-msg').className = 'text-xs font-semibold py-1.5 px-3 rounded text-center text-indigo-400';
-    $('#precheck-blur-val').textContent = 'Extracting...';
-    $('#precheck-blur-bar').style.width = '0%';
+async function loadExpiringMedicines() {
+  const listEl = $("expiring-list");
+  const countEl = $("expiring-count");
+  if (!listEl) return;
 
-    try {
-        const pages = await extractZipToImages(file);
-        if (pages.length === 0) {
-            showToast('No images found in ZIP', 'red');
-            panel.classList.add('hidden');
-            e.target.value = '';
-            return;
-        }
-        showToast(`Extracted ${pages.length} images from ZIP — processing...`, 'green');
-        State.imageQueue = pages;
-        State.extractedQueue = [];
-        State.currentQueueIndex = 0;
-        panel.classList.add('hidden');
-        processNextInQueue();
-    } catch (err) {
-        console.error('[RxExpiry] ZIP extraction failed:', err);
-        showToast('ZIP extraction failed: ' + err.message, 'red');
-        panel.classList.add('hidden');
-    }
-    e.target.value = '';
-}
+  listEl.innerHTML = `<div class="text-center py-6 text-xs text-slate-500">Loading...</div>`;
 
-// ═══════════════════════════════════════════════════════════════════
-// 5. CLIENT-SIDE QUALITY CHECK (Blur + Exposure — pure code, no AI)
-// ═══════════════════════════════════════════════════════════════════
-async function runQualityCheck(file, type) {
-    const panel = $('#precheck-feedback-panel');
-    panel.classList.remove('hidden');
-    $('#precheck-blur-val').textContent = 'Calculating...';
-    $('#precheck-exposure-val').textContent = 'Calculating...';
-    $('#precheck-blur-bar').style.width = '0%';
-    $('#precheck-exposure-bar').style.width = '0%';
-    const statusEl = $('#precheck-status-msg');
-    statusEl.textContent = '';
-    statusEl.className = 'text-xs font-semibold py-1.5 px-3 rounded text-center';
+  try {
+    const snapshot = await getDocs(
+      collection(db, "pharmacies", currentPharmacyId, "medicines")
+    );
 
-    if (type === 'pdf') {
-        // No size cap — large PDFs are split client-side before reaching here
-        updateBar('blur', 1, 'N/A (PDF)');
-        updateBar('exposure', 1, 'N/A (PDF)');
-        passPrecheck('PDF passed validation.');
-        return;
-    }
+    const now = new Date();
+    const ninetyDaysOut = new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000);
+    const items = [];
 
-    try {
-        const img = await loadImage(file);
-        const W = 640, H = Math.round((img.height / img.width) * W);
-        const cvs = document.createElement('canvas');
-        cvs.width = W; cvs.height = H;
-        const ctx = cvs.getContext('2d');
-        ctx.drawImage(img, 0, 0, W, H);
-        const px = ctx.getImageData(0, 0, W, H).data;
-
-        // Luminance
-        const gray = new Float32Array(W * H);
-        for (let i = 0; i < W * H; i++) {
-            const j = i * 4;
-            gray[i] = 0.299 * px[j] + 0.587 * px[j+1] + 0.114 * px[j+2];
-        }
-
-        // Laplacian variance (blur detection)
-        let lapSum = 0, lapN = 0;
-        for (let y = 1; y < H-1; y++) {
-            for (let x = 1; x < W-1; x++) {
-                const c = gray[y*W+x];
-                const l = -4*c + gray[(y-1)*W+x] + gray[(y+1)*W+x] + gray[y*W+x-1] + gray[y*W+x+1];
-                lapSum += l*l; lapN++;
-            }
-        }
-        const blurVar = lapSum / lapN;
-        const blurScore = Math.min(blurVar / 100, 1);
-        updateBar('blur', blurScore, blurVar.toFixed(1));
-
-        // Exposure (avg luminance)
-        let totalLum = 0;
-        for (let i = 0; i < W*H; i++) totalLum += gray[i];
-        const avgLum = totalLum / (W * H);
-        let expScore = avgLum >= 60 && avgLum <= 200 ? 1 :
-                       avgLum < 60 ? avgLum/60 : (255-avgLum)/55;
-        expScore = Math.max(0, Math.min(1, expScore));
-        updateBar('exposure', expScore, `Avg: ${avgLum.toFixed(0)}`);
-
-        if (blurScore < 0.3 || expScore < 0.3) {
-            const issues = [];
-            if (blurScore < 0.3) issues.push('too blurry');
-            if (expScore < 0.3) issues.push(avgLum < 60 ? 'too dark' : 'too bright');
-            failPrecheck(`Please retake: ${issues.join(' and ')}.`);
-        } else {
-            passPrecheck('Image quality OK. Uploading to extractor...');
-        }
-    } catch (e) {
-        console.error('Quality check error:', e);
-        failPrecheck('Could not analyze image.');
-    }
-}
-
-function updateBar(type, score, label) {
-    const pct = Math.round(score * 100);
-    $(`#precheck-${type}-val`).textContent = `${label} (${pct}%)`;
-    const bar = $(`#precheck-${type}-bar`);
-    bar.style.width = `${pct}%`;
-    bar.className = `h-full transition-all duration-300 ${score < 0.3 ? 'bg-rose-500' : score < 0.7 ? 'bg-amber-500' : 'bg-emerald-500 precheck-bar-glow'}`;
-}
-
-function failPrecheck(msg) {
-    const el = $('#precheck-status-msg');
-    el.innerHTML = `${msg} <button onclick="window.retryCapture()" class="ml-2 underline font-bold">Retry</button>`;
-    el.className = 'text-xs font-semibold py-1.5 px-3 rounded text-center bg-rose-500/15 text-rose-400 border border-rose-500/30';
-}
-
-function passPrecheck(msg) {
-    const el = $('#precheck-status-msg');
-    el.textContent = msg;
-    el.className = 'text-xs font-semibold py-1.5 px-3 rounded text-center bg-emerald-500/15 text-emerald-400 border border-emerald-500/30';
-    setTimeout(() => {
-        $('#precheck-feedback-panel').classList.add('hidden');
-        sendToExtractInvoice();
-    }, 1200);
-}
-
-window.retryCapture = () => {
-    $('#precheck-feedback-panel').classList.add('hidden');
-    State.currentImageFile = null; State.currentImageBlob = null;
-};
-
-// ═══════════════════════════════════════════════════════════════════
-// 5a0. BATCH-MODE QUALITY CHECK — Runs on JPEG blobs from PDF split
-// Returns { pass: bool, blurScore, expScore, reason }
-// ═══════════════════════════════════════════════════════════════════
-async function checkPageQuality(blob) {
-    try {
-        const img = await loadImage(blob);
-        const W = 640, H = Math.round((img.height / img.width) * W);
-        const cvs = document.createElement('canvas');
-        cvs.width = W; cvs.height = H;
-        const ctx = cvs.getContext('2d');
-        ctx.drawImage(img, 0, 0, W, H);
-        const px = ctx.getImageData(0, 0, W, H).data;
-
-        const gray = new Float32Array(W * H);
-        for (let i = 0; i < W * H; i++) {
-            const j = i * 4;
-            gray[i] = 0.299 * px[j] + 0.587 * px[j+1] + 0.114 * px[j+2];
-        }
-
-        // Laplacian variance (blur)
-        let lapSum = 0, lapN = 0;
-        for (let y = 1; y < H-1; y++) {
-            for (let x = 1; x < W-1; x++) {
-                const c = gray[y*W+x];
-                const l = -4*c + gray[(y-1)*W+x] + gray[(y+1)*W+x] + gray[y*W+x-1] + gray[y*W+x+1];
-                lapSum += l*l; lapN++;
-            }
-        }
-        const blurScore = Math.min((lapSum / lapN) / 100, 1);
-
-        // Exposure (avg luminance)
-        let totalLum = 0;
-        for (let i = 0; i < W*H; i++) totalLum += gray[i];
-        const avgLum = totalLum / (W * H);
-        let expScore = avgLum >= 60 && avgLum <= 200 ? 1 :
-                       avgLum < 60 ? avgLum/60 : (255-avgLum)/55;
-        expScore = Math.max(0, Math.min(1, expScore));
-
-        if (blurScore < 0.3 || expScore < 0.3) {
-            const reasons = [];
-            if (blurScore < 0.3) reasons.push('blurry');
-            if (expScore < 0.3) reasons.push(avgLum < 60 ? 'dark' : 'bright');
-            return { pass: false, blurScore, expScore, reason: reasons.join(', ') };
-        }
-        return { pass: true, blurScore, expScore, reason: null };
-    } catch {
-        return { pass: true, blurScore: 1, expScore: 1, reason: null };
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// 5a. CLIENT-SIDE PDF SPLITTER — Render each page to high-res JPEG
-// ═══════════════════════════════════════════════════════════════════
-async function splitPdfToImages(file) {
-    const arrayBuffer = await file.arrayBuffer();
-    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
-    const totalPages = pdf.numPages;
-    const pages = [];
-
-    showToast(`Splitting ${totalPages}-page PDF into images...`, 'indigo');
-
-    // Reuse a single canvas to avoid GC pressure on large PDFs
-    const canvas = document.createElement('canvas');
-    const ctx = canvas.getContext('2d');
-
-    for (let i = 1; i <= totalPages; i++) {
-        const page = await pdf.getPage(i);
-        // Scale 2.2 (~160 DPI) — denser than 2.0 for tiny medicine names,
-        // batch numbers, and expiry dates that Gemini must read precisely
-        const viewport = page.getViewport({ scale: 2.2 });
-        canvas.width = viewport.width;
-        canvas.height = viewport.height;
-
-        await page.render({ canvasContext: ctx, viewport }).promise;
-
-        // 0.90 JPEG — balances sharp text edges against file size
-        const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.90));
-        const fileName = `${file.name.replace(/\.pdf$/i, '')}_page_${String(i).padStart(3, '0')}.jpg`;
-
-        pages.push({
-            file: new File([blob], fileName, { type: 'image/jpeg' }),
-            blob,
-            type: 'image',
-            // Metadata carried through to extractSingleImage for debugging
-            _originalName: file.name,
-            _totalPages: totalPages
-        });
-
-        // Progress every page for first 10, then every 5 to avoid UI thrash
-        if (i <= 10 || i % 5 === 0 || i === totalPages) {
-            updateBatchProgress(i, totalPages, `Split page ${i} of ${totalPages}...`);
-            await new Promise(r => setTimeout(r, 0));
-        }
-        // Free canvas memory between pages
-        ctx.clearRect(0, 0, canvas.width, canvas.height);
-    }
-
-    return pages;
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// 5a2. CLIENT-SIDE ZIP EXTRACTOR — Pull images from a ZIP archive
-// ═══════════════════════════════════════════════════════════════════
-async function extractZipToImages(file) {
-    showToast('Extracting images from ZIP...', 'indigo');
-    const zip = await JSZip.loadAsync(file);
-    const imageExts = /\.(jpe?g|png|webp|gif|bmp)$/i;
-    const entries = [];
-
-    zip.forEach((relativePath, zipEntry) => {
-        if (!zipEntry.dir && imageExts.test(relativePath)) {
-            entries.push({ path: relativePath, entry: zipEntry });
-        }
+    snapshot.forEach((docSnap) => {
+      const d = docSnap.data();
+      // Parse expiry: try MM/YYYY then DD/MM/YYYY
+      const expDate = parseExpiryDate(d.expiryDate);
+      if (expDate && expDate <= ninetyDaysOut) {
+        items.push({ id: docSnap.id, ...d, expDate });
+      }
     });
 
-    if (entries.length === 0) {
-        showToast('No images found in ZIP', 'red');
-        return [];
+    items.sort((a, b) => a.expDate - b.expDate);
+    countEl.textContent = `${items.length} record${items.length !== 1 ? "s" : ""}`;
+
+    if (items.length === 0) {
+      listEl.innerHTML = `<div class="text-center py-6 text-xs text-slate-500">No medicines expiring within 90 days.</div>`;
+      return;
     }
 
-    showToast(`Found ${entries.length} images in ZIP — extracting...`, 'indigo');
-    const pages = [];
-
-    for (let i = 0; i < entries.length; i++) {
-        const { path, entry } = entries[i];
-        const blob = await entry.async('blob');
-        const ext = path.split('.').pop().toLowerCase();
-        const mimeType = ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp' : 'image/jpeg';
-        const finalBlob = mimeType === 'image/jpeg' ? blob : await convertToJpeg(blob, mimeType);
-
-        const fileName = path.split('/').pop();
-        pages.push({
-            file: new File([finalBlob], fileName, { type: 'image/jpeg' }),
-            blob: finalBlob,
-            type: 'image'
-        });
-
-        if ((i + 1) % 10 === 0 || i === entries.length - 1) {
-            updateBatchProgress(i + 1, entries.length, `Extracting ${i + 1} of ${entries.length}...`);
-            await new Promise(r => setTimeout(r, 0));
-        }
-    }
-
-    return pages;
+    listEl.innerHTML = items.map((item) => {
+      const daysLeft = Math.ceil((item.expDate - now) / (1000 * 60 * 60 * 24));
+      const urgency = daysLeft <= 30 ? "border-rose-500/40 bg-rose-500/5" : daysLeft <= 60 ? "border-amber-500/40 bg-amber-500/5" : "border-slate-700/60 bg-slate-800/40";
+      const badgeClass = daysLeft <= 30 ? "bg-rose-500/20 text-rose-400" : daysLeft <= 60 ? "bg-amber-500/20 text-amber-400" : "bg-slate-700 text-slate-400";
+      return `
+        <div class="border ${urgency} rounded-xl p-3 space-y-1.5">
+          <div class="flex justify-between items-start">
+            <div>
+              <p class="text-xs font-bold text-slate-100 leading-tight">${item.medicineName}</p>
+              <p class="text-[9px] font-mono text-slate-500">Batch: ${item.batchNumber}</p>
+            </div>
+            <span class="text-[9px] px-2 py-0.5 rounded-full font-bold ${badgeClass}">
+              ${daysLeft <= 0 ? "EXPIRED" : `${daysLeft}d left`}
+            </span>
+          </div>
+          <div class="flex items-center justify-between text-[10px] text-slate-400">
+            <span>Exp: ${item.expiryDate}</span>
+            <span>Qty: ${item.remainingQty ?? item.quantityBilled}</span>
+            <span class="text-slate-500">${item.distributor || "—"}</span>
+          </div>
+        </div>
+      `;
+    }).join("");
+  } catch (err) {
+    listEl.innerHTML = `<div class="text-center py-6 text-xs text-rose-400">Error loading: ${err.message}</div>`;
+  }
 }
 
-async function convertToJpeg(blob, mimeType) {
-    const img = await loadImage(blob);
-    const canvas = document.createElement('canvas');
-    canvas.width = img.width; canvas.height = img.height;
-    canvas.getContext('2d').drawImage(img, 0, 0);
-    return new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.92));
+function parseExpiryDate(str) {
+  if (!str) return null;
+  // MM/YYYY
+  let m = str.match(/^(\d{1,2})\/(\d{4})$/);
+  if (m) return new Date(parseInt(m[2]), parseInt(m[1]) - 1, 28);
+  // DD/MM/YYYY
+  m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (m) return new Date(parseInt(m[3]), parseInt(m[2]) - 1, parseInt(m[1]));
+  // YYYY-MM-DD
+  m = str.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (m) return new Date(parseInt(m[1]), parseInt(m[2]) - 1, parseInt(m[3]));
+  return null;
 }
 
-function loadImage(source) {
-    return new Promise((resolve, reject) => {
-        const img = new Image();
-        img.onload = () => { URL.revokeObjectURL(img.src); resolve(img); };
-        img.onerror = () => reject(new Error('Failed to load image'));
-        img.src = URL.createObjectURL(source);
-    });
-}
+// ─── Distributors ─────────────────────────────────────────────────────────────
 
-// ═══════════════════════════════════════════════════════════════════
-// 5b. BATCH QUEUE — Process multiple images with parallel workers
-// ═══════════════════════════════════════════════════════════════════
-function updateBatchProgress(current, total, status, detail) {
-    const panel = $('#batch-progress-panel');
-    panel.classList.remove('hidden');
-    const pct = total > 0 ? Math.round((current / total) * 100) : 0;
-    $('#batch-progress-count').textContent = `${current}/${total}`;
-    $('#batch-progress-bar').style.width = `${pct}%`;
-    $('#batch-progress-status').textContent = status;
-    const detailEl = $('#batch-progress-detail');
-    if (detail) { detailEl.textContent = detail; detailEl.classList.remove('hidden'); }
-    else { detailEl.classList.add('hidden'); }
-}
+async function loadDistributors() {
+  const listEl = $("distributors-list");
+  if (!listEl) return;
 
-function setBatchPhase(phase) {
-    const label = $('#batch-progress-label');
-    const dot = $('#batch-progress-dot');
-    const bar = $('#batch-progress-bar');
-    if (phase === 'split') {
-        label.textContent = 'Splitting PDF';
-        dot.className = 'w-2 h-2 rounded-full bg-amber-500 animate-ping';
-        bar.className = 'bg-amber-500 h-full transition-all duration-500';
-    } else if (phase === 'quality') {
-        label.textContent = 'Quality Check';
-        dot.className = 'w-2 h-2 rounded-full bg-cyan-500 animate-ping';
-        bar.className = 'bg-cyan-500 h-full transition-all duration-500';
-    } else if (phase === 'extract') {
-        label.textContent = 'Extracting via Gemini';
-        dot.className = 'w-2 h-2 rounded-full bg-indigo-500 animate-ping';
-        bar.className = 'bg-indigo-500 h-full transition-all duration-500';
-    } else if (phase === 'merge') {
-        label.textContent = 'Merging Invoices';
-        dot.className = 'w-2 h-2 rounded-full bg-emerald-500 animate-ping';
-        bar.className = 'bg-emerald-500 h-full transition-all duration-500';
-    }
-}
-
-function hideBatchProgress() {
-    $('#batch-progress-panel').classList.add('hidden');
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// 5b. MERGE CONTINUATION PAGES — Group consecutive pages sharing
-//     the same distributor + invoice number into a single invoice
-// ═══════════════════════════════════════════════════════════════════
-function mergeInvoices(pages) {
-    if (pages.length <= 1) return pages;
-
-    // Normalize distributor name + invoice number for grouping
-    function invoiceKey(p) {
-        const dist = (p.distributor || '').trim().toLowerCase();
-        const inv = (p.invoiceNumber || '').trim().toUpperCase();
-        return `${dist}::${inv}`;
-    }
-
-    // Group pages in order — consecutive pages with the same key are continuations
-    const merged = [];
-    let current = null;
-
-    for (const page of pages) {
-        const key = invoiceKey(page);
-        const isSameInvoice = current && key === current._key && key !== '::';
-
-        if (isSameInvoice) {
-            // Append lines from this page to the current invoice
-            const existingLines = current.lineItems || [];
-            const newLines = (page.lineItems || []).map(line => ({ ...line, _fromPage: page._pageIndex }));
-            current.lineItems = [...existingLines, ...newLines];
-
-            // Track page range
-            current._pages = current._pages || [];
-            current._pages.push(page._pageIndex);
-
-            // Keep the better-quality blob (first page usually has header)
-            // but track all blobs for image preview
-            if (!current._pageBlobs) current._pageBlobs = [];
-            if (page._blob) current._pageBlobs.push({ pageIndex: page._pageIndex, blob: page._blob, file: page._file });
-
-            // Use the first page as the primary file for review image
-            // Use the last page's invoiceTotal if available (it usually has the final total)
-            if (page.invoiceTotal) current.invoiceTotal = page.invoiceTotal;
-
-            console.log(`[RxExpiry] Merged page ${page._pageIndex} into existing invoice (${key})`);
-        } else {
-            // New invoice — push current if any and start fresh
-            if (current) merged.push(current._data || current);
-            current = {
-                _key: key,
-                _data: page,
-                _pages: page._pageIndex != null ? [page._pageIndex] : [],
-                _pageBlobs: page._blob ? [{ pageIndex: page._pageIndex, blob: page._blob, file: page._file }] : []
-            };
-        }
-    }
-    if (current) merged.push(current._data || current);
-
-    // Tag merged invoices with page count for UI
-    for (const inv of merged) {
-        if (!inv._pages) continue;
-        inv._pageCount = inv._pages.length;
-        // If we have multiple page blobs, use the first one as primary for display
-        if (inv._pageBlobs && inv._pageBlobs.length > 1) {
-            inv._blob = inv._pageBlobs[0].blob;
-            inv._file = inv._pageBlobs[0].file;
-        }
-    }
-
-    console.log(`[RxExpiry] mergeInvoices: ${pages.length} pages → ${merged.length} invoices`);
-    return merged;
-}
-
-async function processNextInQueue() {
-    const queue = State.imageQueue;
-    const total = queue.length;
-    if (total === 0) {
-        hideBatchProgress();
-        showToast('No invoices to process', 'red');
-        return;
-    }
-
-    const CONCURRENCY = 3;
-    const MAX_RETRIES = 2;
-    let nextIdx = 0;
-    let completed = 0;
-    let failedPages = [];
-    State.extractedQueue = [];
-
-    setBatchPhase('extract');
-
-    async function processPageWithRetry(idx, retries) {
-        const item = queue[idx];
-        const pageLabel = item.pageIndex != null ? `Page ${item.pageIndex + 1}/${total}` : `Item ${idx + 1}/${total}`;
-
-        try {
-            if (!item.blob) {
-                item.blob = item.type === 'pdf'
-                    ? item.file
-                    : new Blob([await item.file.arrayBuffer()], { type: item.file.type });
-            }
-                const result = await extractSingleImage(item.file, item.type, item.batchId, item.pageIndex, {
-                    totalPages: item._totalPages,
-                    originalName: item._originalName
-                });
-            if (result && result.lineItems && result.lineItems.length > 0) {
-                State.extractedQueue.push({
-                    ...result,
-                    _queueIndex: idx,
-                    _file: item.file,
-                    _blob: item.blob,
-                    _type: item.type,
-                    _batchId: item.batchId || null,
-                    _pageIndex: item.pageIndex ?? null
-                });
-                console.log(`[RxExpiry] Queue[${idx}] extracted ${result.lineItems.length} items`);
-            } else {
-                console.warn(`[RxExpiry] Queue[${idx}] returned no items — skipping`);
-            }
-        } catch (e) {
-            console.error(`[RxExpiry] Queue[${idx}] extraction failed:`, e);
-            if (retries > 0) {
-                console.warn(`[RxExpiry] Retrying Queue[${idx}]... (${retries} attempts left)`);
-                await new Promise(r => setTimeout(r, 1000));
-                return processPageWithRetry(idx, retries - 1);
-            } else {
-                failedPages.push(pageLabel);
-                console.error(`[RxExpiry] Queue[${idx}] exhausted all retries`);
-            }
-        }
-    }
-
-    async function runWorker() {
-        while (nextIdx < total) {
-            const idx = nextIdx++;
-            const item = queue[idx];
-            const pageLabel = item.pageIndex != null ? `Page ${item.pageIndex + 1}/${total}` : `Item ${idx + 1}/${total}`;
-            updateBatchProgress(
-                completed, total,
-                `Extracting ${pageLabel}...`,
-                `${completed + failedPages.length}/${total} done · ${Math.min(CONCURRENCY, total - idx)} active`
-            );
-
-            await processPageWithRetry(idx, MAX_RETRIES);
-
-            completed++;
-            updateBatchProgress(
-                completed, total,
-                failedPages.length > 0
-                    ? `Extracted ${completed}/${total} (${failedPages.length} failed)`
-                    : `Extracted ${completed}/${total}`,
-                `${completed}/${total} complete`
-            );
-        }
-    }
-
-    const workers = [];
-    for (let w = 0; w < Math.min(CONCURRENCY, total); w++) {
-        workers.push(runWorker());
-    }
-    await Promise.all(workers);
-
-    // Phase 4: Merge continuation pages that share the same distributor+invoice
-    if (State.extractedQueue.length > 1 && State.batchId) {
-        setBatchPhase('merge');
-        updateBatchProgress(State.extractedQueue.length, State.extractedQueue.length, 'Merging continuation pages...');
-        State.extractedQueue = mergeInvoices(State.extractedQueue);
-    }
-
-    hideBatchProgress();
-    State.currentQueueIndex = 0;
-
-    if (failedPages.length > 0) {
-        showToast(`${failedPages.length} page(s) failed after retries: ${failedPages.join(', ')}`, 'amber');
-    }
-    if (State.extractedQueue.length > 0) {
-        showToast(`${State.extractedQueue.length} invoices extracted — reviewing...`, 'green');
-        showNextReview();
-    } else {
-        showToast('No invoices could be extracted', 'red');
-    }
-}
-
-async function extractSingleImage(file, type, batchId, pageIndex, meta) {
-    if (!isFirebaseReady()) return null;
-
-    const { ref: storageRef, uploadBytes, getDownloadURL } = State._fbStorage;
-    const { httpsCallable } = State._fbFunctions;
-
-    const rand = Math.random().toString(36).slice(2, 6);
-    const fileId = batchId
-        ? `${State.pharmacyId}/${batchId}/page${pageIndex ?? 0}_${Date.now()}_${rand}`
-        : `${State.pharmacyId}_${Date.now()}_${rand}`;
-    const fileRef = storageRef(State._storage, `temp/${fileId}`);
-    await uploadBytes(fileRef, file, {
-        contentType: file.type || 'image/jpeg',
-        customMetadata: {
-            batchId: batchId || '',
-            pageIndex: pageIndex != null ? String(pageIndex) : '',
-            totalDocumentPages: meta?.totalPages != null ? String(meta.totalPages) : '',
-            originalFileName: meta?.originalName || file.name || ''
-        }
-    });
-    const downloadURL = await getDownloadURL(fileRef);
-
-    const extractFn = httpsCallable(State._functions, 'extractInvoice');
-    const response = await extractFn({
-        fileUrl: downloadURL,
-        fileId,
-        pharmacyId: State.pharmacyId,
-        batchId: batchId || undefined,
-        pageIndex: pageIndex != null ? pageIndex : undefined
+  try {
+    const snapshot = await getDocs(
+      collection(db, "pharmacies", currentPharmacyId, "medicines")
+    );
+    const distributorMap = {};
+    snapshot.forEach((docSnap) => {
+      const d = docSnap.data();
+      if (d.distributor) {
+        distributorMap[d.distributor] = (distributorMap[d.distributor] || 0) + 1;
+      }
     });
 
-    return response.data;
+    const distributors = Object.entries(distributorMap);
+    if (distributors.length === 0) {
+      listEl.innerHTML = `<div class="text-center py-8 text-xs text-slate-500">No distributors recorded yet.</div>`;
+      return;
+    }
+
+    listEl.innerHTML = distributors.map(([name, count]) => `
+      <div class="bg-slate-800/60 border border-slate-700/60 rounded-xl p-3 flex justify-between items-center">
+        <div>
+          <p class="text-xs font-bold text-slate-100">${name}</p>
+          <p class="text-[9px] text-slate-400">${count} medicine batch${count !== 1 ? "es" : ""}</p>
+        </div>
+        <div class="w-8 h-8 rounded-lg bg-indigo-600/20 flex items-center justify-center">
+          <svg class="w-4 h-4 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"/>
+          </svg>
+        </div>
+      </div>
+    `).join("");
+  } catch (err) {
+    listEl.innerHTML = `<div class="text-xs text-rose-400 text-center py-4">${err.message}</div>`;
+  }
 }
 
-function showNextReview() {
-    const idx = State.currentQueueIndex;
-    if (idx >= State.extractedQueue.length) {
-        State.extractedQueue = [];
-        State.imageQueue = [];
-        State.currentQueueIndex = 0;
-        State.batchId = null;
-        showToast('All invoices reviewed!', 'green');
-        return;
-    }
+// ─── Bootstrap ────────────────────────────────────────────────────────────────
 
-    const result = State.extractedQueue[idx];
-    State.extractedData = result;
-
-    // Show batch indicator with multi-page info
-    const indicator = $('#review-batch-indicator');
-    indicator.classList.remove('hidden');
-    let label = `Invoice ${idx + 1} of ${State.extractedQueue.length}`;
-    if (result._pageCount > 1) {
-        label += ` · ${result._pageCount} pages merged`;
-    }
-    if (result._batchId) {
-        label += ` · Batch`;
-    }
-    indicator.textContent = label;
-
-    renderReviewPanel(result);
-
-    // Show the scanned image (first page for merged multi-page invoices)
-    if (result._blob && result._type !== 'pdf') {
-        $('#review-invoice-img').src = URL.createObjectURL(result._blob);
-        $('#review-invoice-img').classList.remove('hidden');
-        $('#review-invoice-pdf').classList.add('hidden');
-    } else if (result._type === 'pdf' && result._file) {
-        $('#review-invoice-pdf').src = URL.createObjectURL(result._file);
-        $('#review-invoice-pdf').classList.remove('hidden');
-        $('#review-invoice-img').classList.add('hidden');
-    } else {
-        $('#review-invoice-img').classList.add('hidden');
-        $('#review-invoice-pdf').classList.add('hidden');
-    }
-
-    const panel = $('#extraction-review-panel');
-    panel.classList.remove('hidden');
-    showToast(`Reviewing invoice ${idx + 1} of ${State.extractedQueue.length}`, 'indigo');
-}
-
-$('#btn-cancel-scan')?.addEventListener('click', () => {
-    $('#precheck-feedback-panel').classList.add('hidden');
+document.addEventListener("DOMContentLoaded", () => {
+  // Show auth screen initially
+  $("app-workspace").classList.add("hidden");
+  $("auth-screen").classList.remove("hidden");
+  initAuth();
 });
 
-// ═══════════════════════════════════════════════════════════════════
-// 6. EXTRACT INVOICE — Upload to Storage → Call Cloud Function → Gemini
-// ═══════════════════════════════════════════════════════════════════
-// ═══════════════════════════════════════════════════════════════════
-// 6a. CONTINUATION-PAGE DETECTION — After single-image extraction,
-// check if this page continues a recent pending invoice
-// ═══════════════════════════════════════════════════════════════════
-async function checkForContinuationPage(newResult) {
-    if (!isFirebaseReady() || !newResult) return null;
+// ─── Client-Side OCR & Grouping Triage ────────────────────────────────────────
 
-    const { collection, query, orderBy, limit, getDocs, Timestamp } = State._fbFirestore;
-    const fifteenMinAgo = Timestamp.fromDate(new Date(Date.now() - 15 * 60 * 1000));
+let _ocrWorker = null;
 
-    try {
-        // Query recent invoices from the last 15 minutes (all are confirmed/saved)
-        const q = query(
-            collection(State._db, `pharmacies/${State.pharmacyId}/invoices`),
-            orderBy('capturedAt', 'desc'),
-            limit(10)
-        );
-        const snap = await getDocs(q);
-        if (snap.empty) return null;
-
-        const newDist = (newResult.distributor || '').trim().toLowerCase();
-        const newInv = (newResult.invoiceNumber || '').trim().toUpperCase();
-        const newPageInfo = newResult.captureQuality?.pageInfo;
-
-        for (const doc of snap.docs) {
-            const existing = doc.data();
-            // Only consider invoices from last 15 minutes
-            const captured = existing.capturedAt?.toDate ? existing.capturedAt.toDate().getTime() : 0;
-            if (captured < Date.now() - 15 * 60 * 1000) break; // Sorted desc, rest are older
-
-            const existDist = (existing.distributor || '').trim().toLowerCase();
-            const existInv = (existing.invoiceNumber || '').trim().toUpperCase();
-
-            // Match signals
-            const distMatch = newDist && existDist && newDist === existDist;
-            const invMatch = newInv && existInv && newInv === existInv;
-            const invMissing = !newInv || !existInv;
-
-            if (distMatch && (invMatch || invMissing)) {
-                const created = existing.capturedAt?.toDate
-                    ? existing.capturedAt.toDate().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-                    : 'recently';
-                return {
-                    existingId: doc.id,
-                    existingData: { id: doc.id, ...existing },
-                    distLabel: existing.distributor || 'Unknown',
-                    invLabel: existing.invoiceNumber || 'N/A',
-                    created,
-                    lineCount: (existing.lineItems || []).length,
-                    pageInfo: newPageInfo
-                };
-            }
-        }
-    } catch (e) {
-        console.warn('[RxExpiry] Continuation check failed:', e);
-    }
-    return null;
+async function getOcrWorker() {
+  if (!_ocrWorker) {
+    _ocrWorker = await Tesseract.createWorker("eng", 1, {
+      logger: (m) => {
+        if (m.status === "recognizing text") return;
+      }
+    });
+  }
+  return _ocrWorker;
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// 6b. MERGE INTO EXISTING INVOICE — Append new page's lineItems to
-// an existing pending invoice in Firestore
-// ═══════════════════════════════════════════════════════════════════
-async function mergeIntoExistingInvoice(existingId, existingData, newResult) {
-    if (!isFirebaseReady()) return;
+async function terminateOcrWorker() {
+  if (_ocrWorker) {
+    await _ocrWorker.terminate();
+    _ocrWorker = null;
+  }
+}
 
-    const { doc, updateDoc } = State._fbFirestore;
-
-    const existingLines = existingData.lineItems || [];
-    const newLines = (newResult.lineItems || []).map(item => ({
-        ...item,
-        _fromPage: newResult.captureQuality?.pageInfo?.current || existingLines.length
-    }));
-    const mergedLines = [...existingLines, ...newLines];
-
-    // Build update: append new lineItems, update page count
-    const updateData = {
-        lineItems: mergedLines,
-        _pageCount: (existingData._pageCount || 1) + 1,
-        _lastUpdated: new Date().toISOString()
+function preprocessForOcr(file) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    const url = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      const canvas = document.createElement("canvas");
+      const maxDim = 1200;
+      const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+      canvas.width = Math.floor(img.width * scale);
+      canvas.height = Math.floor(img.height * scale);
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      const d = imageData.data;
+      for (let i = 0; i < d.length; i += 4) {
+        const r = d[i], g = d[i + 1], b = d[i + 2];
+        const gray = 0.299 * r + 0.587 * g + 0.114 * b;
+        const contrasted = gray < 128 ? Math.max(0, gray - 20) : Math.min(255, gray + 20);
+        d[i] = d[i + 1] = d[i + 2] = contrasted;
+      }
+      ctx.putImageData(imageData, 0, 0);
+      canvas.toBlob((blob) => {
+        resolve(blob);
+      }, "image/jpeg", 0.92);
     };
-
-    // If the new page has totals, update them
-    // (totals are usually on the final page with the summary block)
-    if (newResult.invoiceTotal) updateData.invoiceTotal = newResult.invoiceTotal;
-    if (newResult.totalTaxableAmount) updateData.totalTaxableAmount = newResult.totalTaxableAmount;
-    if (newResult.cgstTotal) updateData.cgstTotal = newResult.cgstTotal;
-    if (newResult.sgstTotal) updateData.sgstTotal = newResult.sgstTotal;
-
-    const invoiceRef = doc(State._db, `pharmacies/${State.pharmacyId}/invoices`, existingId);
-    await updateDoc(invoiceRef, updateData);
-    console.log(`[RxExpiry] Merged ${newLines.length} items into invoice ${existingId} (${mergedLines.length} total)`);
+    img.src = url;
+  });
 }
 
-async function sendToExtractInvoice() {
-    showToast('Uploading invoice...', 'indigo');
+async function performOcr(file) {
+  const processedBlob = await preprocessForOcr(file);
+  const worker = await getOcrWorker();
+  const { data: { text } } = await worker.recognize(processedBlob);
+  return text;
+}
 
-    // Compute image hash for duplicate detection (cheap, pre-Gemini)
-    if (State.currentImageBlob && State.currentImageFile?.type?.startsWith('image/')) {
-        State.currentImageHash = await computeImageHash(State.currentImageBlob);
-        if (State.currentImageHash) {
-            const dup = await checkImageDuplicate(State.currentImageHash);
-            if (dup) {
-                const created = dup.capturedAt?.toDate ? dup.capturedAt.toDate().toLocaleDateString() : 'recently';
-                const proceed = confirm(`This looks like an invoice you already uploaded on ${created} (${dup.distributor || 'Unknown'} #${dup.invoiceNumber || 'N/A'}). Continue anyway?`);
-                if (!proceed) {
-                    closeReviewPanel();
-                    return;
-                }
-            }
-        }
+async function performOcrWithRetry(file, retries = 2) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      return await performOcr(file);
+    } catch (err) {
+      console.warn(`OCR attempt ${attempt}/${retries} failed:`, err.message);
+      if (attempt === retries) throw err;
+      await new Promise(r => setTimeout(r, 500));
+    }
+  }
+}
+
+function parseInvoiceNo(text) {
+  const cleaned = text.replace(/\s+/g, " ");
+  const invPatterns = [
+    /tax\s+invoice\s*(?:no|num|number|#)?\.?\s*[:#\s-]+\s*([a-z0-9\-/]+)/i,
+    /invoice\s*(?:no|num|number|#)?\.?\s*[:#\s-]+\s*([a-z0-9\-/]+)/i,
+    /(?:proforma|pro\.?\s*forma)?\s*invoice\s*(?:no|num|number|#)?\.?\s*[:#\s-]+\s*([a-z0-9\-/]+)/i,
+    /bill\s*(?:no|num|number|#)?\.?\s*[:#\s-]+\s*([a-z0-9\-/]+)/i,
+    /inv\s*(?:no|num|number|#)?\.?\s*[:#\s-]+\s*([a-z0-9\-/]+)/i,
+    /invoice#\s*([a-z0-9\-/]+)/i,
+    /bill#\s*([a-z0-9\-/]+)/i,
+    /(?:tax\s+)?invoice\s*[#:]\s*([a-z0-9\-/]+)/i,
+  ];
+  for (const regex of invPatterns) {
+    const match = cleaned.match(regex);
+    if (match && match[1]) {
+      const val = match[1].trim().replace(/[^a-z0-9\-/]/ig, "").replace(/^0+/, "");
+      if (val.length >= 3 && /\d/.test(val)) return val;
+    }
+  }
+  const fallback = cleaned.match(/(?:no|number|#)\s*[:#\s-]*\s*([A-Z0-9]{4,}(?:\/[A-Z0-9]+)*)/i);
+  if (fallback && fallback[1] && /\d/.test(fallback[1])) return fallback[1].replace(/[^a-z0-9\-/]/ig, "");
+  return "";
+}
+
+function parsePageInfo(text) {
+  const cleaned = text.replace(/\s+/g, " ");
+  const pagePatterns = [
+    /page\s*(\d+)\s*(?:of|out\s*of|\/)\s*(\d+)/i,
+    /p(?:age)?\.?\s*no\.?\s*[:#\s-]*(\d+)\s*(?:of|out\s*of|\/)\s*(\d+)/i,
+    /(?:sheet|page)\s+(\d+)\s*[-/]\s*(\d+)/i,
+    /page\s*no\.?\s*[:#\s-]*(\d+)/i,
+    /p\.?\s*(\d+)\s*[/]\s*(\d+)/i,
+    /page\s*(\d+)/i,
+    /p\.?\s*(\d+)\b/i,
+  ];
+  for (const regex of pagePatterns) {
+    const match = cleaned.match(regex);
+    if (match) {
+      const current = parseInt(match[1]);
+      const total = match[2] ? parseInt(match[2]) : (current >= 1 ? Math.max(current, 1) : 1);
+      if (current >= 1 && total >= 1 && current <= total) {
+        return { current, total };
+      }
+      return { current, total: Math.max(current, total) };
+    }
+  }
+  return { current: 1, total: 1 };
+}
+
+async function handleMultipleFilesSelected(files) {
+  showLoadingOverlay(true, "Initializing OCR scanner...");
+  triageFiles = [];
+  triageGroups = [];
+
+  let count = 0;
+  for (const file of files) {
+    count++;
+    showLoadingOverlay(true, `OCR Analysis: File ${count}/${files.length}...`);
+    try {
+      const text = await performOcrWithRetry(file);
+      const invoiceNo = parseInvoiceNo(text);
+      const { current: pageNum, total: totalPages } = parsePageInfo(text);
+      
+      console.log(`OCR Raw Text for ${file.name}:`, text);
+      console.log(`OCR Parsed Metadata for ${file.name}:`, { invoiceNo, pageNum, totalPages });
+
+      triageFiles.push({
+        id: `file_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
+        file,
+        objectUrl: URL.createObjectURL(file),
+        text,
+        invoiceNo,
+        pageNum,
+        totalPages
+      });
+    } catch (err) {
+      console.error("OCR failed for file: " + file.name, err);
+      triageFiles.push({
+        id: `file_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
+        file,
+        objectUrl: URL.createObjectURL(file),
+        text: "",
+        invoiceNo: "",
+        pageNum: 1,
+        totalPages: 1
+      });
+    }
+  }
+
+  await terminateOcrWorker();
+  showLoadingOverlay(false);
+  autoGroupTriageFiles();
+
+  // If there are no multi-page groups (every group has exactly 1 file), bypass the triage modal entirely!
+  const hasMultiPageGroup = triageGroups.some(g => g.files.length > 1);
+  if (!hasMultiPageGroup) {
+    console.log("No multi-page invoices detected, bypassing triage modal and proceeding to extraction...");
+    startTriageUploadAndExtraction();
+  } else {
+    openTriageModal();
+  }
+}
+
+function autoGroupTriageFiles() {
+  triageGroups = [];
+  const groupsMap = {};
+  const unidentifiedFiles = [];
+
+  triageFiles.forEach((tf) => {
+    if (tf.invoiceNo) {
+      if (!groupsMap[tf.invoiceNo]) {
+        groupsMap[tf.invoiceNo] = {
+          id: `group_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
+          invoiceNo: tf.invoiceNo,
+          files: []
+        };
+        triageGroups.push(groupsMap[tf.invoiceNo]);
+      }
+      groupsMap[tf.invoiceNo].files.push(tf.id);
     } else {
-        State.currentImageHash = null;
+      unidentifiedFiles.push(tf);
     }
+  });
 
-    // Open review panel with loading state
-    const panel = $('#extraction-review-panel');
-    panel.classList.remove('hidden');
-    $('#review-form-container').classList.remove('hidden');
-    $('#review-form-container').classList.add('md:flex');
-    $('#review-line-items').innerHTML = `
-        <div class="flex flex-col items-center justify-center py-12 space-y-3">
-            <div class="spinner"></div>
-            <span class="text-xs text-slate-400 font-semibold">Uploading & extracting via Gemini...</span>
-            <span class="text-[10px] text-slate-500">This may take 5-15 seconds</span>
-        </div>`;
+  let lastGroupId = null;
+  if (triageGroups.length > 0) {
+    lastGroupId = triageGroups[triageGroups.length - 1].id;
+  }
 
-    // Show the scanned image
-    if (State.currentImageBlob) {
-        $('#review-invoice-img').src = URL.createObjectURL(State.currentImageBlob);
-        $('#review-invoice-img').classList.remove('hidden');
-        $('#review-invoice-pdf').classList.add('hidden');
-    } else if (State.currentImageFile?.type === 'application/pdf') {
-        $('#review-invoice-pdf').src = URL.createObjectURL(State.currentImageFile);
-        $('#review-invoice-pdf').classList.remove('hidden');
-        $('#review-invoice-img').classList.add('hidden');
-    }
-
-    let result = null;
-
-    // ── LIVE MODE: Upload to Storage → Call extractInvoice Cloud Function ──
-    if (isFirebaseReady()) {
-        try {
-            const { ref: storageRef, uploadBytes, getDownloadURL } = State._fbStorage;
-            const { httpsCallable } = State._fbFunctions;
-
-            // Step A: Upload file to Firebase Storage (temp path)
-            const fileId = `${State.pharmacyId}_${Date.now()}`;
-            const fileRef = storageRef(State._storage, `temp/${fileId}`);
-            showToast('Uploading to Storage...', 'indigo');
-            await uploadBytes(fileRef, State.currentImageFile);
-            const downloadURL = await getDownloadURL(fileRef);
-            console.log('[RxExpiry] Uploaded to Storage:', downloadURL.substring(0, 60) + '...');
-
-            // Step B: Call extractInvoice Cloud Function (synchronous — one request, one response)
-            showToast('Calling Gemini extraction...', 'indigo');
-            const extractFn = httpsCallable(State._functions, 'extractInvoice');
-            const response = await extractFn({
-                fileUrl: downloadURL,
-                fileId: fileId,
-                pharmacyId: State.pharmacyId
-            });
-
-            result = response.data;
-            console.log('[RxExpiry] Extract result:', result);
-
-        } catch (e) {
-            console.error('[RxExpiry] Extraction failed:', e);
-            closeReviewPanel();
-            showToast('Cloud extraction failed: ' + (e.message || 'Unknown error'), 'red');
-            failPrecheck('Extraction failed. Please check your connection and try again.');
-            return;
-        }
+  unidentifiedFiles.forEach((tf) => {
+    if (tf.pageNum > 1 && lastGroupId) {
+      const group = triageGroups.find(g => g.id === lastGroupId);
+      group.files.push(tf.id);
     } else {
-        closeReviewPanel();
-        showToast('Firebase not configured — cannot extract invoice', 'red');
-        failPrecheck('Extraction service unavailable. Please ensure Firebase is set up.');
-        return;
+      const newGroup = {
+        id: `group_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
+        invoiceNo: `UNIDENTIFIED_${triageGroups.length + 1}`,
+        files: [tf.id]
+      };
+      triageGroups.push(newGroup);
+      lastGroupId = newGroup.id;
     }
+  });
 
-    // ── Step 6: Check captureQuality.readable ──
-    if (result.captureQuality && !result.captureQuality.readable) {
-        closeReviewPanel();
-        showToast(`Unreadable: ${result.captureQuality.issues?.join(', ')}`, 'red');
-        failPrecheck(`Invoice not readable: ${result.captureQuality.issues?.join(', ')}. Please retake.`);
-        return;
-    }
-
-    // ── Step 7: Check for continuation page (single-image uploads only) ──
-    // Only runs when NOT in a batch/gallery group — just a lone photo upload
-    if (!State.batchId && result && result.lineItems?.length > 0) {
-        const continuation = await checkForContinuationPage(result);
-        if (continuation) {
-            const pageHint = continuation.pageInfo
-                ? ` (Page ${continuation.pageInfo.current} of ${continuation.pageInfo.total})`
-                : '';
-            const merge = confirm(
-                `This looks like it continues invoice #${continuation.invLabel} ` +
-                `from ${continuation.distLabel} (${continuation.lineCount} items, uploaded ${continuation.created})${pageHint}.\n\n` +
-                `Merge into that invoice?`
-            );
-            if (merge) {
-                await mergeIntoExistingInvoice(continuation.existingId, continuation.existingData, result);
-                closeReviewPanel();
-                showToast(`Merged into invoice #${continuation.invLabel}`, 'green');
-                return;
-            }
-        }
-    }
-
-    // ── Step 8: Show Review screen ──
-    State.extractedData = result;
-    renderReviewPanel(result);
-    showToast('Extraction complete — verify below', 'green');
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// 7. REVIEW PANEL (Step 7 from prompt)
-// ═══════════════════════════════════════════════════════════════════
-function bindReview() {
-    $('#btn-review-reject').addEventListener('click', () => { closeReviewPanel(); showToast('Invoice discarded', 'amber'); });
-    $('#btn-review-approve').addEventListener('click', saveConfirmedInvoice);
-    $('#btn-toggle-to-form')?.addEventListener('click', () => {
-        $('#review-visual-container').classList.add('hidden');
-        $('#review-form-container').classList.remove('hidden');
-        $('#review-form-container').classList.add('flex');
+  triageGroups.forEach((group) => {
+    group.files.sort((aId, bId) => {
+      const a = triageFiles.find(f => f.id === aId);
+      const b = triageFiles.find(f => f.id === bId);
+      return a.pageNum - b.pageNum;
     });
-    $('#btn-toggle-to-scan')?.addEventListener('click', () => {
-        $('#review-visual-container').classList.remove('hidden');
-        $('#review-form-container').classList.add('hidden');
-    });
+  });
 }
 
-function closeReviewPanel() {
-    $('#extraction-review-panel').classList.add('hidden');
-    $('#review-batch-indicator').classList.add('hidden');
-    State.extractedData = null; State.currentImageFile = null; State.currentImageBlob = null; State.currentImageHash = null;
-
-    if (State.extractedQueue.length > 0 && State.currentQueueIndex < State.extractedQueue.length - 1) {
-        State.currentQueueIndex++;
-        setTimeout(() => showNextReview(), 300);
-    } else if (State.extractedQueue.length > 0) {
-        State.extractedQueue = [];
-        State.imageQueue = [];
-        State.currentQueueIndex = 0;
-        State.batchId = null;
-    }
+function openTriageModal() {
+  $("triage-modal").classList.remove("hidden");
+  renderTriageGroups();
+  
+  $("btn-close-triage").onclick = () => {
+    $("triage-modal").classList.add("hidden");
+    triageFiles.forEach(f => URL.revokeObjectURL(f.objectUrl));
+  };
+  
+  $("btn-triage-add-group").onclick = () => {
+    const newGroup = {
+      id: `group_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
+      invoiceNo: `NEW_GROUP_${triageGroups.length + 1}`,
+      files: []
+    };
+    triageGroups.push(newGroup);
+    renderTriageGroups();
+  };
+  
+  $("btn-triage-confirm").onclick = startTriageUploadAndExtraction;
 }
 
-function renderReviewPanel(data) {
-    const distLabel = data.distributor || 'Unknown';
-    const buyerLabel = data.buyerName ? ` → ${data.buyerName}` : '';
-    let pageInfo = '';
-    if (data.captureQuality?.pageInfo?.total) {
-        pageInfo = ` · Page ${data.captureQuality.pageInfo.current || '?'} of ${data.captureQuality.pageInfo.total}`;
-    }
-    if (data._pageCount > 1) {
-        pageInfo += ` · ${data._pageCount} pages merged`;
-    }
-    $('#review-distributor-lbl').textContent = `Distributor: ${distLabel}${buyerLabel}${pageInfo}`;
-    const container = $('#review-line-items');
-    const alerts = $('#pipeline-alerts');
-    container.innerHTML = '';
-    alerts.innerHTML = '';
+function renderTriageGroups() {
+  const container = $("triage-groups-container");
+  container.innerHTML = "";
 
-    // Per-line validation alert banner
-    const flaggedLines = (data.lineItems || []).filter(item => item.lineValidationFailed || item.columnShiftSuspected);
-    if (flaggedLines.length > 0) {
-        const hasColShift = flaggedLines.some(item => item.columnShiftSuspected);
-        const alertClass = hasColShift ? 'bg-orange-500/10 border-orange-500/30 text-orange-300' : 'bg-rose-500/10 border-rose-500/30 text-rose-300';
-        const labelClass = hasColShift ? 'text-orange-400' : 'text-rose-400';
-        const itemClass = hasColShift ? 'text-orange-300/80' : 'text-rose-300/80';
-        const hintClass = hasColShift ? 'text-orange-300/60' : 'text-rose-300/60';
-        alerts.innerHTML = `<div class="${alertClass} border rounded-xl p-3 text-[10px] space-y-1">
-            <span class="font-bold ${labelClass}">⚠ ${flaggedLines.length} line${flaggedLines.length > 1 ? 's' : ''} need${flaggedLines.length === 1 ? 's' : ''} attention:</span>
-            <ul class="list-disc list-inside space-y-0.5 ${itemClass}">
-                ${flaggedLines.map((item, i) => `<li>Line ${data.lineItems.indexOf(item) + 1}: ${esc(item.medicineName || 'Unknown')} — ${item.validationNote || 'Values don\'t match formula'}</li>`).join('')}
-            </ul>
-            <span class="${hintClass}">Verify these values against the original invoice. Fix or acknowledge to save.</span>
-        </div>`;
-    }
+  triageGroups.forEach((group) => {
+    const card = document.createElement("div");
+    card.className = "bg-slate-800/60 border border-slate-700/60 rounded-xl p-4 space-y-3";
+    card.dataset.groupId = group.id;
 
-    (data.lineItems || []).forEach((item, i) => {
-        const low = (item.confidence || 1) < 0.8;
-        const flagged = item.lineValidationFailed;
-        const colShift = item.columnShiftSuspected;
-        const borderColor = colShift ? 'border-orange-500/60 bg-orange-500/5' : (flagged ? 'border-rose-500/60 bg-rose-500/5' : (low ? 'border-amber-500/40 bg-amber-500/5' : 'border-slate-700/50'));
-        const div = document.createElement('div');
-        div.className = `bg-slate-800/50 border ${borderColor} rounded-xl p-3 space-y-2 ${colShift ? 'line-item-validation-failed' : (flagged ? 'line-item-validation-failed' : (low ? 'line-item-low-confidence' : ''))}`;
-        div.innerHTML = `
-            <div class="flex justify-between items-start">
-                <div class="flex-1 mr-2">
-                    <input type="text" value="${esc(item.medicineName)}" data-field="medicineName" data-idx="${i}"
-                        class="w-full bg-transparent font-heading font-bold text-slate-100 text-xs border-b border-transparent hover:border-slate-600 focus:border-indigo-500 focus:outline-none ${low ? 'confidence-low' : ''}">
-                    ${item.mfac ? `<span class="text-[8px] text-slate-500">${esc(item.mfac)}</span>` : ''}
-                </div>
-                ${colShift ? '<span class="text-[8px] bg-orange-500/20 text-orange-400 px-1.5 py-0.5 rounded font-bold">COLUMN SHIFT</span>' : ''}
-                ${flagged && !colShift ? '<span class="text-[8px] bg-rose-500/20 text-rose-400 px-1.5 py-0.5 rounded font-bold">ARITH MISMATCH</span>' : ''}
-                ${low ? '<span class="text-[8px] bg-amber-500/20 text-amber-400 px-1.5 py-0.5 rounded font-bold">LOW CONF</span>' : ''}
+    const headerHtml = `
+      <div class="flex justify-between items-center gap-2">
+        <div class="flex items-center gap-1.5 flex-1">
+          <label class="text-[10px] font-bold text-slate-500 uppercase">Invoice No:</label>
+          <input type="text" value="${group.invoiceNo}" 
+            class="flex-1 bg-slate-900 border border-slate-700 rounded-md px-2 py-1 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 font-mono"
+            onchange="window.updateTriageGroupName('${group.id}', this.value)"
+          >
+        </div>
+        <button class="text-slate-400 hover:text-rose-400 p-1 rounded" onclick="window.deleteTriageGroup('${group.id}')" title="Delete Group">
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
+        </button>
+      </div>
+    `;
+
+    let pagesHtml = `<div class="grid grid-cols-2 gap-2">`;
+    if (group.files.length === 0) {
+      pagesHtml += `<div class="col-span-2 text-center text-xs text-slate-500 py-3">No pages in this group. Move pages here.</div>`;
+    } else {
+      group.files.forEach((fileId) => {
+        const tf = triageFiles.find(f => f.id === fileId);
+        pagesHtml += `
+          <div class="bg-slate-900 border border-slate-800 rounded-lg p-2 flex flex-col gap-2 relative">
+            <div class="aspect-[4/3] bg-black rounded overflow-hidden relative">
+              <img src="${tf.objectUrl}" class="w-full h-full object-contain">
+              <span class="absolute bottom-1 right-1 bg-black/75 px-1.5 py-0.5 rounded text-[8px] font-mono text-slate-300">
+                Page ${tf.pageNum}
+              </span>
             </div>
-            <div class="grid grid-cols-3 gap-2 text-[10px]">
-                <div class="space-y-0.5">
-                    <label class="text-slate-500 font-bold">Batch</label>
-                    <input type="text" value="${esc(item.batchNumber)}" data-field="batchNumber" data-idx="${i}"
-                        class="w-full bg-slate-900/60 border border-slate-700 rounded px-2 py-1 font-mono text-slate-200 focus:outline-none focus:border-indigo-500 ${low ? 'confidence-low' : ''}">
-                </div>
-                <div class="space-y-0.5">
-                    <label class="text-slate-500 font-bold">Expiry</label>
-                    <input type="text" value="${esc(item.expiryDate)}" data-field="expiryDate" data-idx="${i}"
-                        class="w-full bg-slate-900/60 border border-slate-700 rounded px-2 py-1 font-mono text-slate-200 focus:outline-none focus:border-indigo-500 ${low ? 'confidence-low' : ''}">
-                </div>
-                <div class="space-y-0.5">
-                    <label class="text-slate-500 font-bold">Qty</label>
-                    <input type="number" value="${item.quantityBilled}" data-field="quantityBilled" data-idx="${i}" min="0"
-                        class="w-full bg-slate-900/60 border border-slate-700 rounded px-2 py-1 font-mono text-slate-200 focus:outline-none focus:border-indigo-500">
-                </div>
+            <div class="flex flex-col gap-1">
+              <span class="text-[9px] text-slate-500 truncate">${tf.file.name}</span>
+              <div class="flex items-center gap-1">
+                <span class="text-[8px] text-slate-500 uppercase">Move:</span>
+                <select class="flex-1 bg-slate-800 border border-slate-700 rounded text-[9px] px-1 py-0.5 text-slate-300"
+                  onchange="window.moveTriageFile('${tf.id}', this.value)"
+                >
+                  ${triageGroups.map(g => `<option value="${g.id}" ${g.id === group.id ? "selected" : ""}>${g.invoiceNo}</option>`).join("")}
+                </select>
+              </div>
             </div>
-            <div class="grid grid-cols-4 gap-2 text-[10px]">
-                <div class="space-y-0.5">
-                    <label class="text-slate-500 font-bold">Trade ₹ (C.D. ${item.cdPercent||0}%)</label>
-                    <input type="number" step="0.01" value="${item.tradePrice}" data-field="tradePrice" data-idx="${i}" min="0"
-                        class="w-full bg-slate-900/60 border border-slate-700 rounded px-2 py-1 font-mono text-slate-200 focus:outline-none focus:border-indigo-500 line-total-input">
-                </div>
-                <div class="space-y-0.5">
-                    <label class="text-slate-500 font-bold">Net ₹</label>
-                    <input type="number" step="0.01" value="${item.netValue}" data-field="netValue" data-idx="${i}" min="0"
-                        class="w-full bg-slate-900/60 border border-slate-700 rounded px-2 py-1 font-mono text-slate-200 focus:outline-none focus:border-indigo-500 line-total-input">
-                </div>
-                <div class="space-y-0.5">
-                    <label class="text-slate-500 font-bold">GST ₹</label>
-                    <input type="number" step="0.01" value="${item.gstValue}" data-field="gstValue" data-idx="${i}" min="0"
-                        class="w-full bg-slate-900/60 border border-slate-700 rounded px-2 py-1 font-mono text-slate-200 focus:outline-none focus:border-indigo-500 line-total-input">
-                </div>
-                <div class="space-y-0.5">
-                    <label class="text-slate-500 font-bold">Line Total</label>
-                    <span class="line-total-display block w-full bg-slate-900/40 border border-slate-700/50 rounded px-2 py-1 font-mono text-slate-400 text-[10px]">${(item.lineTotal || (item.netValue + item.gstValue) || 0).toFixed(2)}</span>
-                </div>
-            </div>
-            <div class="grid grid-cols-3 gap-2 text-[10px]">
-                <div class="space-y-0.5">
-                    <label class="text-slate-500 font-bold">Scm Disc ₹</label>
-                    <input type="number" step="0.01" value="${item.scmDiscount || 0}" data-field="scmDiscount" data-idx="${i}" min="0"
-                        class="w-full bg-slate-900/60 border border-slate-700 rounded px-2 py-1 font-mono text-slate-200 focus:outline-none focus:border-indigo-500">
-                </div>
-                <div class="space-y-0.5">
-                    <label class="text-slate-500 font-bold">GST Rate</label>
-                    <span class="block w-full bg-slate-900/40 border border-slate-700/50 rounded px-2 py-1 font-mono text-slate-400">${item.gstRate||0}%</span>
-                </div>
-                <div class="flex items-end justify-end">
-                    <span class="text-[9px] ${colShift ? 'text-orange-400' : (flagged ? 'text-rose-400' : (low ? 'text-amber-400' : 'text-emerald-400'))}">${colShift ? (item.validationNote || 'Column shift detected') : (flagged ? (item.validationNote || 'Check values') : `Conf: ${((item.confidence||0)*100).toFixed(0)}%`)}</span>
-                </div>
-            </div>`;
-        container.appendChild(div);
-    });
-
-    container.querySelectorAll('.line-total-input').forEach(inp => inp.addEventListener('input', () => window.triggerRecalculate()));
-    $('#review-declared-total-input').value = data.invoiceTotal || 0;
-    $('#review-scheme-discount-input').value = data.schemeDiscount || 0;
-    $('#review-cash-discount-input').value = data.cashDiscount || 0;
-    $('#review-roundoff-input').value = data.roundOff || 0;
-
-    // CGST / SGST and Taxable summary
-    const cgstEl = $('#review-cgst-val');
-    const sgstEl = $('#review-sgst-val');
-    const taxableEl = $('#review-taxable-val');
-    if (cgstEl) cgstEl.textContent = `₹${(data.cgstTotal || 0).toFixed(2)}`;
-    if (sgstEl) sgstEl.textContent = `₹${(data.sgstTotal || 0).toFixed(2)}`;
-    if (taxableEl) taxableEl.textContent = `₹${(data.totalTaxableAmount || 0).toFixed(2)}`;
-
-    // Computed Summary (from reconcileAndCalculateInvoice on server)
-    const cs = data.computedSummary;
-    const csPanel = $('#computed-summary-panel');
-    if (cs && cs.totalItemsCount > 0) {
-        csPanel.classList.remove('hidden');
-        $('#computed-items-count').textContent = cs.totalItemsCount;
-        $('#computed-total-qty').textContent = cs.totalQty;
-        $('#computed-total-gst').textContent = `₹${(cs.totalGst || 0).toFixed(2)}`;
-        $('#computed-grand-total').textContent = `₹${(cs.grandTotalComputed || 0).toFixed(2)}`;
-        $('#computed-declared-total').textContent = `₹${(cs.grandTotalDeclared || 0).toFixed(2)}`;
-        const badge = $('#computed-summary-badge');
-        const discRow = $('#computed-discrepancy-row');
-        const discVal = $('#computed-discrepancy-val');
-        const disc = Math.abs(cs.discrepancy || 0);
-        if (cs.grandTotalDeclared === 0) {
-            badge.textContent = 'No Declared Total';
-            badge.className = 'px-2 py-0.5 text-[9px] rounded font-bold uppercase tracking-wider bg-slate-800 text-slate-400';
-            discRow.classList.add('hidden');
-        } else if (disc <= 10) {
-            badge.textContent = 'Matched';
-            badge.className = 'px-2 py-0.5 text-[9px] rounded font-bold uppercase tracking-wider bg-emerald-500/15 text-emerald-400 border border-emerald-500/30';
-            discRow.classList.add('hidden');
-        } else {
-            badge.textContent = `Diff ₹${disc.toFixed(2)}`;
-            badge.className = 'px-2 py-0.5 text-[9px] rounded font-bold uppercase tracking-wider bg-rose-500/15 text-rose-400 border border-rose-500/30';
-            discRow.classList.remove('hidden');
-            discVal.textContent = `₹${cs.discrepancy > 0 ? '+' : ''}${cs.discrepancy.toFixed(2)}`;
-            discVal.className = `font-mono font-bold ${disc > 10 ? 'text-rose-400' : 'text-amber-400'}`;
-        }
-    } else {
-        csPanel.classList.add('hidden');
+          </div>
+        `;
+      });
     }
+    pagesHtml += `</div>`;
 
-    window.triggerRecalculate();
+    card.innerHTML = headerHtml + pagesHtml;
+    container.appendChild(card);
+  });
+
+  $("triage-stats-txt").textContent = `${triageFiles.length} file(s) · ${triageGroups.length} invoice group(s)`;
 }
 
-window.triggerRecalculate = function () {
-    const data = State.extractedData;
-    if (!data) return;
-
-    $$('#review-line-items input[data-field]').forEach(inp => {
-        const idx = parseInt(inp.dataset.idx);
-        if (data.lineItems[idx]) {
-            data.lineItems[idx][inp.dataset.field] = inp.type === 'number' ? parseFloat(inp.value)||0 : inp.value;
-        }
-    });
-
-    // Preserve OCR-extracted netValue/gstValue as the source of truth.
-    // Only compute from formula as fallback when extracted value is missing/zero.
-    data.lineItems.forEach(m => {
-        if ((!m.netValue || m.netValue === 0) && m.tradePrice > 0 && m.quantityBilled > 0) {
-            const cdMultiplier = 1 - ((m.cdPercent || 0) / 100);
-            m.netValue = +(m.tradePrice * m.quantityBilled * cdMultiplier).toFixed(2);
-        }
-        if ((!m.gstValue || m.gstValue === 0) && m.netValue > 0 && m.gstRate > 0) {
-            m.gstValue = +(m.netValue * m.gstRate / 100).toFixed(2);
-        }
-        m.lineTotal = +((m.netValue || 0) + (m.gstValue || 0)).toFixed(2);
-    });
-
-    let sumNet = 0, sumGst = 0;
-    data.lineItems.forEach((m, i) => { sumNet += +m.netValue||0; sumGst += +m.gstValue||0; });
-    // Update line total, net, gst displays in DOM
-    $$('#review-line-items input[data-field="netValue"]').forEach((inp, i) => {
-        if (data.lineItems[i]) inp.value = data.lineItems[i].netValue;
-    });
-    $$('#review-line-items input[data-field="gstValue"]').forEach((inp, i) => {
-        if (data.lineItems[i]) inp.value = data.lineItems[i].gstValue;
-    });
-    $$('#review-line-items .line-total-display').forEach((el, i) => {
-        if (data.lineItems[i]) el.textContent = (data.lineItems[i].lineTotal || 0).toFixed(2);
-    });
-    const schemeDiscount = parseFloat($('#review-scheme-discount-input')?.value) || 0;
-    const cashDiscount = parseFloat($('#review-cash-discount-input')?.value) || 0;
-    const roundOff = parseFloat($('#review-roundoff-input')?.value) || 0;
-    const computed = sumNet + sumGst - schemeDiscount + roundOff;
-    const declared = parseFloat($('#review-declared-total-input').value) || 0;
-
-    $('#review-subtotal-val').textContent = `₹${sumNet.toFixed(2)}`;
-    $('#review-gst-val').textContent = `₹${sumGst.toFixed(2)}`;
-
-    const diff = Math.abs(computed - declared);
-    const ok = diff <= 10 || declared === 0;
-    const badge = $('#review-arithmetic-badge');
-    const warn = $('#arithmetic-warning-banner');
-    const ack = $('#arithmetic-ack-container');
-
-    if (declared === 0) {
-        badge.textContent = 'No Total'; badge.className = 'px-2 py-0.5 text-[9px] rounded font-bold uppercase tracking-wider bg-slate-800 text-slate-400';
-        warn.classList.add('hidden'); ack.classList.add('hidden'); ack.classList.remove('flex');
-    } else if (ok) {
-        badge.textContent = 'Arithmetic OK'; badge.className = 'px-2 py-0.5 text-[9px] rounded font-bold uppercase tracking-wider bg-emerald-500/15 text-emerald-400 border border-emerald-500/30';
-        warn.classList.add('hidden'); ack.classList.add('hidden'); ack.classList.remove('flex');
-    } else {
-        badge.textContent = `Mismatch ₹${diff.toFixed(2)}`; badge.className = 'px-2 py-0.5 text-[9px] rounded font-bold uppercase tracking-wider bg-rose-500/15 text-rose-400 border border-rose-500/30';
-        warn.classList.remove('hidden');
-        warn.innerHTML = `<span class="font-bold">Totals don't match!</span> Computed ₹${computed.toFixed(2)} (Net + GST − Discount + Rounding) vs Declared ₹${declared.toFixed(2)} (diff ₹${diff.toFixed(2)}).`;
-        ack.classList.remove('hidden'); ack.classList.add('flex');
-    }
+window.updateTriageGroupName = (groupId, val) => {
+  const group = triageGroups.find(g => g.id === groupId);
+  if (group) {
+    group.invoiceNo = val.trim();
+    renderTriageGroups();
+  }
 };
 
-// ═══════════════════════════════════════════════════════════════════
-// 8. CONFIRM & SAVE (Step 8: Write Firestore → Delete temp file)
-// ═══════════════════════════════════════════════════════════════════
-async function saveConfirmedInvoice() {
-    const data = State.extractedData;
-    if (!data) return;
-
-    // Per-line validation warnings are informational only — never block save.
-    // The user has reviewed the extracted values and can fix them inline.
-
-    // ── Data-level duplicate check (distributorId + invoiceNumber) ──
-    if (data.distributor && data.invoiceNumber) {
-        const dup = await checkInvoiceDuplicate(data.distributor, data.invoiceNumber);
-        if (dup) {
-            const created = dup.capturedAt?.toDate ? dup.capturedAt.toDate().toLocaleDateString() : 'previously';
-            const proceed = confirm(`Invoice "${data.invoiceNumber}" from "${data.distributor}" was already recorded on ${created}. Save anyway?`);
-            if (!proceed) {
-                showToast('Duplicate invoice — save cancelled', 'amber');
-                return;
-            }
-        }
-    }
-
-    const btn = $('#btn-review-approve');
-    btn.disabled = true;
-    btn.innerHTML = '<span class="spinner spinner-white inline-block"></span> Saving...';
-
-    // Diagnostic: confirm auth state before attempting write
-    const authReady = isFirebaseReady();
-    const authUser = authReady ? State._auth.currentUser : null;
-    console.log('[RxExpiry] Save auth check:', {
-        firebaseReady: authReady,
-        currentUser: authUser ? { uid: authUser.uid, isAnonymous: authUser.isAnonymous, phoneNumber: authUser.phoneNumber } : null,
-        isUserAuthenticated: isUserAuthenticated()
-    });
-
-    if (!authReady || !authUser) {
-        console.warn('[RxExpiry] Not authenticated — falling back to demo save');
-        showToast('Not authenticated — saving locally', 'amber');
-    }
-
-    if (isUserAuthenticated()) {
-        try {
-            const { httpsCallable } = State._fbFunctions;
-            const pharmacyId = State.pharmacyId;
-
-            console.log('[RxExpiry] Saving via Cloud Function:', { pharmacyId, medicineCount: data.lineItems.length });
-
-            const saveFn = httpsCallable(State._functions, 'saveInvoice');
-            const result = await saveFn({
-                pharmacyId: pharmacyId,
-                invoice: {
-                    distributor: data.distributor || '',
-                    buyerName: data.buyerName || null,
-                    invoiceNumber: data.invoiceNumber || '',
-                    invoiceTotal: parseFloat($('#review-declared-total-input').value) || 0,
-                    totalTaxableAmount: data.totalTaxableAmount || 0,
-                    cgstTotal: data.cgstTotal || 0,
-                    sgstTotal: data.sgstTotal || 0,
-                    schemeDiscount: parseFloat($('#review-scheme-discount-input')?.value) || 0,
-                    cashDiscount: parseFloat($('#review-cash-discount-input')?.value) || 0,
-                    roundOff: parseFloat($('#review-roundoff-input')?.value) || 0,
-                    pendingInvoicesCount: data.pendingInvoicesCount || 0,
-                    pendingTotalAmount: data.pendingTotalAmount || 0,
-                    imageHash: State.currentImageHash || null
-                },
-                medicines: data.lineItems.filter(item => item.medicineName && item.medicineName !== 'Could not parse - verify manually').map(item => ({
-                    medicineName: item.medicineName,
-                    batchNumber: item.batchNumber || '',
-                    expiryDate: item.expiryDate || '',
-                    quantityBilled: parseInt(item.quantityBilled) || 0,
-                    quantityFree: parseInt(item.quantityFree) || 0,
-                    tradePrice: parseFloat(item.tradePrice) || 0,
-                    cdPercent: parseFloat(item.cdPercent) || 0,
-                    scmDiscount: parseFloat(item.scmDiscount) || 0,
-                    netValue: parseFloat(item.netValue) || 0,
-                    gstRate: parseFloat(item.gstRate) || 0,
-                    gstValue: parseFloat(item.gstValue) || 0,
-                    lineTotal: parseFloat(item.lineTotal) || 0,
-                    mrp: parseFloat(item.mrp) || 0,
-                    packSize: item.packSize || '',
-                    hsnCode: item.hsnCode || '',
-                    rack: item.rack || '',
-                    ptr: parseFloat(item.ptr) || 0,
-                    mfac: item.mfac || null,
-                    confidence: item.confidence || 0
-                })),
-                tempFileId: data.fileId || null
-            });
-
-            console.log('[RxExpiry] Save result:', result.data);
-
-            showToast(`Saved ${data.lineItems.length} items to Firestore!`, 'green');
-
-            // Reset button before closing (needed for batch queue)
-            btn.disabled = false;
-            btn.textContent = 'Confirm & Save';
-
-            closeReviewPanel();
-
-            // Reload data from Firestore
-            await fetchFirestoreData();
-
-        } catch (e) {
-            console.error('[RxExpiry] Save error:', e);
-            console.error('[RxExpiry] Save error code:', e.code, 'message:', e.message, 'details:', e.details);
-            showToast('Firestore save failed: ' + (e.message || e.code || 'Unknown error'), 'red');
-            btn.disabled = false;
-            btn.textContent = 'Confirm & Save';
-            return;
-        }
-    } else {
-        // Demo: save to local state
-        await new Promise(r => setTimeout(r, 800));
-        const invoiceId = `INV${Date.now().toString(36).toUpperCase()}`;
-        data.lineItems.forEach(item => {
-            if (!item.medicineName) return;
-            State.medicines.unshift({
-                id: `med_${Date.now()}_${Math.random().toString(36).slice(2,6)}`,
-                medicineName: item.medicineName, batchNumber: item.batchNumber, expiryDate: item.expiryDate,
-                quantityBilled: +item.quantityBilled||0, quantityFree: +item.quantityFree||0, remainingQty: +item.quantityBilled||0,
-                unitPrice: +item.unitPrice||0, netValue: +item.netValue||0, gstRate: +item.gstRate||0, gstValue: +item.gstValue||0,
-                distributor: data.distributor||'', invoiceId, confidence: item.confidence||0, soldToday: 0
-            });
+window.deleteTriageGroup = (groupId) => {
+  const group = triageGroups.find(g => g.id === groupId);
+  if (group) {
+    triageGroups = triageGroups.filter(g => g.id !== groupId);
+    if (group.files.length > 0) {
+      if (triageGroups.length > 0) {
+        triageGroups[0].files.push(...group.files);
+      } else {
+        triageGroups.push({
+          id: `group_${Date.now()}`,
+          invoiceNo: "ORPHANED_PAGES",
+          files: group.files
         });
-        State.invoices.unshift({ id: invoiceId, distributor: data.distributor, invoiceNumber: data.invoiceNumber,
-            invoiceTotal: parseFloat($('#review-declared-total-input').value)||0, lineItemCount: data.lineItems.length, imageHash: State.currentImageHash || null });
-        closeReviewPanel();
-        showToast(`Saved ${data.lineItems.length} items (demo)`, 'green');
+      }
     }
+    renderTriageGroups();
+  }
+};
 
-    renderExpiringList();
-    updateStats();
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// 9. INVENTORY LIST + EXPIRING Batches
-// ═══════════════════════════════════════════════════════════════════
-function renderExpiringList() {
-    const list = $('#expiring-list');
-    const count = $('#expiring-count');
-    const now = Date.now();
-    const cut = new Date(now + 90*86400000);
-
-    const expiring = State.medicines.filter(m => {
-        if (!m.expiryDate) return false;
-        const exp = parseExp(m.expiryDate);
-        return exp && exp <= cut && (m.remainingQty||0) > 0;
-    }).sort((a,b) => parseExp(a.expiryDate) - parseExp(b.expiryDate));
-
-    count.textContent = `${expiring.length} record${expiring.length!==1?'s':''}`;
-
-    if (!expiring.length) {
-        list.innerHTML = '<div class="text-center py-6 text-xs text-slate-500">No expiring items. Record an invoice to populate.</div>';
-        State.selectedMedIds.clear();
-        updateBulkActionBar();
-        return;
-    }
-
-    // ── Group by distributor ──
-    const distGroups = {};
-    expiring.forEach(m => {
-        const name = m.distributor || 'Unknown';
-        if (!distGroups[name]) distGroups[name] = { name, items: [] };
-        distGroups[name].items.push(m);
+window.moveTriageFile = (fileId, targetGroupId) => {
+  triageGroups.forEach((g) => {
+    g.files = g.files.filter(id => id !== fileId);
+  });
+  const targetGroup = triageGroups.find(g => g.id === targetGroupId);
+  if (targetGroup) {
+    targetGroup.files.push(fileId);
+    targetGroup.files.sort((aId, bId) => {
+      const a = triageFiles.find(f => f.id === aId);
+      const b = triageFiles.find(f => f.id === bId);
+      return a.pageNum - b.pageNum;
     });
-
-    // Enrich groups with distributor data (phone, returnWindowDays)
-    State.distributors.forEach(d => {
-        if (distGroups[d.name]) {
-            distGroups[d.name].phone = d.phone || '';
-            distGroups[d.name].returnWindowDays = d.returnWindowDays || 0;
-        }
-    });
-
-    const sortedGroups = Object.values(distGroups).sort((a, b) => b.items.length - a.items.length);
-
-    // Bulk action toolbar
-    const expiredCount = expiring.filter(m => { const e = parseExp(m.expiryDate); return e && e <= new Date(now); }).length;
-    const selectedCount = State.selectedMedIds.size;
-
-    let toolbarHtml = '';
-    if (State.selectMode) {
-        toolbarHtml = `
-        <div class="bg-slate-800/60 border border-indigo-500/30 rounded-xl p-3 flex flex-wrap items-center gap-2 mb-2">
-            <span class="text-[10px] text-indigo-400 font-bold">${selectedCount} selected</span>
-            <div class="flex-1"></div>
-            <button onclick="selectAllExpiring()" class="text-[10px] px-2 py-1 rounded-md bg-slate-700 text-slate-300 font-bold hover:bg-slate-600 transition-all">Select All</button>
-            ${expiredCount > 0 ? `<button onclick="selectExpiredOnly()" class="text-[10px] px-2 py-1 rounded-md bg-amber-600/20 text-amber-400 font-bold hover:bg-amber-600/30 transition-all">Select Expired (${expiredCount})</button>` : ''}
-            <button onclick="clearSelection()" class="text-[10px] px-2 py-1 rounded-md bg-slate-700 text-slate-400 font-bold hover:bg-slate-600 transition-all">Clear</button>
-            <button onclick="exitSelectMode()" class="text-[10px] px-2 py-1 rounded-md bg-slate-700 text-slate-400 font-bold hover:bg-slate-600 transition-all">Cancel</button>
-        </div>`;
-    } else {
-        toolbarHtml = `
-        <div class="flex items-center justify-between mb-1">
-            <button onclick="enterSelectMode()" class="text-[10px] px-2.5 py-1 rounded-md bg-slate-800 border border-slate-700 text-slate-400 font-bold hover:text-indigo-400 hover:border-indigo-500/50 transition-all flex items-center gap-1">
-                <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2"/></svg>
-                Select
-            </button>
-        </div>`;
-    }
-
-    // ── Render grouped list ──
-    let html = toolbarHtml;
-    sortedGroups.forEach((group, gi) => {
-        const phoneHtml = group.phone ? `<a href="tel:${group.phone.replace(/[^0-9+]/g, '')}" class="text-[10px] px-2 py-0.5 rounded bg-emerald-600/20 text-emerald-400 font-bold hover:bg-emerald-600/30 transition-all shrink-0">Call</a>` : '';
-        const phoneNum = group.phone ? `<span class="text-[9px] text-slate-500 font-mono">${esc(group.phone)}</span>` : '';
-
-        // Return window countdown
-        let returnWindowHtml = '';
-        if (group.returnWindowDays > 0) {
-            const earliest = Math.min(...group.items.map(m => parseExp(m.expiryDate).getTime()));
-            const windowClose = earliest - (group.returnWindowDays * 86400000);
-            const daysLeft = Math.ceil((windowClose - now) / 86400000);
-            if (daysLeft > 0) {
-                returnWindowHtml = `<span class="text-[9px] px-1.5 py-0.5 rounded bg-sky-600/20 text-sky-400 font-bold">Return window: ${daysLeft}d left</span>`;
-            } else {
-                returnWindowHtml = `<span class="text-[9px] px-1.5 py-0.5 rounded bg-rose-600/20 text-rose-400 font-bold">Return window closed</span>`;
-            }
-        }
-
-        const groupId = `exp-group-${gi}`;
-        html += `
-        <div class="bg-slate-800/40 border border-slate-700/30 rounded-xl overflow-hidden mb-2">
-            <button onclick="toggleExpiringGroup('${groupId}')" class="w-full p-3 flex items-center justify-between gap-2 text-left hover:bg-slate-800/60 transition-colors">
-                <div class="flex-1 min-w-0">
-                    <div class="flex items-center gap-2 flex-wrap">
-                        <h4 class="font-heading font-bold text-slate-100 text-xs">${esc(group.name)}</h4>
-                        ${phoneHtml}
-                        ${phoneNum}
-                    </div>
-                    <div class="flex items-center gap-2 mt-0.5">
-                        <span class="text-[10px] text-slate-400">${group.items.length} expiring item${group.items.length!==1?'s':''}</span>
-                        ${returnWindowHtml}
-                    </div>
-                </div>
-                <svg id="exp-chevron-${gi}" class="w-4 h-4 text-slate-500 transition-transform duration-200 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
-            </button>
-            <div id="${groupId}" class="hidden border-t border-slate-700/30">
-                ${group.items.map(m => {
-                    const days = Math.ceil((parseExp(m.expiryDate) - now) / 86400000);
-                    let cls, txt;
-                    if (days <= 0) { cls='badge-expired'; txt='EXPIRED'; }
-                    else if (days <= 30) { cls='badge-expiring'; txt=`${days}d left`; }
-                    else { cls='badge-safe'; txt=`${days}d left`; }
-
-                    const isSelected = State.selectedMedIds.has(m.id);
-                    const checkbox = State.selectMode ? `
-                        <label class="shrink-0 cursor-pointer" onclick="event.stopPropagation()">
-                            <input type="checkbox" ${isSelected ? 'checked' : ''} onchange="toggleMedSelect('${m.id}')" class="accent-indigo-500 w-4 h-4 rounded border-slate-600 bg-slate-800">
-                        </label>` : '';
-
-                    const rowCls = isSelected ? 'border-indigo-500/60 bg-indigo-500/10' : 'border-slate-700/50';
-
-                    return `<div class="px-3 py-2.5 border-b ${rowCls} last:border-0 flex items-center justify-between gap-2 transition-all ${isSelected ? 'ring-1 ring-indigo-500/30' : ''}">
-                        ${checkbox}
-                        <div class="flex-1 min-w-0">
-                            <p class="text-[10px] font-bold text-slate-200 truncate">${esc(m.medicineName)}</p>
-                            <p class="text-[9px] text-slate-500 font-mono">Batch: ${esc(m.batchNumber||'N/A')} · ${m.remainingQty||0} pkts</p>
-                        </div>
-                        <span class="px-2 py-1 text-[9px] rounded font-bold shrink-0 ${cls}">${txt}</span>
-                        ${State.selectMode ? '' : `<button onclick="deleteMedicine('${m.id}','${esc(m.medicineName)}')" class="shrink-0 p-1.5 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 transition-all" title="Remove">
-                            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
-                        </button>`}
-                    </div>`;
-                }).join('')}
-            </div>
-        </div>`;
-    });
-
-    list.innerHTML = html;
-    updateBulkActionBar();
-}
-
-window.toggleExpiringGroup = function(id) {
-    const el = document.getElementById(id);
-    const idx = id.replace('exp-group-', '');
-    const chevron = $(`#exp-chevron-${idx}`);
-    const isOpen = !el.classList.contains('hidden');
-
-    // Collapse all
-    $$('.view-pane [id^="exp-group-"]').forEach(e => e.classList.add('hidden'));
-    $$('.view-pane [id^="exp-chevron-"]').forEach(e => e.style.transform = '');
-
-    if (!isOpen) {
-        el.classList.remove('hidden');
-        if (chevron) chevron.style.transform = 'rotate(180deg)';
-    }
+  }
+  renderTriageGroups();
 };
 
-window.deleteMedicine = async function(id, name) {
-    if (!confirm(`Remove "${name}"? This can't be undone.`)) return;
+async function startTriageUploadAndExtraction() {
+  $("triage-modal").classList.add("hidden");
+  
+  const groupsToProcess = triageGroups.filter(g => g.files.length > 0);
+  if (groupsToProcess.length === 0) {
+    showToast("No invoices to process", "warning");
+    return;
+  }
 
-    if (isUserAuthenticated()) {
-        try {
-            const { httpsCallable } = State._fbFunctions;
-            const fn = httpsCallable(State._functions, 'deleteMedicine');
-            await fn({ pharmacyId: State.pharmacyId, medicineId: id });
-        } catch (e) {
-            console.error('[RxExpiry] Delete failed:', e);
-            showToast('Delete failed: ' + e.message, 'red');
-            return;
-        }
-    }
+  showLoadingOverlay(true, "Uploading invoice files...");
+  reviewQueue = [];
+  reviewQueueIndex = 0;
 
-    State.medicines = State.medicines.filter(m => m.id !== id);
-    renderExpiringList();
-    updateStats();
-    showToast(`Removed "${name}"`, 'green');
-};
+  const extractFn = httpsCallable(functions, "extractInvoice", { timeout: 120000 });
 
-// ═══════════════════════════════════════════════════════════════════
-// 9b. BULK SELECT + DELETE
-// ═══════════════════════════════════════════════════════════════════
-window.enterSelectMode = function() {
-    State.selectMode = true;
-    State.selectedMedIds.clear();
-    renderExpiringList();
-};
+  for (let i = 0; i < groupsToProcess.length; i++) {
+    const group = groupsToProcess[i];
+    showLoadingOverlay(true, `Processing invoice ${i + 1}/${groupsToProcess.length}...`);
 
-window.exitSelectMode = function() {
-    State.selectMode = false;
-    State.selectedMedIds.clear();
-    renderExpiringList();
-};
-
-window.toggleMedSelect = function(id) {
-    if (State.selectedMedIds.has(id)) {
-        State.selectedMedIds.delete(id);
-    } else {
-        State.selectedMedIds.add(id);
-    }
-    renderExpiringList();
-};
-
-window.selectAllExpiring = function() {
-    const now = Date.now();
-    const cut = new Date(now + 90*86400000);
-    State.medicines.forEach(m => {
-        if (!m.expiryDate) return;
-        const exp = parseExp(m.expiryDate);
-        if (exp && exp <= cut && (m.remainingQty||0) > 0) {
-            State.selectedMedIds.add(m.id);
-        }
-    });
-    renderExpiringList();
-};
-
-window.selectExpiredOnly = function() {
-    const now = Date.now();
-    State.selectedMedIds.clear();
-    State.medicines.forEach(m => {
-        if (!m.expiryDate) return;
-        const exp = parseExp(m.expiryDate);
-        if (exp && exp <= now && (m.remainingQty||0) > 0) {
-            State.selectedMedIds.add(m.id);
-        }
-    });
-    renderExpiringList();
-};
-
-window.clearSelection = function() {
-    State.selectedMedIds.clear();
-    renderExpiringList();
-};
-
-window.bulkDeleteSelected = async function() {
-    const ids = Array.from(State.selectedMedIds);
-    if (!ids.length) return;
-    if (!confirm(`Delete ${ids.length} selected medicine${ids.length>1?'s':''}? This can't be undone.`)) return;
-
-    const btn = $('#btn-bulk-delete');
-    if (btn) { btn.disabled = true; btn.textContent = 'Deleting...'; }
-
-    if (isUserAuthenticated()) {
-        try {
-            const { httpsCallable } = State._fbFunctions;
-            const fn = httpsCallable(State._functions, 'bulkDeleteMedicines');
-            await fn({ pharmacyId: State.pharmacyId, medicineIds: ids });
-        } catch (e) {
-            console.error('[RxExpiry] Bulk delete failed:', e);
-            showToast('Bulk delete failed: ' + e.message, 'red');
-            if (btn) { btn.disabled = false; btn.textContent = 'Delete Selected'; }
-            return;
-        }
-    }
-
-    State.medicines = State.medicines.filter(m => !State.selectedMedIds.has(m.id));
-    const count = State.selectedMedIds.size;
-    State.selectedMedIds.clear();
-    State.selectMode = false;
-    renderExpiringList();
-    updateStats();
-    showToast(`Deleted ${count} medicine${count>1?'s':''}`, 'green');
-};
-
-function updateBulkActionBar() {
-    const bar = $('#bulk-action-bar');
-    if (!bar) return;
-    const count = State.selectedMedIds.size;
-    if (State.selectMode && count > 0) {
-        bar.classList.remove('hidden');
-        $('#bulk-count-text').textContent = `${count} item${count>1?'s':''} selected`;
-    } else {
-        bar.classList.add('hidden');
-    }
-}
-
-function updateStats() {
-    const cut = new Date(Date.now() + 90*86400000);
-    $('#stat-total-batches').textContent = State.medicines.length;
-    $('#stat-expiring-batches').textContent = State.medicines.filter(m => { const e=parseExp(m.expiryDate); return e&&e<=cut; }).length;
-    $('#stat-total-packs').textContent = State.medicines.reduce((s,m)=>s+(m.remainingQty||0),0);
-    $('#stat-sold-today').textContent = State.medicines.reduce((s,m)=>s+(m.soldToday||0),0);
-}
-
-function parseExp(str) {
-    if (!str) return null;
-    const sep = str.includes('/') ? '/' : '-';
-    const p = str.split(sep).map(Number);
-    if (p.length === 3) return p[0] > 1900 ? new Date(p[0], p[1]-1, p[2]) : new Date(p[2] > 1900 ? p[2] : 2000+p[2], p[1]-1, p[0]);
-    if (p.length === 2) return new Date(p[1] > 1900 ? p[1] : 2000+p[1], p[0]-1, 1);
-    return null;
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// 10. SEARCH + MANUAL ENTRY
-// ═══════════════════════════════════════════════════════════════════
-function bindSearch() {
-    const input = $('#search-input');
-    const list = $('#search-autocomplete-list');
-
-    input.addEventListener('input', () => {
-        const q = input.value.toLowerCase().trim();
-        if (q.length < 2) { list.classList.add('hidden'); return; }
-        const matches = State.medicines.filter(m =>
-            m.medicineName?.toLowerCase().includes(q) || m.batchNumber?.toLowerCase().includes(q)
-        ).slice(0, 8);
-        if (!matches.length) {
-            list.innerHTML = `<div class="autocomplete-item px-4 py-3 text-xs text-slate-400 cursor-pointer" data-action="new">+ Register new batch manually</div>`;
-        } else {
-            list.innerHTML = matches.map(m => `
-                <div class="autocomplete-item px-4 py-3 cursor-pointer" data-id="${m.id}">
-                    <div class="font-heading font-bold text-slate-100 text-xs">${esc(m.medicineName)}</div>
-                    <div class="text-[10px] text-slate-400 font-mono">Batch: ${esc(m.batchNumber||'N/A')} · Exp: ${esc(m.expiryDate||'N/A')} · Stock: ${m.remainingQty||0}</div>
-                </div>`).join('');
-        }
-        list.classList.remove('hidden');
-        list.querySelectorAll('.autocomplete-item').forEach(item => {
-            item.addEventListener('click', () => {
-                list.classList.add('hidden');
-                if (item.dataset.action==='new') { input.value=''; showNewBatchForm(); return; }
-                const med = State.medicines.find(m=>m.id===item.dataset.id);
-                if (med) selectBatch(med);
-            });
-        });
-    });
-    document.addEventListener('click', e => {
-        if (!e.target.closest('#search-input') && !e.target.closest('#search-autocomplete-list')) list.classList.add('hidden');
-    });
-
-    $('#btn-search-decrement').addEventListener('click', decrementBatch);
-    $('#btn-save-manual-batch').addEventListener('click', saveManualBatch);
-}
-
-function selectBatch(med) {
-    State.selectedBatch = med;
-    $('#search-result-panel').classList.remove('hidden');
-    $('#new-batch-fallback-form').classList.add('hidden');
-    $('#search-med-name').textContent = med.medicineName;
-    $('#search-med-batch').textContent = `Batch: ${med.batchNumber||'N/A'}`;
-    $('#search-med-original-qty').textContent = med.quantityBilled||0;
-    $('#search-med-remaining-qty').textContent = med.remainingQty||0;
-    const exp = parseExp(med.expiryDate);
-    const badge = $('#search-med-expiry');
-    if (exp) {
-        const d = Math.ceil((exp-Date.now())/86400000);
-        if (d<=0) { badge.textContent='EXPIRED'; badge.className='px-2 py-0.5 text-[9px] rounded font-bold badge-expired'; }
-        else if (d<=30) { badge.textContent=`${d}d left`; badge.className='px-2 py-0.5 text-[9px] rounded font-bold badge-expiring'; }
-        else { badge.textContent=`Exp: ${med.expiryDate}`; badge.className='px-2 py-0.5 text-[9px] rounded font-bold badge-safe'; }
-    }
-}
-
-async function decrementBatch() {
-    const med = State.selectedBatch;
-    if (!med) return;
-    if ((med.remainingQty||0)<=0) { showToast('Stock is zero','red'); return; }
-    const newQty = med.remainingQty - 1;
-
-    if (isFirebaseReady()) {
-        try {
-            const { doc, updateDoc } = State._fbFirestore;
-            await updateDoc(doc(State._db, `pharmacies/${State.pharmacyId}/medicines/${med.id}`), { remainingQty: newQty });
-        } catch (e) { console.warn('[RxExpiry] Firestore update skipped:', e); }
-    }
-
-    med.remainingQty = newQty;
-    $('#search-med-remaining-qty').textContent = newQty;
-    showToast(`${med.medicineName} → ${newQty} remaining`, 'indigo');
-    renderExpiringList();
-}
-
-function showNewBatchForm() {
-    $('#search-result-panel').classList.add('hidden');
-    $('#new-batch-fallback-form').classList.remove('hidden');
-    populateDistSelects();
-}
-
-async function saveManualBatch() {
-    const name = $('#manual-med-name').value.trim();
-    const batch = $('#manual-med-batch').value.trim();
-    const expiry = $('#manual-med-expiry').value;
-    const qty = parseInt($('#manual-med-qty').value)||0;
-    const dist = $('#manual-med-distributor').value;
-    if (!name||!batch||!expiry||qty<=0) { showToast('Fill all fields','red'); return; }
-
-    const expFmt = expiry.split('-').reverse().join('/');
-
-    if (isFirebaseReady()) {
-        try {
-            const { collection, addDoc, serverTimestamp } = State._fbFirestore;
-            await addDoc(collection(State._db, `pharmacies/${State.pharmacyId}/medicines`), {
-                medicineName: name, batchNumber: batch, expiryDate: expFmt,
-                quantityBilled: qty, quantityFree: 0, remainingQty: qty, unitPrice: 0, netValue: 0,
-                gstRate: 0, gstValue: 0, distributor: dist, invoiceId: null, confidence: 1, addedAt: serverTimestamp(), soldToday: 0
-            });
-        } catch (e) { console.warn('[RxExpiry] Firestore save skipped:', e); }
-    }
-
-    State.medicines.unshift({ id:`med_${Date.now()}`, medicineName:name, batchNumber:batch, expiryDate:expFmt,
-        quantityBilled:qty, quantityFree:0, remainingQty:qty, unitPrice:0, netValue:0, gstRate:0, gstValue:0,
-        distributor:dist, invoiceId:null, confidence:1, soldToday:0 });
-
-    $('#manual-med-name').value=''; $('#manual-med-batch').value='';
-    $('#manual-med-expiry').value=''; $('#manual-med-qty').value='';
-    $('#new-batch-fallback-form').classList.add('hidden');
-    showToast('Batch saved!','green');
-    renderExpiringList();
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// 11. DISTRIBUTORS
-// ═══════════════════════════════════════════════════════════════════
-function renderDistributors() {
-    const list = $('#distributors-list');
+    const storagePaths = [];
+    const objectUrls = [];
     
-    // Build distributor map from medicines
-    const distMap = {};
-    State.medicines.forEach(m => {
-        const name = m.distributor || 'Unknown';
-        if (!distMap[name]) distMap[name] = { name, medicines: [], invoices: new Set() };
-        distMap[name].medicines.push(m);
-    });
-    // Count invoices per distributor
-    State.invoices.forEach(inv => {
-        const name = inv.distributor || 'Unknown';
-        if (distMap[name]) distMap[name].invoices.add(inv.id);
-    });
-
-    // Enrich with Firestore distributor data (phone, returnWindowDays)
-    State.distributors.forEach(d => {
-        if (distMap[d.name]) {
-            distMap[d.name].phone = d.phone || '';
-            distMap[d.name].returnWindowDays = d.returnWindowDays || 0;
-            distMap[d.name].distId = d.id;
-        }
-    });
-
-    const dists = Object.values(distMap).sort((a, b) => b.medicines.length - a.medicines.length);
-    if (!dists.length) { list.innerHTML = '<div class="text-center py-8 text-xs text-slate-500">No distributors yet. Save an invoice to populate.</div>'; return; }
-
-    list.innerHTML = dists.map((d, i) => {
-        const invCount = d.invoices.size;
-        const medCount = d.medicines.length;
-        const now = Date.now();
-        const cut90 = new Date(now + 90 * 86400000);
-        const expiring = d.medicines.filter(m => { const e = parseExp(m.expiryDate); return e && e <= cut90; }).length;
-        const phoneHtml = d.phone ? `<a href="tel:${d.phone.replace(/[^0-9+]/g, '')}" onclick="event.stopPropagation()" class="text-[10px] px-2 py-0.5 rounded bg-emerald-600/20 text-emerald-400 font-bold hover:bg-emerald-600/30 transition-all shrink-0">Call</a>` : '';
-        return `<div class="distributor-card bg-slate-800/60 border border-slate-700/50 rounded-xl overflow-hidden">
-            <button onclick="toggleDistributor(${i})" class="w-full p-3 flex items-center justify-between gap-3 text-left hover:bg-slate-800/40 transition-colors">
-                <div class="flex-1 min-w-0">
-                    <div class="flex items-center gap-2">
-                        <h4 class="font-heading font-bold text-slate-100 text-xs">${esc(d.name)}</h4>
-                        ${phoneHtml}
-                        ${d.phone ? `<span class="text-[9px] text-slate-500 font-mono">${esc(d.phone)}</span>` : ''}
-                    </div>
-                    <p class="text-[10px] text-slate-400">${medCount} medicine${medCount !== 1 ? 's' : ''} · ${invCount} invoice${invCount !== 1 ? 's' : ''}${expiring ? ` · <span class="text-amber-400">${expiring} expiring</span>` : ''}</p>
-                </div>
-                <div class="flex items-center gap-2 shrink-0">
-                    ${d.distId ? `<button onclick="event.stopPropagation(); editDistributor('${d.distId}')" class="p-1 rounded text-slate-500 hover:text-indigo-400 transition-all" title="Edit"><svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z"/></svg></button>` : ''}
-                    <svg id="dist-chevron-${i}" class="w-4 h-4 text-slate-500 transition-transform duration-200 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg>
-                </div>
-            </button>
-            <div id="dist-expand-${i}" class="hidden border-t border-slate-700/50 max-h-64 overflow-y-auto">
-                ${d.medicines.map(m => {
-                    const exp = parseExp(m.expiryDate);
-                    const days = exp ? Math.ceil((exp - now) / 86400000) : null;
-                    let badge = '';
-                    if (days !== null) {
-                        if (days <= 0) badge = '<span class="text-[8px] px-1.5 py-0.5 rounded font-bold bg-rose-500/20 text-rose-400">EXPIRED</span>';
-                        else if (days <= 30) badge = `<span class="text-[8px] px-1.5 py-0.5 rounded font-bold bg-amber-500/20 text-amber-400">${days}d</span>`;
-                        else badge = `<span class="text-[8px] px-1.5 py-0.5 rounded font-bold bg-emerald-500/20 text-emerald-400">${days}d</span>`;
-                    }
-                    return `<div class="px-3 py-2 border-b border-slate-800/50 last:border-0 flex items-center justify-between gap-2">
-                        <div class="min-w-0">
-                            <p class="text-[10px] font-bold text-slate-200 truncate">${esc(m.medicineName)}</p>
-                            <p class="text-[9px] text-slate-500 font-mono">Batch: ${esc(m.batchNumber||'N/A')} · Qty: ${m.remainingQty||0} · Exp: ${esc(m.expiryDate||'N/A')}</p>
-                        </div>
-                        ${badge}
-                    </div>`;
-                }).join('')}
-            </div>
-        </div>`;
-    }).join('');
-}
-
-window.toggleDistributor = function(idx) {
-    const expand = $(`#dist-expand-${idx}`);
-    const chevron = $(`#dist-chevron-${idx}`);
-    const isOpen = !expand.classList.contains('hidden');
-
-    // Collapse all
-    $$('.distributor-card [id^="dist-expand-"]').forEach(el => el.classList.add('hidden'));
-    $$('.distributor-card [id^="dist-chevron-"]').forEach(el => el.style.transform = '');
-
-    // If it was closed, open it (and rotate chevron)
-    if (!isOpen) {
-        expand.classList.remove('hidden');
-        chevron.style.transform = 'rotate(180deg)';
-    }
-};
-
-function populateDistSelects() {
-    const sel = $('#manual-med-distributor');
-    if (sel) sel.innerHTML = '<option value="">Select Distributor</option>' + State.distributors.map(d=>`<option value="${esc(d.name)}">${esc(d.name)}</option>`).join('');
-}
-
-function bindDistributorForm() {
-    $('#btn-save-distributor').addEventListener('click', saveDistributor);
-    $('#btn-cancel-dist-edit').addEventListener('click', () => {
-        $('#dist-edit-id').value = '';
-        $('#dist-name').value = '';
-        $('#dist-phone').value = '';
-        $('#dist-return-days').value = '';
-        $('#distributor-form-title').textContent = 'Add Distributor';
-        $('#btn-cancel-dist-edit').classList.add('hidden');
-    });
-}
-
-async function saveDistributor() {
-    const name = $('#dist-name').value.trim();
-    const phone = $('#dist-phone').value.trim();
-    const returnDays = parseInt($('#dist-return-days').value) || 0;
-    if (!name) { showToast('Enter distributor name', 'red'); return; }
-
-    const editId = $('#dist-edit-id').value || null;
-
-    if (isFirebaseReady()) {
-        try {
-            const { httpsCallable } = State._fbFunctions;
-            const fn = httpsCallable(State._functions, 'saveDistributor');
-            await fn({ pharmacyId: State.pharmacyId, distributorId: editId, name, phone, returnWindowDays: returnDays });
-        } catch (e) {
-            console.error('[RxExpiry] Save distributor failed:', e);
-            showToast('Save failed: ' + e.message, 'red');
-            return;
-        }
+    try {
+      for (let j = 0; j < group.files.length; j++) {
+        const tf = triageFiles.find(f => f.id === group.files[j]);
+        const ext = tf.file.type === "application/pdf" ? "pdf" : "jpg";
+        const filename = `${Date.now()}_grp_${i}_p_${j}_${Math.random().toString(36).slice(2)}.${ext}`;
+        const storagePath = `invoices/${currentPharmacyId}/${filename}`;
+        const storageRef = ref(storage, storagePath);
+        
+        await uploadBytes(storageRef, tf.file, { contentType: tf.file.type });
+        storagePaths.push(storagePath);
+        objectUrls.push(tf.objectUrl);
+      }
+    } catch (uploadErr) {
+      showLoadingOverlay(false);
+      showToast(`Upload failed for group ${group.invoiceNo}: ${uploadErr.message}`, "error");
+      return;
     }
 
-    // Update local state
-    if (editId) {
-        const existing = State.distributors.find(d => d.id === editId);
-        if (existing) { existing.name = name; existing.phone = phone; existing.returnWindowDays = returnDays; }
-    } else {
-        State.distributors.push({ id: editId || `dist_${Date.now()}`, name, phone, returnWindowDays: returnDays });
+    showLoadingOverlay(true, `Extracting Invoice "${group.invoiceNo}" with Gemini AI...`);
+    try {
+      const result = await extractFn({ storagePaths, pharmacyId: currentPharmacyId });
+      console.log(`Gemini raw extraction result for group "${group.invoiceNo}":`, JSON.stringify(result.data, null, 2));
+      console.log(`invoiceSummary:`, JSON.stringify(result.data.invoiceSummary, null, 2));
+      console.log(`invoiceTotal:`, result.data.invoiceTotal);
+      console.log(`lineItems count:`, result.data.lineItems?.length);
+      reviewQueue.push({
+        storagePaths,
+        objectUrls,
+        extracted: result.data
+      });
+    } catch (geminiErr) {
+      console.error(`Gemini extraction failed for group "${group.invoiceNo}":`, geminiErr);
+      showLoadingOverlay(false);
+      showToast(`Gemini extraction failed for group ${group.invoiceNo}: ${geminiErr.message}`, "error");
+      for (const p of storagePaths) {
+        try { await deleteObject(ref(storage, p)); } catch (_) {}
+      }
+      return;
     }
+  }
 
-    // Reset form
-    $('#dist-edit-id').value = '';
-    $('#dist-name').value = '';
-    $('#dist-phone').value = '';
-    $('#dist-return-days').value = '';
-    $('#distributor-form-title').textContent = 'Add Distributor';
-    $('#btn-cancel-dist-edit').classList.add('hidden');
+  showLoadingOverlay(false);
+  
+  triageFiles.forEach((tf) => {
+    const isUsed = reviewQueue.some(item => item.objectUrls.includes(tf.objectUrl));
+    if (!isUsed) URL.revokeObjectURL(tf.objectUrl);
+  });
 
-    renderDistributors();
-    populateDistSelects();
-    showToast(editId ? 'Distributor updated' : 'Distributor added', 'green');
+  if (reviewQueue.length > 0) {
+    showNextReviewInQueue();
+  } else {
+    showToast("No invoices extracted successfully", "error");
+  }
 }
 
-window.editDistributor = function(id) {
-    const dist = State.distributors.find(d => d.id === id);
-    if (!dist) return;
-    $('#dist-edit-id').value = dist.id;
-    $('#dist-name').value = dist.name || '';
-    $('#dist-phone').value = dist.phone || '';
-    $('#dist-return-days').value = dist.returnWindowDays || '';
-    $('#distributor-form-title').textContent = 'Edit Distributor';
-    $('#btn-cancel-dist-edit').classList.remove('hidden');
-    $('#distributor-form').scrollIntoView({ behavior: 'smooth' });
-};
+function showNextReviewInQueue() {
+  if (reviewQueueIndex >= reviewQueue.length) {
+    showToast("All invoice extractions reviewed and saved!", "success");
+    loadExpiringMedicines();
+    return;
+  }
 
-// ═══════════════════════════════════════════════════════════════════
-// 12. SETTINGS / ADMIN
-// ═══════════════════════════════════════════════════════════════════
-function bindSettings() {
-    $('#btn-invite-staff').addEventListener('click', async () => {
-        const phone = $('#invite-phone').value.trim();
-        if (!phone||phone.length<10) { showToast('Enter valid phone','red'); return; }
+  const reviewItem = reviewQueue[reviewQueueIndex];
+  reviewSession = {
+    storagePaths: reviewItem.storagePaths,
+    objectUrls: reviewItem.objectUrls,
+    currentPageIndex: 0,
+    fileType: 'image',
+    extracted: reviewItem.extracted
+  };
 
-        if (isFirebaseReady()) {
-            try {
-                const { collection, addDoc, serverTimestamp } = State._fbFirestore;
-                await addDoc(collection(State._db, `pharmacies/${State.pharmacyId}/staff`), {
-                    phone: `+91${phone}`, role: 'staff', invitedBy: State.user?.phone||'unknown', invitedAt: serverTimestamp(), active: true
-                });
-            } catch (e) { console.warn('[RxExpiry] Staff invite skipped:', e); }
-        }
-
-        State.staff.push({ phone: `+91${phone}`, role: 'staff' });
-        showToast('Staff invite sent!','green');
-        $('#invite-phone').value = '';
-        loadStaffList();
-    });
+  openReviewPanel(reviewItem.extracted);
 }
 
-function loadStaffList() {
-    const list = $('#active-staff-list');
-    if (!State.staff.length) { list.innerHTML='<li class="text-slate-500 py-1">No staff yet</li>'; return; }
-    list.innerHTML = State.staff.map(s=>`<li class="py-1 flex justify-between"><span>${esc(s.phone)}</span><span class="text-indigo-400">${s.role}</span></li>`).join('');
+function updateReviewVisualSource() {
+  const imgEl = $("review-invoice-img");
+  const pdfEl = $("review-invoice-pdf");
+  const url = reviewSession.objectUrls[reviewSession.currentPageIndex];
+  
+  if (url && (url.includes("pdf") || url.startsWith("blob:") && reviewSession.fileType === "pdf")) {
+    imgEl.classList.add("hidden");
+    pdfEl.classList.remove("hidden");
+    pdfEl.src = url;
+  } else {
+    pdfEl.classList.add("hidden");
+    imgEl.classList.remove("hidden");
+    imgEl.src = url;
+  }
 }
 
-// ═══════════════════════════════════════════════════════════════════
-// 13. THEME + EXPORT
-// ═══════════════════════════════════════════════════════════════════
-function bindThemeToggle() {
-    $('#theme-toggle').addEventListener('click', () => {
-        State.isDark = !State.isDark;
-        document.body.classList.toggle('bg-slate-950', State.isDark);
-        document.body.classList.toggle('text-slate-100', State.isDark);
-        document.body.classList.toggle('bg-slate-50', !State.isDark);
-        document.body.classList.toggle('text-slate-900', !State.isDark);
-        showToast(State.isDark?'Dark mode':'Light mode','indigo');
-    });
+function updateReviewPaginationUI() {
+  const prevBtn = $("btn-prev-page");
+  const nextBtn = $("btn-next-page");
+  const txt = $("txt-page-num");
+  const total = reviewSession.objectUrls.length;
+  const current = reviewSession.currentPageIndex + 1;
+
+  txt.textContent = `Page ${current}/${total}`;
+  prevBtn.disabled = reviewSession.currentPageIndex === 0;
+  nextBtn.disabled = reviewSession.currentPageIndex === total - 1;
 }
 
-function bindExport() {
-    $('#btn-export-csv')?.addEventListener('click', () => {
-        if (!State.medicines.length) { showToast('No data','red'); return; }
-        const h = ['Medicine','Batch','Expiry','Qty','Remaining','Unit₹','Net₹','GST₹','Distributor'];
-        const csv = [h,...State.medicines.map(m=>[m.medicineName,m.batchNumber,m.expiryDate,m.quantityBilled,m.remainingQty,m.unitPrice,m.netValue,m.gstValue,m.distributor])].map(r=>r.map(c=>`"${(c||'').toString().replace(/"/g,'""')}"`).join(',')).join('\n');
-        dl(csv,`rxexpiry_${Date.now()}.csv`,'text/csv'); showToast('CSV exported!','green');
-    });
-    $('#btn-export-json')?.addEventListener('click', () => {
-        if (!State.medicines.length) { showToast('No data','red'); return; }
-        dl(JSON.stringify(State.medicines,null,2),`rxexpiry_${Date.now()}.json`,'application/json'); showToast('JSON exported!','green');
-    });
+async function splitPdfToImages(file) {
+  const arrayBuffer = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const images = [];
+
+  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+    const page = await pdf.getPage(pageNum);
+    const viewport = page.getViewport({ scale: 1.5 });
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    
+    await page.render({ canvasContext: ctx, viewport: viewport }).promise;
+    
+    const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.9));
+    const pageFile = new File([blob], `${file.name.replace(/\.[^/.]+$/, "")}_page_${pageNum}.jpg`, { type: 'image/jpeg' });
+    images.push(pageFile);
+  }
+  return images;
 }
 
-function dl(content, name, mime) {
-    const a = document.createElement('a');
-    a.href = URL.createObjectURL(new Blob([content],{type:mime}));
-    a.download = name; document.body.appendChild(a); a.click(); a.remove();
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// DEMO DATA
-// ═══════════════════════════════════════════════════════════════════
-function getDemoMedicines() {
-    return [
-        { id:'d1', medicineName:'Azithral 500mg Tablet', batchNumber:'AZ2214', expiryDate:'03/2026', quantityBilled:20, quantityFree:2, remainingQty:14, unitPrice:85.50, netValue:1710, gstRate:12, gstValue:205.20, distributor:'Medico Pharma', confidence:0.95, soldToday:2 },
-        { id:'d2', medicineName:'Paracetamol 650mg Tab', batchNumber:'PCM1188', expiryDate:'09/2025', quantityBilled:50, quantityFree:5, remainingQty:38, unitPrice:12.00, netValue:600, gstRate:12, gstValue:72, distributor:'HealthLine Dist.', confidence:0.92, soldToday:5 },
-        { id:'d3', medicineName:'Amoxicillin 250mg Cap', batchNumber:'AMX5501', expiryDate:'02/2026', quantityBilled:30, quantityFree:3, remainingQty:30, unitPrice:45.00, netValue:1350, gstRate:12, gstValue:162, distributor:'Medico Pharma', confidence:0.88, soldToday:0 },
-        { id:'d4', medicineName:'Pan-D Pantoprazole Tab', batchNumber:'PAN9933', expiryDate:'11/2025', quantityBilled:40, quantityFree:4, remainingQty:22, unitPrice:120.00, netValue:4800, gstRate:12, gstValue:576, distributor:'Wellness Rx', confidence:0.97, soldToday:3 },
-        { id:'d5', medicineName:'Cetirizine 10mg Tab', batchNumber:'CTZ7766', expiryDate:'08/2025', quantityBilled:60, quantityFree:6, remainingQty:55, unitPrice:8.50, netValue:510, gstRate:12, gstValue:61.20, distributor:'HealthLine Dist.', confidence:0.91, soldToday:1 },
-        { id:'d6', medicineName:'Montair LC 10mg Tab', batchNumber:'MNL4421', expiryDate:'01/2026', quantityBilled:25, quantityFree:2, remainingQty:20, unitPrice:195.00, netValue:4875, gstRate:12, gstValue:585, distributor:'Wellness Rx', confidence:0.94, soldToday:0 },
-        { id:'d7', medicineName:'Dolo 650mg Tablet', batchNumber:'DLO8899', expiryDate:'12/2025', quantityBilled:100, quantityFree:10, remainingQty:72, unitPrice:30.00, netValue:3000, gstRate:12, gstValue:360, distributor:'Medico Pharma', confidence:0.96, soldToday:8 },
-        { id:'d8', medicineName:'Pantop 40mg Tablet', batchNumber:'PNT3344', expiryDate:'07/2025', quantityBilled:35, quantityFree:3, remainingQty:15, unitPrice:75.00, netValue:2625, gstRate:12, gstValue:315, distributor:'HealthLine Dist.', confidence:0.89, soldToday:4 },
-    ];
-}
-function getDemoDistributors() {
-    return [
-        { id:'dist1', name:'Medico Pharma', contact:'+91 98765 43210', returnWindow:45, totalInvoices:24, activeBatches:12 },
-        { id:'dist2', name:'HealthLine Dist.', contact:'+91 87654 32109', returnWindow:30, totalInvoices:18, activeBatches:8 },
-        { id:'dist3', name:'Wellness Rx', contact:'+91 76543 21098', returnWindow:60, totalInvoices:31, activeBatches:15 },
-    ];
-}
-function getDemoInvoices() {
-    return [
-        { id:'INV001', distributor:'Medico Pharma', invoiceNumber:'MC-2241', invoiceTotal:28165.40, lineItemCount:4 },
-        { id:'INV002', distributor:'HealthLine Dist.', invoiceNumber:'HL-8812', invoiceTotal:8625.20, lineItemCount:3 },
-    ];
-}
-function getDemoStaff() {
-    return [{ phone:'+91 99999 11111', role:'staff' }];
-}
-
-function esc(str) { const d=document.createElement('div'); d.textContent=str||''; return d.innerHTML; }

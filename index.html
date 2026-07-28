@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>RxExpiry - Pharmacy Expiry Tracker & Verification</title>
     <meta name="description" content="Multi-tenant pharmacy expiry tracking with OCR invoice capture, client-side blur checks, and post-extraction validation pipeline.">
+    <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <script>
         tailwind.config = {
@@ -12,15 +13,21 @@
             theme: {
                 extend: {
                     colors: {
-                        base: { dark: '#0f172a', light: '#f8fafc' },
-                        surface: { dark: '#1e293b', light: '#ffffff' },
+                        base: {
+                            dark: '#0f172a',
+                            light: '#f8fafc',
+                        },
+                        surface: {
+                            dark: '#1e293b',
+                            light: '#ffffff',
+                        },
                         brand: {
-                            primary: '#6366f1',
-                            success: '#10b981',
-                            warning: '#f59e0b',
-                            danger: '#ef4444',
-                            violet: '#8b5cf6',
-                            sky: '#0ea5e9'
+                            primary: '#6366f1', // Indigo
+                            success: '#10b981', // Green
+                            warning: '#f59e0b', // Amber
+                            danger: '#ef4444', // Red
+                            violet: '#8b5cf6', // Violet (GSD)
+                            sky: '#0ea5e9', // Sky (Ralph)
                         }
                     },
                     fontFamily: {
@@ -31,19 +38,17 @@
             }
         }
     </script>
+    <!-- Google Fonts -->
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="style.css">
     <!-- Tesseract.js for client-side OCR -->
     <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
-    <!-- PDF.js for client-side PDF splitting (renders pages to canvas) -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168/pdf.min.js"></script>
-    <script>if (typeof pdfjsLib !== 'undefined') pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168/pdf.worker.min.js';</script>
-    <!-- JSZip for client-side ZIP extraction -->
-    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-    <!-- jsPDF for PDF viewing fallback -->
-    <script type="module" src="script.js"></script>
+    <!-- PDF.js for client-side PDF rendering -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js"></script>
+    <!-- Firebase SDK (v10 modular via CDN) -->
+    <script type="module" src="script.js?v=1.0.5"></script>
 </head>
 <body class="h-full bg-slate-950 text-slate-100 font-body transition-colors duration-300 selection:bg-indigo-500/30">
     <!-- Glow Background Effects -->
@@ -53,6 +58,7 @@
         <div class="absolute bottom-[-10%] right-[-10%] w-[50vw] h-[50vw] rounded-full bg-rose-500/5 blur-[90px]"></div>
     </div>
 
+    <!-- Main Container (flex layout for mobile screens) -->
     <div class="relative z-10 flex flex-col h-full max-w-md mx-auto bg-slate-900 border-x border-slate-800 shadow-2xl overflow-hidden">
         
         <!-- =================== 1. AUTH SCREEN =================== -->
@@ -71,6 +77,7 @@
                     <h2 class="text-xl font-heading font-bold text-center text-slate-100">Staff Counter Login</h2>
                     <p class="text-xs text-slate-400 text-center">Multi-tenant Pharmacy Management Interface</p>
                     
+                    <!-- Pharmacy Selector / Input -->
                     <div class="space-y-1">
                         <label for="auth-pharmacy-id" class="text-xs font-semibold text-slate-400">Pharmacy ID</label>
                         <select id="auth-pharmacy-id" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2.5 text-sm text-slate-200 focus:outline-none focus:border-indigo-500">
@@ -81,15 +88,18 @@
                         </select>
                     </div>
 
+                    <!-- New Pharmacy Form (Hidden by default) -->
                     <div id="new-pharmacy-form" class="space-y-2 hidden">
                         <input type="text" id="new-pharmacy-name" placeholder="Pharmacy Name" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-indigo-500">
                     </div>
 
+                    <!-- Role Switcher -->
                     <div class="grid grid-cols-2 gap-2 bg-slate-900/60 p-1 rounded-lg border border-slate-800">
                         <button type="button" id="role-owner" class="role-btn px-3 py-1.5 rounded-md text-xs font-semibold text-center transition-all bg-indigo-600 text-white shadow-sm" data-role="owner">Owner</button>
                         <button type="button" id="role-staff" class="role-btn px-3 py-1.5 rounded-md text-xs font-semibold text-slate-400 text-center transition-all" data-role="staff">Staff</button>
                     </div>
 
+                    <!-- Mobile Number Input -->
                     <div class="space-y-1">
                         <label for="auth-phone" class="text-xs font-semibold text-slate-400">Phone Number</label>
                         <div class="relative">
@@ -98,6 +108,7 @@
                         </div>
                     </div>
 
+                    <!-- OTP Code Input (Hidden initially) -->
                     <div id="otp-container" class="space-y-1 hidden">
                         <div class="flex justify-between items-center">
                             <label for="auth-otp" class="text-xs font-semibold text-slate-400">Enter OTP Code</label>
@@ -105,14 +116,17 @@
                         <input type="text" id="auth-otp" maxlength="6" placeholder="******" class="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2.5 text-center text-lg font-bold tracking-[0.5em] text-indigo-400 focus:outline-none focus:border-indigo-500">
                     </div>
 
+                    <!-- Recaptcha Container (For Firebase Phone Auth) -->
                     <div id="recaptcha-container" class="hidden"></div>
 
+                    <!-- Submit Button -->
                     <button id="auth-submit-btn" class="w-full py-3 px-4 bg-gradient-to-r from-indigo-600 to-violet-600 text-white text-sm font-semibold rounded-lg shadow-lg hover:shadow-indigo-600/20 active:scale-[0.98] transition-all">
                         Send OTP
                     </button>
                 </div>
             </div>
             
+            <!-- App Version -->
             <div class="text-center space-y-1.5 pb-2">
                 <span class="inline-flex items-center gap-1.5 px-2 py-1 rounded bg-slate-800 border border-slate-700 text-[10px] text-slate-400">
                     RxExpiry v1.0
@@ -137,11 +151,13 @@
                     </div>
                 </div>
                 <div class="flex items-center gap-3">
+                    <!-- Light / Dark toggle -->
                     <button id="theme-toggle" class="p-1.5 rounded-lg border border-slate-800 bg-slate-900 text-slate-400 hover:text-slate-200">
                         <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v1m0 16v1m9-9h-1M4 12H3m15.364-6.364l-.707.707M6.343 17.657l-.707.707m12.728 0l-.707-.707M6.343 6.343l-.707-.707M14.5 12a2.5 2.5 0 11-5 0 2.5 2.5 0 015 0z" />
                         </svg>
                     </button>
+                    <!-- Log out -->
                     <button id="auth-logout-btn" class="text-[10px] bg-slate-800 text-slate-400 border border-slate-700/50 px-2 py-1 rounded-md font-semibold hover:bg-slate-700">Logout</button>
                 </div>
             </header>
@@ -149,7 +165,7 @@
             <!-- Scrollable Viewport -->
             <main class="flex-1 overflow-y-auto z-0 pb-20">
                 
-                <!-- Toast Alert -->
+                <!-- Toast Alert Component -->
                 <div id="toast" class="fixed top-16 left-1/2 -translate-x-1/2 bg-slate-950 border border-slate-800 px-4 py-2 rounded-full text-xs shadow-xl text-indigo-400 font-bold z-50 flex items-center gap-2 transform translate-y-[-100px] opacity-0 transition-all duration-300">
                     <span id="toast-icon" class="w-2 h-2 rounded-full bg-indigo-500"></span>
                     <span id="toast-text">Toast message</span>
@@ -167,6 +183,7 @@
                                 <p class="text-[10px] text-slate-400">Instantly catalog medicine expiry & batch details</p>
                             </div>
                             
+                            <!-- Large Scan Button -->
                             <button id="btn-camera-scan" class="w-full py-4 bg-indigo-600 text-white rounded-xl font-bold flex flex-col items-center justify-center gap-1.5 shadow-lg shadow-indigo-600/30 hover:bg-indigo-500 active:scale-[0.98] transition-all">
                                 <svg class="w-7 h-7 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
@@ -175,33 +192,27 @@
                                 <span class="text-xs uppercase tracking-widest font-heading font-semibold">Camera Capture Scan</span>
                             </button>
 
-                            <div class="grid grid-cols-3 gap-2">
-                                <label class="flex items-center justify-center gap-2 py-2 px-3 bg-slate-800/80 border border-slate-700/60 rounded-lg text-[10px] font-semibold text-slate-300 hover:bg-slate-800 cursor-pointer active:scale-95 transition-all">
+                            <!-- Gallery & PDF Uploads -->
+                            <div class="grid grid-cols-2 gap-2">
+                                <label class="flex items-center justify-center gap-2 py-2 px-3 bg-slate-800/80 border border-slate-700/60 rounded-lg text-xs font-semibold text-slate-300 hover:bg-slate-800 cursor-pointer active:scale-95 transition-all">
                                     <svg class="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
                                     </svg>
-                                    Gallery
+                                    Gallery Photos
                                     <input type="file" id="upload-gallery" accept="image/*" multiple class="hidden">
                                 </label>
-                                <label class="flex items-center justify-center gap-2 py-2 px-3 bg-slate-800/80 border border-slate-700/60 rounded-lg text-[10px] font-semibold text-slate-300 hover:bg-slate-800 cursor-pointer active:scale-95 transition-all">
+                                <label class="flex items-center justify-center gap-2 py-2 px-3 bg-slate-800/80 border border-slate-700/60 rounded-lg text-xs font-semibold text-slate-300 hover:bg-slate-800 cursor-pointer active:scale-95 transition-all">
                                     <svg class="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                                     </svg>
-                                    PDFs
-                                    <input type="file" id="upload-pdf" accept="application/pdf" multiple class="hidden">
-                                </label>
-                                <label class="flex items-center justify-center gap-2 py-2 px-3 bg-slate-800/80 border border-slate-700/60 rounded-lg text-[10px] font-semibold text-slate-300 hover:bg-slate-800 cursor-pointer active:scale-95 transition-all">
-                                    <svg class="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 8h14M5 8a2 2 0 110-4h14a2 2 0 110 4M5 8v10a2 2 0 002 2h10a2 2 0 002-2V8m-9 4h4" />
-                                    </svg>
-                                    ZIP
-                                    <input type="file" id="upload-zip" accept=".zip,application/zip" class="hidden">
+                                    Invoice PDFs
+                                    <input type="file" id="upload-pdf" accept="application/pdf" class="hidden">
                                 </label>
                             </div>
                         </div>
                     </div>
 
-                    <!-- Client-Side Scan Precheck -->
+                    <!-- Client-Side Scan Precheck Overlay/Feedback -->
                     <div id="precheck-feedback-panel" class="hidden bg-slate-900 border-2 border-brand-warning/30 rounded-2xl p-4 space-y-3">
                         <div class="flex justify-between items-center">
                             <span class="text-xs font-bold uppercase tracking-wider text-brand-warning flex items-center gap-1.5">
@@ -211,6 +222,7 @@
                             <button id="btn-cancel-scan" class="text-[10px] text-slate-400 hover:text-slate-200">Dismiss</button>
                         </div>
                         <div class="space-y-2">
+                            <!-- Blur status -->
                             <div class="flex items-center justify-between text-xs">
                                 <span class="text-slate-400">Image Blur Variance:</span>
                                 <span id="precheck-blur-val" class="font-mono font-bold text-slate-200">Calculating...</span>
@@ -218,6 +230,7 @@
                             <div class="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
                                 <div id="precheck-blur-bar" class="bg-indigo-500 h-full transition-all duration-300" style="width: 0%"></div>
                             </div>
+                            <!-- Exposure status -->
                             <div class="flex items-center justify-between text-xs">
                                 <span class="text-slate-400">Exposure (Luminance):</span>
                                 <span id="precheck-exposure-val" class="font-mono font-bold text-slate-200">Calculating...</span>
@@ -229,25 +242,10 @@
                         <div id="precheck-status-msg" class="text-xs font-semibold py-1.5 px-3 rounded text-center"></div>
                     </div>
 
-                    <!-- Batch Extraction Progress -->
-                    <div id="batch-progress-panel" class="hidden bg-slate-900 border border-indigo-500/30 rounded-2xl p-4 space-y-3">
-                        <div class="flex justify-between items-center">
-                            <span class="text-xs font-bold uppercase tracking-wider text-indigo-400 flex items-center gap-1.5">
-                                <span id="batch-progress-dot" class="w-2 h-2 rounded-full bg-indigo-500 animate-ping"></span>
-                                <span id="batch-progress-label">Batch Extraction</span>
-                            </span>
-                            <span id="batch-progress-count" class="text-[10px] text-slate-400 font-mono font-bold">0/0</span>
-                        </div>
-                        <div class="w-full bg-slate-800 rounded-full h-2 overflow-hidden">
-                            <div id="batch-progress-bar" class="bg-indigo-500 h-full transition-all duration-500" style="width: 0%"></div>
-                        </div>
-                        <div id="batch-progress-status" class="text-[10px] text-slate-400 text-center font-semibold">Preparing...</div>
-                        <div id="batch-progress-detail" class="hidden text-[9px] text-slate-500 text-center"></div>
-                    </div>
-
-                    <!-- Live Camera Feed -->
+                    <!-- Live Camera Feed (Hidden by default, triggered on Camera Scan click) -->
                     <div id="camera-feed-container" class="hidden bg-black rounded-2xl relative overflow-hidden aspect-[4/3] border border-slate-800">
                         <video id="camera-stream" class="w-full h-full object-cover" autoplay playsinline></video>
+                        <!-- Scanner Guideline Overlay -->
                         <div class="absolute inset-4 border border-dashed border-indigo-400/50 rounded-lg pointer-events-none flex flex-col justify-between items-center p-4">
                             <span class="text-[9px] text-indigo-400/80 bg-slate-950/80 px-2 py-0.5 rounded font-mono uppercase tracking-wider">Align Invoice Flat & Center</span>
                             <div class="w-full h-0.5 bg-indigo-500/50 animate-pulse"></div>
@@ -263,106 +261,77 @@
                         </button>
                     </div>
 
-                    <!-- Post-Extraction Review Drawer -->
+                    <!-- Post-Extraction Review Drawer (Refactored to Split/Full View Modal) -->
                     <div id="extraction-review-panel" class="hidden fixed inset-0 bg-slate-950/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
                         <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-4xl h-[90vh] flex flex-col md:flex-row overflow-hidden shadow-2xl">
+                            <!-- Visual Invoice Viewer (Left/Top Pane) -->
                             <div id="review-visual-container" class="w-full md:w-1/2 h-1/2 md:h-full bg-slate-950 border-b md:border-b-0 md:border-r border-slate-800 flex flex-col relative">
                                 <div class="p-3 border-b border-slate-800 flex justify-between items-center bg-slate-900 shrink-0">
-                                    <span class="text-xs font-bold text-slate-300">Invoice Scan Reference</span>
-                                    <button id="btn-toggle-to-form" class="md:hidden px-3 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-[10px] font-bold">Switch to Form</button>
+                                    <div class="flex items-center gap-3">
+                                        <span class="text-xs font-bold text-slate-300">Invoice Scan Reference</span>
+                                        <div id="review-pagination" class="hidden flex items-center gap-1.5 text-[10px] bg-slate-950 px-2 py-0.5 rounded border border-slate-800">
+                                            <button id="btn-prev-page" class="text-slate-400 hover:text-slate-200 disabled:opacity-30 disabled:pointer-events-none">&larr;</button>
+                                            <span id="txt-page-num" class="font-mono text-slate-400">Page 1/1</span>
+                                            <button id="btn-next-page" class="text-slate-400 hover:text-slate-200 disabled:opacity-30 disabled:pointer-events-none">&rarr;</button>
+                                        </div>
+                                    </div>
+                                    <!-- Mobile toggle button (only visible on mobile) -->
+                                    <button id="btn-toggle-to-form" class="md:hidden px-3 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-[10px] font-bold">
+                                        Switch to Form
+                                    </button>
                                 </div>
+                                <!-- Image / PDF View Area -->
                                 <div class="flex-1 overflow-auto p-4 flex items-center justify-center min-h-0 bg-slate-950">
                                     <img id="review-invoice-img" class="max-w-full max-h-full object-contain rounded border border-slate-800" src="" alt="Invoice scan">
                                     <iframe id="review-invoice-pdf" class="hidden w-full h-full border-0" src=""></iframe>
                                 </div>
                             </div>
                             
+                            <!-- Editable Fields Form (Right/Bottom Pane) -->
                             <div id="review-form-container" class="w-full md:w-1/2 h-1/2 md:h-full flex flex-col overflow-hidden bg-slate-900 hidden md:flex">
                                 <div class="p-3 border-b border-slate-800 flex justify-between items-center bg-slate-900 shrink-0">
                                     <div>
                                         <h3 class="text-xs font-heading font-extrabold text-slate-100">Verify Parsed Invoice</h3>
                                         <p id="review-distributor-lbl" class="text-[9px] text-indigo-400 font-bold">Distributor: Loading...</p>
-                                        <p id="review-batch-indicator" class="text-[9px] text-slate-500 font-bold hidden"></p>
                                     </div>
                                     <div class="flex items-center gap-2">
-                                        <button id="btn-toggle-to-scan" class="md:hidden px-3 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-[10px] font-bold">Show Invoice Scan</button>
+                                        <!-- Mobile toggle button -->
+                                        <button id="btn-toggle-to-scan" class="md:hidden px-3 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-[10px] font-bold">
+                                            Show Invoice Scan
+                                        </button>
                                         <span id="review-arithmetic-badge" class="px-2 py-0.5 text-[9px] rounded font-bold uppercase tracking-wider bg-slate-800 text-slate-400">Loading Validation...</span>
                                     </div>
                                 </div>
                                 
+                                <!-- Scrollable Line Items -->
                                 <div class="flex-1 overflow-y-auto p-4 space-y-4 min-h-0">
                                     <div id="pipeline-alerts" class="space-y-1"></div>
-                                    <div id="computed-summary-panel" class="hidden bg-slate-800/40 border border-slate-700/50 rounded-xl p-3 space-y-2">
-                                        <div class="flex items-center justify-between">
-                                            <span class="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Reconciliation Summary</span>
-                                            <span id="computed-summary-badge" class="px-2 py-0.5 text-[9px] rounded font-bold uppercase tracking-wider"></span>
-                                        </div>
-                                        <div class="grid grid-cols-3 gap-2 text-[10px]">
-                                            <div>
-                                                <span class="text-slate-500">Items</span>
-                                                <span id="computed-items-count" class="block font-mono text-slate-200 font-bold">0</span>
-                                            </div>
-                                            <div>
-                                                <span class="text-slate-500">Total Qty</span>
-                                                <span id="computed-total-qty" class="block font-mono text-slate-200 font-bold">0</span>
-                                            </div>
-                                            <div>
-                                                <span class="text-slate-500">GST Computed</span>
-                                                <span id="computed-total-gst" class="block font-mono text-slate-200 font-bold">₹0.00</span>
-                                            </div>
-                                        </div>
-                                        <div class="flex justify-between items-center text-[10px] pt-1 border-t border-slate-700/50">
-                                            <span class="text-slate-500">Computed Grand Total</span>
-                                            <span id="computed-grand-total" class="font-mono font-bold text-slate-100">₹0.00</span>
-                                        </div>
-                                        <div class="flex justify-between items-center text-[10px]">
-                                            <span class="text-slate-500">Declared Grand Total</span>
-                                            <span id="computed-declared-total" class="font-mono font-bold text-indigo-400">₹0.00</span>
-                                        </div>
-                                        <div id="computed-discrepancy-row" class="hidden flex justify-between items-center text-[10px] pt-1 border-t border-slate-700/50">
-                                            <span class="text-slate-500">Discrepancy</span>
-                                            <span id="computed-discrepancy-val" class="font-mono font-bold text-emerald-400">₹0.00</span>
-                                        </div>
+                                    <div id="review-line-items" class="space-y-3">
+                                        <!-- Populated dynamically -->
                                     </div>
-                                    <div id="review-line-items" class="space-y-3"></div>
                                 </div>
                                 
+                                <!-- Totals & Save Actions -->
                                 <div class="p-4 border-t border-slate-800 bg-slate-950/60 space-y-3 shrink-0">
                                     <div class="space-y-1.5 text-xs">
                                         <div class="flex justify-between items-center text-slate-400">
-                                            <span>Invoice Taxable (Gemini):</span>
-                                            <span id="review-taxable-val" class="font-mono text-slate-500">₹0.00</span>
-                                        </div>
-                                        <div class="flex justify-between items-center text-slate-400">
-                                            <span>CGST (Gemini):</span>
-                                            <span id="review-cgst-val" class="font-mono text-slate-500">₹0.00</span>
-                                        </div>
-                                        <div class="flex justify-between items-center text-slate-400">
-                                            <span>SGST (Gemini):</span>
-                                            <span id="review-sgst-val" class="font-mono text-slate-500">₹0.00</span>
-                                        </div>
-                                        <div class="flex justify-between items-center text-slate-400 pt-1 border-t border-slate-800/50">
                                             <span>Sum of Taxable Net:</span>
                                             <span id="review-subtotal-val" class="font-mono font-bold text-slate-200">₹0.00</span>
+                                        </div>
+                                        <div id="review-cash-disc-row" class="hidden flex justify-between items-center text-amber-400">
+                                            <span>Cash Discount:</span>
+                                            <span id="review-cash-disc-val" class="font-mono font-bold">-₹0.00</span>
                                         </div>
                                         <div class="flex justify-between items-center text-slate-400">
                                             <span>Sum of Line GST:</span>
                                             <span id="review-gst-val" class="font-mono font-bold text-slate-200">₹0.00</span>
                                         </div>
-                                        <div class="flex justify-between items-center text-slate-400">
-                                            <span>Scheme Discount:</span>
-                                            <input type="number" step="0.01" id="review-scheme-discount-input" class="bg-slate-900 border border-slate-800 rounded px-2 py-0.5 w-24 text-right font-mono text-slate-300 focus:outline-none focus:border-indigo-500" oninput="window.triggerRecalculate();" value="0">
-                                        </div>
-                                        <div class="flex justify-between items-center text-slate-400">
-                                            <span>Cash Discount:</span>
-                                            <input type="number" step="0.01" id="review-cash-discount-input" class="bg-slate-900 border border-slate-800 rounded px-2 py-0.5 w-24 text-right font-mono text-slate-300 focus:outline-none focus:border-indigo-500" oninput="window.triggerRecalculate();" value="0">
-                                        </div>
-                                        <div class="flex justify-between items-center text-slate-400">
+                                        <div id="review-round-off-row" class="hidden flex justify-between items-center text-slate-400">
                                             <span>Round Off:</span>
-                                            <input type="number" step="0.01" id="review-roundoff-input" class="bg-slate-900 border border-slate-800 rounded px-2 py-0.5 w-24 text-right font-mono text-slate-300 focus:outline-none focus:border-indigo-500" oninput="window.triggerRecalculate();" value="0">
+                                            <span id="review-round-off-val" class="font-mono font-bold text-slate-200">₹0.00</span>
                                         </div>
                                         <div class="flex justify-between items-center font-bold text-slate-100 pt-1 border-t border-slate-800/80">
-                                            <span>Total Declared:</span>
+                                            <span>Grand Total (Printed):</span>
                                             <input type="number" step="0.01" id="review-declared-total-input" class="bg-slate-900 border border-slate-800 rounded px-2 py-0.5 w-24 text-right font-mono text-indigo-400 font-bold focus:outline-none focus:border-indigo-500" oninput="window.triggerRecalculate();">
                                         </div>
                                     </div>
@@ -385,6 +354,36 @@
                         </div>
                     </div>
 
+                    <!-- Grouping Triage Modal -->
+                    <div id="triage-modal" class="hidden fixed inset-0 bg-slate-950/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
+                        <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-2xl h-[80vh] flex flex-col overflow-hidden shadow-2xl">
+                            <div class="p-4 border-b border-slate-800 flex justify-between items-center bg-slate-900 shrink-0">
+                                <div>
+                                    <h3 class="text-sm font-heading font-extrabold text-slate-100">Invoice Grouping Triage</h3>
+                                    <p class="text-[10px] text-slate-400">Confirm or adjust page grouping before sending to Gemini</p>
+                                </div>
+                                <button id="btn-close-triage" class="p-1.5 rounded-lg text-slate-400 hover:text-slate-200">
+                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
+                                </button>
+                            </div>
+                            
+                            <!-- Groups Container -->
+                            <div id="triage-groups-container" class="flex-1 overflow-y-auto p-4 space-y-4 min-h-0">
+                                <!-- Populated dynamically -->
+                            </div>
+                            
+                            <!-- Footer -->
+                            <div class="p-4 border-t border-slate-800 bg-slate-950/60 flex justify-between items-center shrink-0">
+                                <span id="triage-stats-txt" class="text-xs text-slate-400 font-mono">0 files · 0 groups</span>
+                                <div class="flex gap-2">
+                                    <button id="btn-triage-add-group" class="py-2 px-3.5 bg-slate-800 text-slate-200 hover:bg-slate-700 text-xs font-bold rounded-lg transition-all">Add Invoice Group</button>
+                                    <button id="btn-triage-confirm" class="py-2 px-4 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-lg transition-all shadow-md active:scale-95">Analyze with Gemini</button>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+
+
                     <!-- Expiring Soon Header -->
                     <div class="space-y-2">
                         <div class="flex justify-between items-baseline">
@@ -395,17 +394,11 @@
                             <span id="expiring-count" class="text-[10px] text-slate-400 font-bold">0 records</span>
                         </div>
                         
+                        <!-- List Wrapper -->
                         <div id="expiring-list" class="space-y-2.5">
+                            <!-- Items populated dynamically by JS -->
                             <div class="text-center py-6 text-xs text-slate-500">No expiring items. Record an invoice to populate.</div>
                         </div>
-                    </div>
-
-                    <!-- Floating Bulk Delete Action Bar -->
-                    <div id="bulk-action-bar" class="hidden fixed bottom-20 left-1/2 -translate-x-1/2 z-40 bg-slate-800 border border-rose-500/40 rounded-2xl px-4 py-3 shadow-2xl shadow-rose-500/10 flex items-center gap-3 max-w-md w-[calc(100%-2rem)]">
-                        <span id="bulk-count-text" class="text-xs text-slate-300 font-bold"></span>
-                        <div class="flex-1"></div>
-                        <button onclick="clearSelection()" class="text-[10px] px-3 py-1.5 rounded-lg bg-slate-700 text-slate-400 font-bold hover:bg-slate-600 transition-all">Clear</button>
-                        <button id="btn-bulk-delete" onclick="bulkDeleteSelected()" class="text-[10px] px-3 py-1.5 rounded-lg bg-rose-600 text-white font-bold hover:bg-rose-500 transition-all active:scale-95">Delete Selected</button>
                     </div>
                 </div>
 
@@ -416,12 +409,17 @@
                         <p class="text-[10px] text-slate-400">Search existing inventory batches to register a sale manually</p>
                     </div>
 
+                    <!-- Autocomplete Search Form -->
                     <div class="space-y-3">
                         <div class="relative">
                             <input type="text" id="search-input" placeholder="Type medicine name (e.g. Azithral)..." class="w-full bg-slate-900 border border-slate-800 rounded-xl px-4 py-3 text-sm text-slate-200 placeholder-slate-500 focus:outline-none focus:border-indigo-500">
-                            <div id="search-autocomplete-list" class="hidden absolute top-full left-0 right-0 mt-1 bg-slate-800 border border-slate-700 rounded-xl shadow-xl z-20 overflow-hidden divide-y divide-slate-700/50"></div>
+                            <!-- Suggestion List -->
+                            <div id="search-autocomplete-list" class="hidden absolute top-full left-0 right-0 mt-1 bg-slate-800 border border-slate-700 rounded-xl shadow-xl z-20 overflow-hidden divide-y divide-slate-700/50">
+                                <!-- Populated dynamically -->
+                            </div>
                         </div>
                         
+                        <!-- Search Result Details Panel -->
                         <div id="search-result-panel" class="hidden bg-slate-800 border border-slate-700 rounded-2xl p-4 space-y-3">
                             <div class="flex justify-between items-start">
                                 <div>
@@ -448,6 +446,7 @@
                             </div>
                         </div>
 
+                        <!-- Fallback Form for New Batch (Not Found) -->
                         <div id="new-batch-fallback-form" class="hidden bg-slate-800 border border-slate-700 rounded-2xl p-4 space-y-3">
                             <div class="border-b border-slate-700 pb-2">
                                 <h4 class="font-heading font-bold text-slate-100 text-xs text-brand-warning uppercase">New Batch Registration</h4>
@@ -475,7 +474,9 @@
                                     </div>
                                     <div class="space-y-1">
                                         <label class="text-[10px] font-bold text-slate-400">Distributor</label>
-                                        <select id="manual-med-distributor" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-indigo-500"></select>
+                                        <select id="manual-med-distributor" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-slate-200 focus:outline-none focus:border-indigo-500">
+                                            <!-- Dynamically populated -->
+                                        </select>
                                     </div>
                                 </div>
                                 <button id="btn-save-manual-batch" class="w-full py-2.5 bg-gradient-to-r from-emerald-600 to-indigo-600 hover:from-emerald-500 hover:to-indigo-500 text-white font-bold rounded-lg active:scale-98 transition-all">Save Batch to Firestore</button>
@@ -491,29 +492,16 @@
                         <p class="text-[10px] text-slate-400">Returns windows configuration for active medicine batches</p>
                     </div>
 
-                    <!-- Add / Edit Distributor Form -->
-                    <div id="distributor-form" class="bg-slate-800/60 border border-slate-700/50 rounded-2xl p-4 space-y-3">
-                        <h4 id="distributor-form-title" class="font-heading font-bold text-slate-100 text-xs uppercase tracking-wider text-indigo-400">Add Distributor</h4>
-                        <input type="hidden" id="dist-edit-id" value="">
-                        <div class="space-y-2">
-                            <input type="text" id="dist-name" placeholder="Distributor Name" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500">
-                            <div class="grid grid-cols-2 gap-2">
-                                <input type="tel" id="dist-phone" placeholder="Phone (e.g. 9876543210)" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 font-mono">
-                                <input type="number" id="dist-return-days" placeholder="Return Days" min="0" class="w-full bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 font-mono">
-                            </div>
-                        </div>
-                        <div class="flex gap-2">
-                            <button id="btn-save-distributor" class="flex-1 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-lg transition-all active:scale-95">Save Distributor</button>
-                            <button id="btn-cancel-dist-edit" class="hidden px-3 py-2 bg-slate-700 hover:bg-slate-600 text-slate-300 text-xs font-bold rounded-lg transition-all">Cancel</button>
-                        </div>
+                    <!-- Distributors Listing Cards -->
+                    <div id="distributors-list" class="space-y-3">
+                        <!-- Populated dynamically by JS -->
                     </div>
-
-                    <div id="distributors-list" class="space-y-3"></div>
                 </div>
 
                 <!-- =================== 2d. VIEW: SETTINGS / HARNESS =================== -->
                 <div id="view-settings" class="view-pane hidden p-4 space-y-5">
                     
+
                     <!-- Invite Staff (Owner Only) -->
                     <div id="owner-invite-section" class="bg-slate-850 border border-slate-800 rounded-2xl p-4 space-y-3">
                         <div>
@@ -524,47 +512,22 @@
                             <input type="tel" id="invite-phone" placeholder="98765 00000" class="flex-1 bg-slate-900 border border-slate-800 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 font-mono">
                             <button id="btn-invite-staff" class="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-lg transition-all active:scale-95">Send Invite</button>
                         </div>
+                        <!-- Active Staff Subcollection View -->
                         <div class="pt-2">
                             <span class="text-[9px] font-bold text-slate-400 block mb-1">Active Scoped Tenant Staff:</span>
-                            <ul id="active-staff-list" class="space-y-1 max-h-24 overflow-y-auto divide-y divide-slate-800 text-[10px] text-slate-300 font-mono bg-slate-900/50 p-2 rounded border border-slate-800"></ul>
+                            <ul id="active-staff-list" class="space-y-1 max-h-24 overflow-y-auto divide-y divide-slate-800 text-[10px] text-slate-300 font-mono bg-slate-900/50 p-2 rounded border border-slate-800">
+                                <!-- Populated dynamically -->
+                            </ul>
                         </div>
                     </div>
 
-                    <!-- Inventory Summary -->
-                    <div class="bg-slate-800/50 border border-slate-700/50 rounded-2xl p-4 space-y-3">
-                        <h4 class="font-heading font-bold text-slate-100 text-xs uppercase tracking-wider text-emerald-400">Inventory Summary</h4>
-                        <div class="grid grid-cols-2 gap-3">
-                            <div class="bg-slate-900/60 p-3 rounded-xl text-center">
-                                <span id="stat-total-batches" class="text-2xl font-heading font-extrabold text-indigo-400">0</span>
-                                <span class="block text-[10px] text-slate-400 font-bold">Total Batches</span>
-                            </div>
-                            <div class="bg-slate-900/60 p-3 rounded-xl text-center">
-                                <span id="stat-expiring-batches" class="text-2xl font-heading font-extrabold text-amber-400">0</span>
-                                <span class="block text-[10px] text-slate-400 font-bold">Expiring Soon</span>
-                            </div>
-                            <div class="bg-slate-900/60 p-3 rounded-xl text-center">
-                                <span id="stat-total-packs" class="text-2xl font-heading font-extrabold text-emerald-400">0</span>
-                                <span class="block text-[10px] text-slate-400 font-bold">Total Packs</span>
-                            </div>
-                            <div class="bg-slate-900/60 p-3 rounded-xl text-center">
-                                <span id="stat-sold-today" class="text-2xl font-heading font-extrabold text-sky-400">0</span>
-                                <span class="block text-[10px] text-slate-400 font-bold">Sold Today</span>
-                            </div>
-                        </div>
-                    </div>
 
-                    <!-- Data Export -->
-                    <div class="bg-slate-800/50 border border-slate-700/50 rounded-2xl p-4 space-y-3">
-                        <h4 class="font-heading font-bold text-slate-100 text-xs uppercase tracking-wider text-sky-400">Data Management</h4>
-                        <div class="flex gap-2">
-                            <button id="btn-export-csv" class="flex-1 py-2.5 bg-slate-800 border border-slate-700 text-slate-300 font-bold rounded-lg text-xs hover:bg-slate-700 transition-all active:scale-[0.98]">Export CSV</button>
-                            <button id="btn-export-json" class="flex-1 py-2.5 bg-slate-800 border border-slate-700 text-slate-300 font-bold rounded-lg text-xs hover:bg-slate-700 transition-all active:scale-[0.98]">Export JSON</button>
-                        </div>
-                    </div>
+
+
                 </div>
             </main>
 
-            <!-- Bottom Navigation Bar -->
+            <!-- Bottom Navigation Bar (Thumb reach sticky) -->
             <nav class="absolute bottom-0 left-0 right-0 bg-slate-900/95 backdrop-blur-md border-t border-slate-800/80 flex items-center justify-around h-16 px-2 z-30 shrink-0">
                 <button class="nav-tab flex flex-col items-center justify-center flex-1 h-full text-indigo-500 transition-all" data-target="view-home">
                     <svg class="w-5 h-5 mb-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -589,7 +552,7 @@
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
                     </svg>
-                    <span class="text-[9px] font-bold">Admin</span>
+                    <span class="text-[9px] font-bold">Admin/Harness</span>
                 </button>
             </nav>
         </div>

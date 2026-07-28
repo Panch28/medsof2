@@ -2,16 +2,16 @@ rules_version = '2';
 service firebase.storage {
   match /b/{bucket}/o {
 
-    // ─── Temp uploads: accessible by authenticated users, auto-cleanup after 30 days ───
-    // Supports both flat (temp/{fileId}) and batch (temp/{batchId}/{fileId}) layouts
-    match /temp/{allPaths=**} {
-      allow read: if request.auth != null;
-      allow write: if request.auth != null
-                   && request.resource.size < 310 * 1024 * 1024  // 310MB limit
-                   && request.resource.contentType.matches('image/.*|application/pdf');
+    // Raw invoice uploads: only authenticated users, path must match their pharmacyId pattern
+    match /invoices/{pharmacyId}/{fileName} {
+      // Allow read/write only to authenticated users
+      // The CF (admin SDK) bypasses these rules entirely
+      allow read, write: if request.auth != null;
     }
 
-    // ─── No permanent file storage — all confirmed data goes to Firestore ───
-    // Raw files are deleted after save (step 8 in flow)
+    // Deny all other paths
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
   }
 }

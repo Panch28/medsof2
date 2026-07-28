@@ -1,188 +1,159 @@
-/* =================== RxExpiry Custom Styles =================== */
+/* Custom CSS overlaying Tailwind for RxExpiry */
 
-/* Smooth scrollbar for dark theme */
+/* Background glow animations */
+@keyframes pulseGlow {
+    0%, 100% {
+        opacity: 0.5;
+        transform: scale(1);
+    }
+    50% {
+        opacity: 0.8;
+        transform: scale(1.05);
+    }
+}
+
+/* Custom base animations */
+@keyframes scanningLine {
+    0% {
+        top: 0%;
+    }
+    50% {
+        top: 100%;
+    }
+    100% {
+        top: 0%;
+    }
+}
+
+.scanning-laser {
+    position: absolute;
+    left: 0;
+    width: 100%;
+    height: 3px;
+    background: linear-gradient(to right, transparent, rgba(99, 102, 241, 0.8), transparent);
+    animation: scanningLine 2.5s ease-in-out infinite;
+}
+
+/* Custom Scrollbar styling */
 ::-webkit-scrollbar {
-    width: 4px;
-    height: 4px;
+    width: 6px;
+    height: 6px;
 }
+
 ::-webkit-scrollbar-track {
-    background: transparent;
+    background: #0f172a;
 }
+
 ::-webkit-scrollbar-thumb {
     background: #334155;
-    border-radius: 999px;
+    border-radius: 9999px;
 }
+
 ::-webkit-scrollbar-thumb:hover {
     background: #475569;
 }
 
-/* View pane transitions */
-.view-pane {
-    animation: fadeSlideIn 0.25s ease-out;
-}
-@keyframes fadeSlideIn {
-    from { opacity: 0; transform: translateY(8px); }
-    to { opacity: 1; transform: translateY(0); }
+/* Theme support */
+.light-mode {
+    --tw-bg-opacity: 1;
+    background-color: #f8fafc !important;
+    color: #0f172a !important;
 }
 
-/* Pulse glow for danger badge */
-@keyframes dangerPulse {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
-    50% { box-shadow: 0 0 0 6px rgba(239, 68, 68, 0); }
-}
-.pulse-danger {
-    animation: dangerPulse 2s infinite;
+.light-mode #auth-screen,
+.light-mode #app-workspace {
+    background-color: #ffffff !important;
+    border-color: #e2e8f0 !important;
 }
 
-/* Loading spinner */
-.spinner {
-    width: 20px;
-    height: 20px;
-    border: 2.5px solid rgba(99, 102, 241, 0.2);
-    border-top-color: #6366f1;
-    border-radius: 50%;
-    animation: spin 0.7s linear infinite;
-}
-.spinner-white {
-    border-color: rgba(255,255,255,0.2);
-    border-top-color: #fff;
-}
-@keyframes spin {
-    to { transform: rotate(360deg); }
+.light-mode .bg-slate-900 {
+    background-color: #f1f5f9 !important;
 }
 
-/* Skeleton loading placeholder */
-.skeleton {
-    background: linear-gradient(90deg, #1e293b 25%, #334155 50%, #1e293b 75%);
-    background-size: 200% 100%;
-    animation: shimmer 1.5s infinite;
-    border-radius: 8px;
-}
-@keyframes shimmer {
-    0% { background-position: 200% 0; }
-    100% { background-position: -200% 0; }
+.light-mode .bg-slate-800,
+.light-mode .bg-slate-850 {
+    background-color: #e2e8f0 !important;
+    color: #334155 !important;
 }
 
-/* Line item row highlight for low confidence */
-.line-item-low-confidence {
-    border-left: 3px solid #f59e0b;
-    background: rgba(245, 158, 11, 0.05);
+.light-mode .text-slate-100 {
+    color: #0f172a !important;
 }
 
-/* Line item row highlight for per-line arithmetic mismatch */
-.line-item-validation-failed {
-    border-left: 3px solid #ef4444;
-    background: rgba(239, 68, 68, 0.05);
-    animation: flagPulse 2s ease-in-out 1;
-}
-@keyframes flagPulse {
-    0%, 100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
-    50% { box-shadow: 0 0 0 4px rgba(239, 68, 68, 0.15); }
+.light-mode .text-slate-200 {
+    color: #1e293b !important;
 }
 
-/* Toast animation helpers */
-.toast-enter {
-    transform: translate(-50%, 0) !important;
-    opacity: 1 !important;
-}
-.toast-exit {
-    transform: translate(-50%, -100px) !important;
-    opacity: 0 !important;
+.light-mode .text-slate-300 {
+    color: #334155 !important;
 }
 
-/* Camera feed aspect ratio fix */
-#camera-feed-container video {
-    transform: scaleX(-1);
+.light-mode .text-slate-400 {
+    color: #64748b !important;
 }
 
-/* Review panel mobile view toggle */
-.review-mobile-hidden {
-    display: none !important;
-}
-.review-mobile-visible {
-    display: flex !important;
+.light-mode .border-slate-800,
+.light-mode .border-slate-700 {
+    border-color: #cbd5e1 !important;
 }
 
-/* Input focus ring */
-input:focus, select:focus, textarea:focus {
-    box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.15);
+.light-mode input,
+.light-mode select {
+    background-color: #ffffff !important;
+    border-color: #cbd5e1 !important;
+    color: #0f172a !important;
 }
 
-/* Number input no spinners */
-input[type="number"]::-webkit-inner-spin-button,
-input[type="number"]::-webkit-outer-spin-button {
-    -webkit-appearance: none;
-    margin: 0;
-}
-input[type="number"] {
-    -moz-appearance: textfield;
+.light-mode input::placeholder {
+    color: #94a3b8 !important;
 }
 
-/* Expiry badge colors */
-.badge-expired {
-    background: rgba(239, 68, 68, 0.15);
-    color: #f87171;
-    border: 1px solid rgba(239, 68, 68, 0.3);
-}
-.badge-expiring {
-    background: rgba(245, 158, 11, 0.15);
-    color: #fbbf24;
-    border: 1px solid rgba(245, 158, 11, 0.3);
-}
-.badge-safe {
-    background: rgba(16, 185, 129, 0.15);
-    color: #34d399;
-    border: 1px solid rgba(16, 185, 129, 0.3);
+.light-mode .bg-slate-950 {
+    background-color: #f8fafc !important;
 }
 
-/* Confidence field highlight */
-.confidence-low {
-    border-color: #f59e0b !important;
-    background: rgba(245, 158, 11, 0.05);
-}
-.confidence-high {
-    border-color: #10b981 !important;
+.light-mode .bg-slate-900\/60 {
+    background-color: rgba(226, 232, 240, 0.6) !important;
 }
 
-/* Precheck progress bar glow */
-.precheck-bar-glow {
-    box-shadow: 0 0 8px rgba(99, 102, 241, 0.5);
+.light-mode .bg-gradient-to-br {
+    background: linear-gradient(135deg, #f1f5f9 0%, #cbd5e1 100%) !important;
+    border-color: #94a3b8 !important;
 }
 
-/* Autocomplete hover */
-.autocomplete-item {
-    transition: background 0.15s ease;
-}
-.autocomplete-item:hover,
-.autocomplete-item.active {
-    background: #1e293b;
+/* Custom card glow borders */
+.confidence-critical {
+    border-color: rgba(239, 68, 68, 0.4) !important;
+    box-shadow: 0 0 10px rgba(239, 68, 68, 0.1);
 }
 
-/* Distributor card */
-.distributor-card {
-    transition: transform 0.15s ease, box-shadow 0.15s ease;
-}
-.distributor-card:hover {
-    transform: translateY(-1px);
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+.confidence-warning {
+    border-color: rgba(245, 158, 11, 0.4) !important;
+    box-shadow: 0 0 10px rgba(245, 158, 11, 0.1);
 }
 
-/* Print styles */
-@media print {
-    .nav-tab, header, #btn-camera-scan, .grid-cols-2, #toast { display: none !important; }
-    main { padding-bottom: 0 !important; }
+.confidence-good {
+    border-color: rgba(16, 185, 129, 0.2) !important;
 }
 
-/* Mobile touch feedback */
-button:active, a:active {
-    transform: scale(0.97);
+/* Custom checkbox custom look */
+.checkbox-custom {
+    transition: all 0.2s ease-in-out;
 }
 
-/* Long medicine name ellipsis */
-.med-name-ellipsis {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    max-width: 180px;
-    display: inline-block;
+.checkbox-custom.checked {
+    background-color: #10b981;
+    border-color: #10b981;
+}
+
+/* Touch targets optimization for thumb reach */
+button, select, input {
+    min-height: 44px; /* iOS standard thumb tap target */
+}
+
+/* Mobile specific fixes */
+@media (max-width: 640px) {
+    body {
+        background-color: #0f172a;
+    }
 }

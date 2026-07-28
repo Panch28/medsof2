@@ -23,6 +23,7 @@ What it does:
 import os
 import sys
 import json
+import re
 import time
 import base64
 import argparse
@@ -31,147 +32,63 @@ import fitz  # PyMuPDF
 import requests
 
 # ─── Gemini Config ───────────────────────────────────────────────
-GEMINI_MODEL = "gemini-2.0-flash"
+GEMINI_MODEL = "gemini-3.5-flash-lite"
 GEMINI_API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
 
-# ─── Extraction Prompt (exact copy from Cloud Function) ──────────
-EXTRACTION_PROMPT = r"""You are an expert OCR and financial data extraction engine specialized in Indian Pharmaceutical/Medical Distributor Invoices (B2B GST Invoices).
+EXTRACTION_PROMPT = r"""Role & Objective:
+You are an advanced, high-precision OCR and invoice parsing engine specialized in Indian Pharmaceutical GST Invoices. Your task is to extract all line items, metadata, tax distributions, and financial totals from the provided invoice image/text with 100% mathematical accuracy and zero omissions. 
 
-TASK:
-1. Extract every single line item from the main product table. Do not skip any rows.
-2. Extract the summary financial totals precisely.
-3. Perform or verify the mathematical calculations to ensure financial accuracy.
-4. Return ONLY a valid JSON object (no markdown, no code fences, no explanation) with this exact structure:
+CRITICAL INSTRUCTIONS FOR LOCAL SOFTWARE INTEGRATION:
+1. EXHAUSTIVE EXTRACTION: Do not truncate or summarize tables. Extract EVERY single row present in the item table. If an item spans multiple lines, merge them correctly.
+2. STRICT MATHEMATICAL VALIDATION: 
+   - Check that Taxable Value + GST = Net Value for every row.
+   - Sum all Net Values and apply discounts, total GST, and round-offs mathematically before outputting the Grand Total. Do not guess numbers; calculate them based on the text.
+3. HANDLING MISSING DATA: If a specific column value (like RACK or HSN) is missing or blank, explicitly output null or "—" rather than shifting table cells out of alignment.
 
-{
-  "distributor_name": "string — Supplier/Distributor name from invoice header",
-  "buyer_name": "string — Buyer/Retailer pharmacy name (from 'To:', 'Sold To:', or similar; null if not visible)",
-  "invoice_no": "string — Invoice/Bill number",
-  "invoice_date": "string — Invoice date in DD/MM/YYYY or MM/YYYY format (null if not visible)",
-  "grand_total": "number — Grand Total / Amount Payable as printed on invoice",
-  "total_taxable_amount": "number — Total Taxable Amount from invoice footer (should equal sum of all line taxable_values)",
-  "cgst_total": "number — Total CGST amount from invoice footer (0 if not present)",
-  "sgst_total": "number — Total SGST amount from invoice footer (0 if not present)",
-  "scheme_discount": "number — Total scheme/trade discount from footer (0 if not present)",
-  "cash_discount": "number — Cash discount from footer (0 if not present)",
-  "round_off": "number — Round off from footer (positive or negative, 0 if not present)",
-  "pending_invoices_count": "number — Number of pending/unpaid invoices shown on invoice (0 if not visible)",
-  "pending_total_amount": "number — Total pending/unpaid balance amount (0 if not visible)",
-  "lineItems": [
-    {
-      "rack": "string — Rack/Shelf location code (null if not present)",
-      "medicineName": "string — Product/Medicine name and strength",
-      "qty_billed": "number — Quantity billed/purchased",
-      "free_scm": "number — Free quantity or scheme percentage (0 if none)",
-      "pack": "string — Packaging type e.g. 10'S, 15'S, 15ML, 60'S",
-      "batch_no": "string — Batch/Lot number",
-      "exp_date": "string — Expiry date in MM/YY or DD/MM/YYYY format",
-      "mrp": "number — Maximum Retail Price per pack",
-      "trade_price": "number — Trade Price per unit (before C.D.% discount)",
-      "cd_percent": "number — C.D.% (cash discount percentage, usually 4.00%; 0 if absent)",
-      "scm_dis_value": "number — Per-line scheme discount value in ₹ (0 if not present)",
-      "taxable_value": "number — READ the printed Taxable Value from the invoice column (do NOT compute — use the actual printed number)",
-      "gst_percent": "number — GST rate for THIS row (12, 18, 5, or 28 — read from each row individually)",
-      "net_value": "number — READ the printed Net Value / Amount from the invoice column (do NOT compute — use the actual printed number)",
-      "mfac": "string — Manufacturer code/abbreviation (e.g. CIPL, MICR, ALKE; null if not visible)",
-      "hsn_code": "string — HSN code for GST classification (null if not visible)",
-      "confidence": "number between 0 and 1 — how confident you are in this line's extraction accuracy"
-    }
-  ],
-  "captureQuality": {
-    "readable": "boolean — can you read the invoice clearly?",
-    "issues": ["array of strings — specific problems if not readable"],
-    "missingPage": "boolean — multi-page invoice with pages missing?"
-  }
-}
+OUTPUT FORMAT REQUIREMENTS:
+Structure your response into clean, programmatic sections that can be easily parsed by software (JSON-friendly markdown layout):
 
-═══ COLUMN MAPPING RULES (STRICT — CRITICAL) ═══
-The invoice table has fixed columns printed in this exact left-to-right order. You MUST anchor each value to its correct column header. DO NOT shift values left or right.
+### 1. INVOICE METADATA
+- Supplier Name: [Value]
+- Supplier Address: [Value]
+- Supplier GSTIN: [Value]
+- Supplier State Code: [Value]
+- Supplier Contact Info: [Value]
+- Customer/Buyer Name: [Value]
+- Customer/Buyer Address: [Value]
+- Customer/Buyer GSTIN: [Value]
+- Customer/Buyer PAN: [Value]
+- Relationship No: [Value]
+- Customer/Buyer Phone: [Value]
+- Invoice No: [Value]
+- Invoice Date: [Value]
+- Time: [Value]
+- Due Date: [Value]
+- Order No: [Value]
+- Sales Executive: [Value]
 
-TYPICAL COLUMN ORDER (left to right):
-[RACK] → [DESCRIPTION] → [QTY BILLED] → [FREE/SCM] → [PACK] → [BATCH] → [EXP] → [MRP] → [TRADE PRICE] → [C.D.%] → [SCM DIS] → [TAXABLE VALUE] → [GST%] → [NET VALUE]
+### 2. ITEMIZED TABLE (Strict Column Mapping)
+Extract every row into a structured table containing these exact headers:
+| RACK | DESCRIPTION | Billed Qty | Free Qty | Pack | Batch No. | Exp. Date | MRP (₹) | Trade Price (₹) | CD % | Taxable Value (₹) | GST % | Net Value (₹) | Mfr/Mkt | HSN Code |
 
-CRITICAL ANTI-SHIFT RULES:
-- If a column is EMPTY or blank for a row, put 0 (for numbers) or "" (for strings). Do NOT let subsequent column values slide into the empty slot.
-- Example: If C.D.% is blank, taxable_value is NOT placed in the C.D.% slot. taxable_value stays in its own column.
-- Example: If SCM DIS is blank, the taxable value stays in the TAXABLE VALUE column, NOT in the SCM DIS column.
-- Each value belongs to the column directly ABOVE it in the header row. Trace vertically from the header, not horizontally from the previous cell.
+### 3. TAX BREAKDOWN & FINANCIAL SUMMARY
+- Total Items: [Value]
+- Total Billed Quantity: [Value]
+- Total Taxable Sale Amount: [Value]
+- Slab-wise Tax breakdown: [Value]
+- Scheme Discount: [Value]
+- Cash Discount: [Value]
+- Total GST: [Value]
+- TCS: [Value]
+- Credit Notes: [Value]
+- Round Off: [Value]
+- GRAND TOTAL PAYABLE: [Value]
 
-FIELD-TO-COLUMN MAP:
-- rack → Rack/Shelf location code (e.g. C0194, E0387)
-- medicineName → Description / Product Name column
-- qty_billed → Qty Billed / Quantity column
-- free_scm → Free Qty / Scheme Qty / Scm% column (0 if absent)
-- pack → Pack / Pack Size column (e.g. 10'S, 15ML, 60'S)
-- batch_no → Batch No. / Lot No. column
-- exp_date → Exp. Date / Expiry Date column
-- mrp → M.R.P. column (per pack)
-- trade_price → Trade Price / T.Rate / Rate column (per unit BEFORE C.D.%)
-- cd_percent → C.D.% column (cash discount percentage, usually 4%)
-- scm_dis_value → Scm Dis Value / Scheme Discount Value column (absolute ₹, 0 if absent)
-- taxable_value → Taxable Value column (read the printed number from this column)
-- gst_percent → GST % column (read from EACH ROW individually — do NOT use a flat rate)
-- net_value → Net Value / Amount column (the final amount including GST)
-- mfac → Mfac / Manufacturer / Company code column
-- hsn_code → HSN Code column
+### 4. OUTSTANDING / LEDGER DETAILS
+- Pending Invoices: [Value]
+- Total Outstanding Balance: [Value]
 
-SELF-CHECK AFTER EXTRACTION: For each row, verify that taxable_value is a reasonable number (typically between ₹10 and ₹50,000 for a single line item). If taxable_value looks like a quantity, batch number, or discount percentage, you have placed it in the wrong column — re-examine the row.
-
-═══ FEW-SHOT EXAMPLE (how to correctly anchor columns) ═══
-Below is a sample row as it appears on a printed invoice, and the correct JSON output. Note how empty columns get 0 — values do NOT slide left.
-
-INVOICE ROW (left to right):
-| Rack   | Description      | Qty | Free | Pack | Batch    | Exp    | MRP  | Trade  | C.D.% | Scm Dis | Taxable  | GST% | Net     |
-| C0194  | ESSRYL M1 TAB   | 5   | 1    | 10'S | AB1234   | 03/27  | 185  | 172.80 | 4     | 0       | 829.44   | 12   | 929.97  |
-
-CORRECT JSON for this row:
-{
-  "rack": "C0194",
-  "medicineName": "ESSRYL M1 TAB",
-  "qty_billed": 5,
-  "free_scm": 1,
-  "pack": "10'S",
-  "batch_no": "AB1234",
-  "exp_date": "03/27",
-  "mrp": 185,
-  "trade_price": 172.80,
-  "cd_percent": 4,
-  "scm_dis_value": 0,
-  "taxable_value": 829.44,
-  "gst_percent": 12,
-  "net_value": 929.97
-}
-
-NOTICE: trade_price (172.80) is in the TRADE PRICE column. taxable_value (829.44) is in the TAXABLE VALUE column. Even though trade_price and qty_billed are close in the row, they go to DIFFERENT fields. Do NOT put 172.80 into taxable_value.
-
-═══ ARITHMETIC FORMULA (MUST be applied to EVERY row) ═══
-1. taxable_value = trade_price × qty_billed × (1 - cd_percent/100)
-2. gst_amount = taxable_value × gst_percent / 100
-3. net_value = taxable_value + gst_amount
-Use the printed values from the invoice columns as the primary source. Only apply these formulas as a fallback when a printed value is missing or unreadable. If a printed value exists but differs from the formula result, use the printed value — distributors may apply scheme adjustments or tiered discounts that change the standard formula.
-
-═══ GST BREAKDOWN (Summary Level) ═══
-CGST and SGST are split equally. If GST is 12%, CGST = 6% and SGST = 6%.
-Group taxable amounts by their GST slabs and compute exact CGST/SGST totals.
-- 12% GST slab → 6% CGST + 6% SGST
-- 18% GST slab → 9% CGST + 9% SGST
-
-═══ CROSS-VERIFICATION (MUST DO BEFORE OUTPUTTING) ═══
-Before you output the final JSON, perform these checks internally and CORRECT any mismatches:
-1. Sum all line taxable_values → this MUST match total_taxable_amount from the footer. If it doesn't, re-examine each line — you likely shifted a column.
-2. Sum all line net_values → this should be close to grand_total (within ₹10 for rounding).
-3. grand_total ≈ total_taxable_amount + cgst_total + sgst_total - scheme_discount - cash_discount + round_off
-4. If any line's taxable_value is less than ₹5 and trade_price > ₹20, you almost certainly put the trade price or quantity in the wrong column. Fix it before outputting.
-5. Report any remaining discrepancies as a note, but always use the printed value from the invoice column.
-
-═══ GENERAL RULES ═══
-- Extract EVERY line item visible, even if partially visible
-- For confidence: 1.0 = perfect, 0.9 = very clear, 0.8 = minor doubt, 0.7 = partially readable, <0.7 = uncertain
-- If a field is not visible, use null for strings and 0 for numbers
-- Read gst_percent from EACH ROW — do NOT apply a single flat GST rate to all lines
-- mfac should be the manufacturer abbreviation/code as printed (CIPL, MICR, ALKE, etc.)
-- pack should include the unit (10'S, 15'S, 15ML, 60'S, 3'S, 120'S, etc.)
-- For captureQuality.readable: false if >30% of invoice is unreadable"""
+Execute this extraction with absolute fidelity to the source document. No approximations."""
 
 
 # ─── PDF Splitting ───────────────────────────────────────────────
@@ -208,8 +125,171 @@ def split_pdf(pdf_path, dpi=200, output_dir=None):
 
 # ─── Gemini API ──────────────────────────────────────────────────
 
+def parse_markdown_invoice_py(text):
+    result = {
+        "distributor_name": "",
+        "buyer_name": None,
+        "invoice_no": "",
+        "invoice_date": None,
+        "grand_total": 0.0,
+        "total_taxable_amount": 0.0,
+        "cgst_total": 0.0,
+        "sgst_total": 0.0,
+        "scheme_discount": 0.0,
+        "cash_discount": 0.0,
+        "round_off": 0.0,
+        "pending_invoices_count": 0,
+        "pending_total_amount": 0.0,
+        "lineItems": [],
+        "captureQuality": {
+            "readable": True,
+            "issues": [],
+            "missingPage": False
+        }
+    }
+    
+    lines = text.split('\n')
+    in_table = False
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        match = re.match(r'^[-*]\s*([^:]+)\s*:\s*(.*)$', line)
+        if match:
+            key = match.group(1).strip().lower()
+            val = match.group(2).strip()
+            clean_val = "" if val in ['null', '—', 'undefined'] else val
+            
+            if 'supplier name' in key:
+                result["distributor_name"] = clean_val
+            elif 'customer/buyer name' in key or 'buyer name' in key:
+                result["buyer_name"] = clean_val if clean_val else None
+            elif 'invoice no' in key:
+                result["invoice_no"] = clean_val
+            elif 'invoice date' in key:
+                result["invoice_date"] = clean_val if clean_val else None
+            elif 'total taxable sale amount' in key:
+                try:
+                    result["total_taxable_amount"] = float(re.sub(r'[^\d.-]', '', clean_val))
+                except ValueError:
+                    result["total_taxable_amount"] = 0.0
+            elif 'scheme discount' in key:
+                try:
+                    result["scheme_discount"] = float(re.sub(r'[^\d.-]', '', clean_val))
+                except ValueError:
+                    result["scheme_discount"] = 0.0
+            elif 'cash discount' in key:
+                try:
+                    result["cash_discount"] = float(re.sub(r'[^\d.-]', '', clean_val))
+                except ValueError:
+                    result["cash_discount"] = 0.0
+            elif 'total gst' in key:
+                try:
+                    total_gst = float(re.sub(r'[^\d.-]', '', clean_val))
+                    result["cgst_total"] = round(total_gst / 2.0, 2)
+                    result["sgst_total"] = round(total_gst / 2.0, 2)
+                except ValueError:
+                    pass
+            elif 'round off' in key:
+                try:
+                    result["round_off"] = float(re.sub(r'[^\d.-]', '', clean_val))
+                except ValueError:
+                    result["round_off"] = 0.0
+            elif 'grand total payable' in key or 'grand total' in key:
+                try:
+                    result["grand_total"] = float(re.sub(r'[^\d.-]', '', clean_val))
+                except ValueError:
+                    result["grand_total"] = 0.0
+            elif 'pending invoices' in key:
+                try:
+                    result["pending_invoices_count"] = int(re.sub(r'[^\d]', '', clean_val))
+                except ValueError:
+                    result["pending_invoices_count"] = 0
+            elif 'total outstanding balance' in key:
+                try:
+                    result["pending_total_amount"] = float(re.sub(r'[^\d.-]', '', clean_val))
+                except ValueError:
+                    result["pending_total_amount"] = 0.0
+            continue
+            
+        if line.startswith('|'):
+            if 'description' in line.lower() or '---' in line:
+                in_table = True
+                continue
+            if in_table:
+                parts = [p.strip() for p in line.split('|')]
+                if parts and parts[0] == '':
+                    parts.pop(0)
+                if parts and parts[-1] == '':
+                    parts.pop()
+                
+                if len(parts) >= 13:
+                    rack = "" if parts[0] in ['—', 'null', '-'] else parts[0]
+                    description = parts[1]
+                    try:
+                        qty_billed = int(parts[2])
+                    except ValueError:
+                        qty_billed = 0
+                    try:
+                        free_scm = float(parts[3])
+                    except ValueError:
+                        free_scm = 0.0
+                    pack = "" if parts[4] in ['—', 'null', '-'] else parts[4]
+                    batch_no = parts[5]
+                    exp_date = parts[6]
+                    try:
+                        mrp = float(re.sub(r'[^\d.-]', '', parts[7]))
+                    except ValueError:
+                        mrp = 0.0
+                    try:
+                        trade_price = float(re.sub(r'[^\d.-]', '', parts[8]))
+                    except ValueError:
+                        trade_price = 0.0
+                    try:
+                        cd_percent = float(re.sub(r'[^\d.-]', '', parts[9]))
+                    except ValueError:
+                        cd_percent = 0.0
+                    try:
+                        taxable_value = float(re.sub(r'[^\d.-]', '', parts[10]))
+                    except ValueError:
+                        taxable_value = 0.0
+                    try:
+                        gst_percent = float(re.sub(r'[^\d.-]', '', parts[11]))
+                    except ValueError:
+                        gst_percent = 0.0
+                    try:
+                        net_value = float(re.sub(r'[^\d.-]', '', parts[12]))
+                    except ValueError:
+                        net_value = 0.0
+                    mfac = "" if len(parts) <= 13 or parts[13] in ['—', 'null', '-'] else parts[13]
+                    hsn_code = "" if len(parts) <= 14 or parts[14] in ['—', 'null', '-'] else parts[14]
+                    
+                    result["lineItems"].append({
+                        "rack": rack if rack else None,
+                        "medicineName": description,
+                        "qty_billed": qty_billed,
+                        "free_scm": free_scm,
+                        "pack": pack,
+                        "batch_no": batch_no,
+                        "exp_date": exp_date,
+                        "mrp": mrp,
+                        "trade_price": trade_price,
+                        "cd_percent": cd_percent,
+                        "scm_dis_value": 0.0,
+                        "taxable_value": taxable_value,
+                        "gst_percent": gst_percent,
+                        "net_value": net_value,
+                        "mfac": mfac if mfac else None,
+                        "hsn_code": hsn_code if hsn_code else None,
+                        "confidence": 0.95
+                    })
+    return result
+
+
 def call_gemini(image_path, api_key):
-    """Send a page image to Gemini and return parsed JSON."""
+    """Send a page image to Gemini and return parsed data."""
     with open(image_path, "rb") as f:
         img_data = base64.b64encode(f.read()).decode("utf-8")
 
@@ -222,8 +302,7 @@ def call_gemini(image_path, api_key):
             "temperature": 0.1,
             "topK": 1,
             "topP": 1,
-            "maxOutputTokens": 8192,
-            "responseMimeType": "application/json"
+            "maxOutputTokens": 8192
         },
         "safetySettings": [
             {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
@@ -241,7 +320,7 @@ def call_gemini(image_path, api_key):
     resp.raise_for_status()
 
     text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-    return json.loads(text)
+    return parse_markdown_invoice_py(text)
 
 
 # ─── Worker ──────────────────────────────────────────────────────

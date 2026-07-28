@@ -1,0 +1,9 @@
+{
+  "name": "rxexpiry",
+  "version": "1.0.0",
+  "description": "RxExpiry pharmacy tracking static frontend",
+  "scripts": {
+    "start": "npx -y serve ."
+  },
+  "private": true
+}

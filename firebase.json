@@ -1,8 +1,4 @@
 {
-  "firestore": {
-    "rules": "firestore.rules",
-    "indexes": "firestore.indexes.json"
-  },
   "functions": [
     {
       "source": "functions",
@@ -11,12 +7,15 @@
         "node_modules",
         ".git",
         "firebase-debug.log",
-        "firebase-debug.*.log",
-        "*.local"
-      ],
-      "predeploy": []
+        "firestore-debug.log",
+        "pubsub-debug.log"
+      ]
     }
   ],
+  "firestore": {
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  },
   "storage": {
     "rules": "storage.rules"
   },
@@ -26,18 +25,15 @@
       "firebase.json",
       "**/.*",
       "**/node_modules/**",
-      "functions/**"
+      "functions/**",
+      "users.json",
+      "check-staff.js",
+      "cors.json"
     ],
-    "rewrites": [],
-    "headers": [
+    "rewrites": [
       {
-        "source": "**/*.@(js|html)",
-        "headers": [
-          {
-            "key": "Cache-Control",
-            "value": "no-cache"
-          }
-        ]
+        "source": "**",
+        "destination": "/index.html"
       }
     ]
   }
