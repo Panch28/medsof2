@@ -747,32 +747,19 @@ function recalculate() {
   let computedTotal, match, diff;
 
   const summary = window._invoiceSummary;
-  console.log("=== RECALCULATE DEBUG ===");
-  console.log("totalNet (sum of line netValues):", totalNet);
-  console.log("totalGst (sum of line gstValues):", totalGst);
-  console.log("declaredTotal (from input):", declaredTotal);
-  console.log("invoiceSummary:", JSON.stringify(summary));
   if (summary) {
     const netTaxable = summary.saleValue || totalNet;
     const cashDisc = summary.cashDiscount || 0;
     const totalGstSummary = summary.totalGst || totalGst;
     const roundOff = summary.roundOff || 0;
-    console.log("Using invoiceSummary path:");
-    console.log("  saleValue:", netTaxable, "cashDisc:", cashDisc, "totalGst:", totalGstSummary, "roundOff:", roundOff);
     computedTotal = netTaxable - cashDisc + totalGstSummary + roundOff;
-    console.log("  computedTotal =", netTaxable, "-", cashDisc, "+", totalGstSummary, "+", roundOff, "=", computedTotal);
     diff = Math.abs(computedTotal - declaredTotal);
-    console.log("  diff:", diff, "match:", diff <= 0.5);
     match = diff <= 0.5;
   } else {
-    console.log("Using fallback (no invoiceSummary):");
     computedTotal = totalNet + totalGst;
-    console.log("  computedTotal =", totalNet, "+", totalGst, "=", computedTotal);
     diff = Math.abs(computedTotal - declaredTotal);
-    console.log("  diff:", diff, "match:", diff <= 2);
     match = diff <= 2;
   }
-  console.log("=== END RECALCULATE DEBUG ===");
 
   const badge = $("review-arithmetic-badge");
   const warning = $("arithmetic-warning-banner");
@@ -1441,10 +1428,6 @@ async function startTriageUploadAndExtraction() {
     showLoadingOverlay(true, `Extracting Invoice "${group.invoiceNo}" with Gemini AI...`);
     try {
       const result = await extractFn({ storagePaths, pharmacyId: currentPharmacyId });
-      console.log(`Gemini raw extraction result for group "${group.invoiceNo}":`, JSON.stringify(result.data, null, 2));
-      console.log(`invoiceSummary:`, JSON.stringify(result.data.invoiceSummary, null, 2));
-      console.log(`invoiceTotal:`, result.data.invoiceTotal);
-      console.log(`lineItems count:`, result.data.lineItems?.length);
       reviewQueue.push({
         storagePaths,
         objectUrls,
