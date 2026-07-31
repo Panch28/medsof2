@@ -8,6 +8,7 @@
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
 const { onSchedule } = require("firebase-functions/v2/scheduler");
 const { defineSecret } = require("firebase-functions/params");
+const { logger } = require("firebase-functions/v2");
 const { initializeApp } = require("firebase-admin/app");
 const { getStorage } = require("firebase-admin/storage");
 const { getFirestore, FieldValue } = require("firebase-admin/firestore");
@@ -97,10 +98,16 @@ Return ONLY valid JSON matching this exact schema — no markdown, no explanatio
   },
   "invoiceSummary": {
     "saleValue": number,
+    "schDisc": number,
     "cashDiscount": number,
     "totalGst": number,
     "roundOff": number,
-    "grandTotal": number
+    "cnNo": number,
+    "grandTotal": number,
+    "totalTaxable": number,
+    "totalCGST": number,
+    "totalSGST": number,
+    "totalIGST": number
   },
   "lineItems": [
     {
@@ -110,6 +117,9 @@ Return ONLY valid JSON matching this exact schema — no markdown, no explanatio
       "quantityBilled": number,
       "quantityFree": number,
       "unitPrice": number,
+      "taxableValue": number,
+      "cdPercent": number,
+      "cdValue": number,
       "netValue": number,
       "gstRate": number,
       "gstValue": number,
@@ -120,6 +130,9 @@ Return ONLY valid JSON matching this exact schema — no markdown, no explanatio
         "quantityBilled": number,
         "quantityFree": number,
         "unitPrice": number,
+        "taxableValue": number,
+        "cdPercent": number,
+        "cdValue": number,
         "netValue": number,
         "gstRate": number,
         "gstValue": number
@@ -128,23 +141,37 @@ Return ONLY valid JSON matching this exact schema — no markdown, no explanatio
   ]
 }
 
-CRITICAL CALCULATION RULES:
-1. DO NOT independently sum row-level netValues to find the final Grand Total if an invoice-level Cash Discount exists. ALWAYS use the printed summary block.
-2. Row-level netValue = Taxable Value + row gstValue. Invoice-level Cash Discount is deducted from the total taxable amount BEFORE GST — it does NOT appear in individual line items.
-3. Official summary formula: saleValue - cashDiscount + totalGst + roundOff = grandTotal. Extract these from the invoice footer — do not compute them from line items.
-4. If multiple images are provided, they represent consecutive pages of the SAME invoice. Combine all line items. The grandTotal is usually on the last page.
-
-ROW-LEVEL EXTRACTION:
-- Use these exact column mappings: RACK | DESCRIPTION (medicineName) | Billed Qty (quantityBilled) | Free Qty (quantityFree) | Pack | Batch No. (batchNumber) | Exp. Date (expiryDate) | MRP | Trade Price (unitPrice) | CD % | Taxable Value | GST % (gstRate) | Net Value (netValue) | Mfr/Mkt | HSN Code.
-- If a field is missing, output default values (0 or "") — never shift cells out of alignment.
-- quantityFree is the free/bonus column (often "Free" or "Scheme Qty") — use 0 if absent.
-
-Rules:
-- confidence values are 0.0 to 1.0 per field.
-- If the image is blurry or unreadable, set captureQuality.readable = false and list reasons in issues[].
-- gstRate is the percentage (e.g. 12 for 12%), gstValue is the rupee amount.
-- All amounts in INR as plain numbers (no ₹ symbol).
-- Return ONLY valid JSON — no markdown, no explanation.`;
+CRITICAL — COPY PRINTED VALUES, DO NOT DERIVE:
+1. PER LINE ITEM — typical column layout (order may vary by distributor):
+   MRP | Trade Price (unitPrice) | CD % (cdPercent) | C.D. VALUE (cdValue) | Taxable Value (taxableValue) | GST % (gstRate) | GST ₹ (gstValue) | Net Value (netValue).
+   Copy EACH printed value independently from the image into its own field. Do NOT compute gstValue, netValue, or cdValue from arithmetic — read them as printed.
+   - cdPercent is the printed CD % column (e.g. 4.00 means 4%).
+   - cdValue is the printed C.D. VALUE column — the RUPPEE discount amount for that line (e.g. 35.20). COPY THE PRINTED DIGITS VERBATIM. IMPORTANT: on many Vardhman-format invoices this column literally prints ₹0.00 on EVERY line — that is genuine printed data, NOT an extraction gap. Copy it as 0. Do NOT derive a per-line discount from cdPercent × amount. Only when the column actually prints real per-line values (other distributors) read them as printed.
+   - taxableValue is the printed Taxable Value column — the value AFTER any line-level discount and BEFORE GST.
+   - gstRate is the printed GST % column, read PER LINE from the image. Rates commonly VARY within a single invoice (5%, 12%, 18%, 28% — e.g. CGST 2.5% + SGST 2.5% = 5%, CGST 6% + SGST 6% = 12%, CGST 9% + SGST 9% = 18%). NEVER assume all lines share one rate and NEVER default to a flat value like 12. Read each line's actual printed GST % digits.
+   - netValue is the printed final line total (usually = taxableValue + gstValue).
+2. INVOICE SUMMARY — read the printed FOOTER summary block (below the line items) VERBATIM, field by field. This is the SINGLE source of truth for all totals:
+   - saleValue: the printed "Sale Value" / "Total Sale" / "Sum of Taxable" row (the GROSS amount BEFORE discount and GST).
+   - schDisc: the printed "Sch Disc." / "Scheme Discount" row (scheme discount, usually 0.00). DEDUCTED.
+   - cashDiscount: the printed "Cash Disc." / "Cash Discount" / "Less: C.D." row. Copy the EXACT printed amount as a POSITIVE number (e.g. "-₹271.48" or "271.48" → 271.48). It is DEDUCTED. NEVER default it to 0 — read the actual digits; use 0 only when the invoice genuinely prints no discount row.
+   - totalGst: the printed "Total GST" row (or CGST + SGST + IGST when printed separately).
+   - roundOff: the printed "Round Off" amount, preserving its sign (can be negative).
+   - cnNo: the printed "CN.NO." / "Credit Note" amount, if one is printed and nonzero. DEDUCTED. Use 0 if absent/empty.
+   - grandTotal: the printed "Grand Total" row VERBATIM — ground truth. Do NOT compute it.
+   - totalTaxable: the printed "Taxable Sale Amount" subtotal(s) for the GST slabs (e.g. 10136.87 for 6% + 683.38 for 9%).
+   - totalCGST / totalSGST / totalIGST: the printed CGST / SGST / IGST amounts (usually equal, e.g. 608.21 / 608.21).
+3. The printed Grand Total is ground truth. It should satisfy:
+   Grand Total = Sale Value − Sch Disc − Cash Disc + Total GST + Round Off − CN.NO
+4. If multiple images are provided, they represent consecutive pages of the SAME invoice. Combine all line items. The footer totals are usually on the last page.
+5. confidence values are 0.0 to 1.0 per field. If the image is blurry or unreadable, set captureQuality.readable = false and list reasons in issues[].
+6. All amounts in INR as plain numbers (no ₹ symbol). gstRate and cdPercent are percentages (e.g. 12, 4.00).
+7. Return ONLY valid JSON — no markdown, no explanation.
+8. SELF-CHECK before returning (this is mandatory):
+   a. sum of ALL line gstValue values should approximately equal the printed Total GST (totalGst) — within ₹1.
+   b. Verify the footer formula: saleValue − schDisc − cashDiscount + totalGst + roundOff − cnNo should approximately equal grandTotal (within ₹1). If it does not, you MISREAD a footer field — re-scan the footer summary block and CORRECT the specific misread field from the printed digits. Do NOT change line items to fake a match.
+   c. PER-LINE GST RATE check: for EVERY line, gstValue should be within ₹1 of (taxableValue × gstRate / 100). If a line's gstRate disagrees with its gstValue, you MISREAD the GST % column — re-scan that line and correct gstRate from the printed digits.
+   d. RATE-SLAB check: the DISTINCT gstRate values across lines must match the GST % slabs shown in the footer tax table. A footer row "CGST 9% + SGST 9%" means those lines are taxed at 18%; "CGST 2.5% + SGST 2.5%" means 5%. If your lines show ONLY ONE rate but the footer shows TWO or MORE slabs, you FLATTENED the GST % column — re-scan EVERY line and read each actual per-line rate.
+   If the footer is genuinely unreadable or off-page, set captureQuality.readable = false (or missingPage = true) and explain in issues[].`;
 
     let geminiResponse;
     try {
@@ -172,6 +199,82 @@ Rules:
     }
 
     return parsed;
+  }
+);
+
+// ─── saveInvoice ───────────────────────────────────────────────────────────────
+// Client SDK writes fail due to rules/Console mismatch; Admin SDK
+// bypasses rules entirely. This is also more secure (server-side).
+
+exports.saveInvoice = onCall(
+  {
+    region: "us-central1",
+    memory: "256MiB",
+    timeoutSeconds: 60,
+  },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Login required.");
+    }
+
+    const { pharmacyId, invoice, lineItems, confirmedBy } = request.data;
+
+    if (!pharmacyId) throw new HttpsError("invalid-argument", "pharmacyId is required");
+    if (!invoice) throw new HttpsError("invalid-argument", "invoice data is required");
+    if (!Array.isArray(lineItems) || lineItems.length === 0) {
+      throw new HttpsError("invalid-argument", "At least one line item is required");
+    }
+
+    const db = getFirestore();
+
+    try {
+      const invoiceRef = await db.collection("pharmacies").doc(pharmacyId).collection("invoices").add({
+        distributor: invoice.distributor || "",
+        invoiceNumber: invoice.invoiceNumber || "",
+        invoiceDate: invoice.invoiceDate || "",
+        invoiceTotal: invoice.invoiceTotal || 0,
+        invoiceSummary: invoice.invoiceSummary || {},
+        lineItems,
+        captureQuality: invoice.captureQuality || {},
+        confirmedBy: confirmedBy || request.auth.uid,
+        confirmedAt: FieldValue.serverTimestamp(),
+        createdAt: FieldValue.serverTimestamp(),
+      });
+
+      const batch = db.batch();
+      for (const item of lineItems) {
+        if (!item.medicineName) continue;
+        const medRef = db.collection("pharmacies").doc(pharmacyId).collection("medicines").doc();
+        batch.set(medRef, {
+          medicineName: item.medicineName,
+          batchNumber: item.batchNumber || "",
+          expiryDate: item.expiryDate || "",
+          quantityBilled: item.quantityBilled || 0,
+          quantityFree: item.quantityFree || 0,
+          unitPrice: item.unitPrice || 0,
+          cdPercent: item.cdPercent || 0,
+          taxableValue: item.taxableValue || 0,
+          cdValue: item.cdValue || 0,
+          netValue: item.netValue || 0,
+          gstRate: item.gstRate || 0,
+          gstValue: item.gstValue || 0,
+          remainingQty: (item.quantityBilled || 0) + (item.quantityFree || 0),
+          distributor: invoice.distributor || "",
+          invoiceId: invoiceRef.id,
+          pharmacyId,
+          createdAt: FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+      }
+      await batch.commit();
+
+      logger.info(`[saveInvoice] Saved invoice ${invoiceRef.id} with ${lineItems.length} items for pharmacy=${pharmacyId}`);
+
+      return { success: true, invoiceId: invoiceRef.id };
+    } catch (err) {
+      logger.error("[saveInvoice] Write failed:", err.message);
+      throw new HttpsError("internal", "Failed to save: " + err.message);
+    }
   }
 );
 

@@ -48,7 +48,7 @@
     <!-- PDF.js for client-side PDF rendering -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js"></script>
     <!-- Firebase SDK (v10 modular via CDN) -->
-    <script type="module" src="script.js?v=1.0.5"></script>
+    <script type="module" src="script.js?v=1.0.9"></script>
 </head>
 <body class="h-full bg-slate-950 text-slate-100 font-body transition-colors duration-300 selection:bg-indigo-500/30">
     <!-- Glow Background Effects -->
@@ -300,6 +300,8 @@
                                             Show Invoice Scan
                                         </button>
                                         <span id="review-arithmetic-badge" class="px-2 py-0.5 text-[9px] rounded font-bold uppercase tracking-wider bg-slate-800 text-slate-400">Loading Validation...</span>
+                                        <span id="review-gst-badge" class="hidden px-2 py-0.5 text-[9px] rounded font-bold uppercase tracking-wider bg-slate-800 text-slate-400">GST</span>
+                                        <span id="review-cd-badge" class="hidden px-2 py-0.5 text-[9px] rounded font-bold uppercase tracking-wider bg-slate-800 text-slate-400">CD</span>
                                     </div>
                                 </div>
                                 
@@ -322,9 +324,25 @@
                                             <span>Cash Discount:</span>
                                             <span id="review-cash-disc-val" class="font-mono font-bold">-₹0.00</span>
                                         </div>
+                                        <div id="review-sch-disc-row" class="hidden flex justify-between items-center text-amber-400/80">
+                                            <span>Scheme Discount:</span>
+                                            <span id="review-sch-disc-val" class="font-mono font-bold">-₹0.00</span>
+                                        </div>
+                                        <div id="review-cn-no-row" class="hidden flex justify-between items-center text-slate-500 text-[11px]">
+                                            <span>CN.NO (Credit Note):</span>
+                                            <span id="review-cn-no-val" class="font-mono">-₹0.00</span>
+                                        </div>
                                         <div class="flex justify-between items-center text-slate-400">
                                             <span>Sum of Line GST:</span>
                                             <span id="review-gst-val" class="font-mono font-bold text-slate-200">₹0.00</span>
+                                        </div>
+                                        <div id="review-printed-gst-row" class="hidden flex justify-between items-center text-slate-500 text-[11px]">
+                                            <span>Printed GST (CGST+SGST):</span>
+                                            <span id="review-printed-gst-val" class="font-mono">—</span>
+                                        </div>
+                                        <div id="review-printed-cd-row" class="hidden flex justify-between items-center text-slate-500 text-[11px]">
+                                            <span>Printed Cash Discount:</span>
+                                            <span id="review-printed-cd-val" class="font-mono">—</span>
                                         </div>
                                         <div id="review-round-off-row" class="hidden flex justify-between items-center text-slate-400">
                                             <span>Round Off:</span>
@@ -339,6 +357,7 @@
                                     <div id="review-action-container" class="space-y-2">
                                         <div id="arithmetic-warning-banner" class="hidden bg-rose-500/10 border border-rose-500/30 rounded-lg p-2 text-[10px] text-brand-danger leading-normal">
                                             <span class="font-bold">Totals don't match!</span> Please check the highlighted fields.
+                                            <div id="arithmetic-warning-detail" class="mt-1 text-amber-300"></div>
                                         </div>
                                         <div id="arithmetic-ack-container" class="hidden flex items-center gap-2 p-1 text-[10px] text-slate-400">
                                             <input type="checkbox" id="arithmetic-ack-checkbox" class="rounded border-slate-700 bg-slate-900 text-indigo-600 focus:ring-indigo-500" onchange="window.triggerRecalculate();">

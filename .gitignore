@@ -1,0 +1,6 @@
+node_modules/
+**/node_modules/
+.firebase/
+testdata/
+functions/out_ce.err
+functions/out_ce.json

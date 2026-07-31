@@ -22,25 +22,14 @@ import {
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 import {
   getFirestore,
-  doc,
-  setDoc,
   collection,
-  addDoc,
-  serverTimestamp,
-  query,
-  where,
-  orderBy,
   getDocs,
-  onSnapshot,
-  updateDoc,
-  increment,
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import {
   getStorage,
   ref,
   uploadBytes,
   deleteObject,
-  getDownloadURL,
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-storage.js";
 import {
   getFunctions,
@@ -611,17 +600,61 @@ function openReviewPanel(extracted) {
   const summary = extracted.invoiceSummary;
   window._invoiceSummary = summary || null;
   const cashDiscRow = $("review-cash-disc-row");
+  const schDiscRow = $("review-sch-disc-row");
+  const cnNoRow = $("review-cn-no-row");
   const roundOffRow = $("review-round-off-row");
+  const printedGstRow = $("review-printed-gst-row");
+  const printedCdRow = $("review-printed-cd-row");
   if (summary) {
     $("review-declared-total-input").value = (summary.grandTotal || 0).toFixed(2);
     cashDiscRow.classList.remove("hidden");
     $("review-cash-disc-val").textContent = "-₹" + (summary.cashDiscount || 0).toFixed(2);
+    if (schDiscRow) {
+      if (summary.schDisc) {
+        schDiscRow.classList.remove("hidden");
+        $("review-sch-disc-val").textContent = "-₹" + summary.schDisc.toFixed(2);
+      } else {
+        schDiscRow.classList.add("hidden");
+      }
+    }
+    if (cnNoRow) {
+      if (summary.cnNo) {
+        cnNoRow.classList.remove("hidden");
+        $("review-cn-no-val").textContent = "-₹" + summary.cnNo.toFixed(2);
+      } else {
+        cnNoRow.classList.add("hidden");
+      }
+    }
     roundOffRow.classList.remove("hidden");
     $("review-round-off-val").textContent = "₹" + (summary.roundOff || 0).toFixed(2);
+
+    const printedGst = summary.totalGst ?? ((summary.totalCGST || 0) + (summary.totalSGST || 0) + (summary.totalIGST || 0));
+    if (printedGstRow) {
+      if (printedGst) {
+        printedGstRow.classList.remove("hidden");
+        let lbl = `₹${printedGst.toFixed(2)}`;
+        if (summary.totalCGST || summary.totalSGST || summary.totalIGST) {
+          lbl += ` (CGST ₹${(summary.totalCGST || 0).toFixed(2)} + SGST ₹${(summary.totalSGST || 0).toFixed(2)}${summary.totalIGST ? ` + IGST ₹${summary.totalIGST.toFixed(2)}` : ""})`;
+        }
+        $("review-printed-gst-val").textContent = lbl;
+      } else {
+        printedGstRow.classList.add("hidden");
+      }
+    }
+    if (printedCdRow) {
+      if (summary.cashDiscount) {
+        printedCdRow.classList.remove("hidden");
+        $("review-printed-cd-val").textContent = "-₹" + summary.cashDiscount.toFixed(2);
+      } else {
+        printedCdRow.classList.add("hidden");
+      }
+    }
   } else {
     $("review-declared-total-input").value = (extracted.invoiceTotal || 0).toFixed(2);
     cashDiscRow.classList.add("hidden");
     roundOffRow.classList.add("hidden");
+    if (printedGstRow) printedGstRow.classList.add("hidden");
+    if (printedCdRow) printedCdRow.classList.add("hidden");
   }
 
   // Pipeline alerts (missing page warning etc.)
@@ -676,9 +709,12 @@ function renderLineItems(lineItems) {
       { key: "quantityBilled", label: "Qty Billed", type: "number", value: item.quantityBilled },
       { key: "quantityFree", label: "Qty Free", type: "number", value: item.quantityFree },
       { key: "unitPrice", label: "Unit Price ₹", type: "number", value: item.unitPrice },
-      { key: "netValue", label: "Net Value ₹", type: "number", value: item.netValue },
+      { key: "cdPercent", label: "CD %", type: "number", value: item.cdPercent },
+      { key: "taxableValue", label: "Taxable ₹", type: "number", value: item.taxableValue },
+      { key: "cdValue", label: "CD ₹", type: "number", value: item.cdValue },
       { key: "gstRate", label: "GST %", type: "number", value: item.gstRate },
       { key: "gstValue", label: "GST ₹", type: "number", value: item.gstValue },
+      { key: "netValue", label: "Net Value ₹", type: "number", value: item.netValue },
     ];
 
     const card = document.createElement("div");
@@ -732,6 +768,8 @@ function avgConfidence(conf) {
 function recalculate() {
   let totalNet = 0;
   let totalGst = 0;
+  let totalCd = 0;
+  let totalTaxable = 0;
 
   document.querySelectorAll("#review-line-items [data-field='netValue']").forEach((el) => {
     totalNet += parseFloat(el.value) || 0;
@@ -739,44 +777,95 @@ function recalculate() {
   document.querySelectorAll("#review-line-items [data-field='gstValue']").forEach((el) => {
     totalGst += parseFloat(el.value) || 0;
   });
+  document.querySelectorAll("#review-line-items [data-field='cdValue']").forEach((el) => {
+    totalCd += parseFloat(el.value) || 0;
+  });
+  document.querySelectorAll("#review-line-items [data-field='taxableValue']").forEach((el) => {
+    totalTaxable += parseFloat(el.value) || 0;
+  });
 
   $("review-subtotal-val").textContent = "₹" + totalNet.toFixed(2);
   $("review-gst-val").textContent = "₹" + totalGst.toFixed(2);
 
   const declaredTotal = parseFloat($("review-declared-total-input").value) || 0;
-  let computedTotal, match, diff;
+  let computedTotal, diff, match;
 
   const summary = window._invoiceSummary;
-  if (summary) {
-    const netTaxable = summary.saleValue || totalNet;
-    const cashDisc = summary.cashDiscount || 0;
-    const totalGstSummary = summary.totalGst || totalGst;
-    const roundOff = summary.roundOff || 0;
-    computedTotal = netTaxable - cashDisc + totalGstSummary + roundOff;
+
+  // 1) GRAND TOTAL check — printed footer formula:
+  //    Grand Total = Sale Value − Sch Disc − Cash Disc + Total GST + Round Off − CN.NO
+  if (summary && summary.saleValue) {
+    const sVal = summary.saleValue || 0;
+    const sch = summary.schDisc || 0;
+    const cash = summary.cashDiscount || 0;
+    const gstSum = summary.totalGst || totalGst;
+    const ro = summary.roundOff || 0;
+    const cn = summary.cnNo || 0;
+    computedTotal = sVal - sch - cash + gstSum + ro - cn;
     diff = Math.abs(computedTotal - declaredTotal);
-    match = diff <= 0.5;
+    match = diff <= 2;
+  } else if (summary) {
+    computedTotal = totalNet + totalGst;
+    diff = Math.abs(computedTotal - declaredTotal);
+    match = diff <= 2;
   } else {
     computedTotal = totalNet + totalGst;
     diff = Math.abs(computedTotal - declaredTotal);
     match = diff <= 2;
   }
 
+  // 2) Independent GST cross-check vs printed footer totals
+  const printedGst = summary && (summary.totalGst ?? ((summary.totalCGST || 0) + (summary.totalSGST || 0) + (summary.totalIGST || 0)));
+  let gstMatch = true, gstDiff = 0;
+  if (printedGst) {
+    gstDiff = Math.abs(totalGst - printedGst);
+    gstMatch = gstDiff <= 1;
+  }
+
+  const overallMatch = match && gstMatch;
+
   const badge = $("review-arithmetic-badge");
+  const gstBadge = $("review-gst-badge");
   const warning = $("arithmetic-warning-banner");
+  const warningDetail = $("arithmetic-warning-detail");
   const ackContainer = $("arithmetic-ack-container");
   const approveBtn = $("btn-review-approve");
 
-  if (match) {
-    badge.textContent = "✓ Totals Match";
-    badge.className = "px-2 py-0.5 text-[9px] rounded font-bold uppercase tracking-wider bg-emerald-500/15 text-emerald-400 border border-emerald-500/30";
+  styleBadge(badge, match, "✓ Totals Match", `⚠ Total ₹${diff.toFixed(2)}`);
+  if (gstBadge) {
+    if (!printedGst) {
+      gstBadge.classList.add("hidden");
+    } else {
+      gstBadge.classList.remove("hidden");
+      styleBadge(gstBadge, gstMatch, "✓ GST Matches", `⚠ GST ₹${gstDiff.toFixed(2)}`);
+    }
+  }
+
+  if (overallMatch) {
     warning.classList.add("hidden");
     ackContainer.classList.add("hidden");
     approveBtn.disabled = false;
     approveBtn.className = "py-2.5 bg-indigo-600 text-white font-bold rounded-lg text-xs hover:bg-indigo-500 transition-all active:scale-[0.98]";
   } else {
-    badge.textContent = `⚠ Mismatch ₹${diff.toFixed(2)}`;
-    badge.className = "px-2 py-0.5 text-[9px] rounded font-bold uppercase tracking-wider bg-rose-500/15 text-rose-400 border border-rose-500/30";
     warning.classList.remove("hidden");
+    if (warningDetail) {
+      const fails = [];
+      if (!match) fails.push(`Grand total mismatch ₹${diff.toFixed(2)}`);
+      if (printedGst && !gstMatch) fails.push(`GST: sum ₹${totalGst.toFixed(2)} ≠ printed ₹${printedGst.toFixed(2)}`);
+
+      if (!match && summary && !(summary.cashDiscount || summary.schDisc || 0) && !totalCd) {
+        const netTaxable = summary.saleValue || totalNet;
+        const roundOff = summary.roundOff || 0;
+        const implied = netTaxable + (summary.totalGst || totalGst) + roundOff - declaredTotal;
+        const impliedNet = netTaxable + roundOff - declaredTotal;
+        const impliedDisc = Math.abs(implied) < Math.abs(impliedNet) ? implied : impliedNet;
+        if (impliedDisc > 0.01) {
+          fails.push(`Discount of ~₹${impliedDisc.toFixed(2)} appears missing (Gemini read ₹0.00)`);
+        }
+      }
+
+      warningDetail.textContent = fails.join(" · ");
+    }
     ackContainer.classList.remove("hidden");
     const ackCheckbox = $("arithmetic-ack-checkbox");
     approveBtn.disabled = !ackCheckbox.checked;
@@ -785,6 +874,16 @@ function recalculate() {
     } else {
       approveBtn.className = "py-2.5 bg-slate-700 text-slate-500 font-bold rounded-lg text-xs cursor-not-allowed";
     }
+  }
+}
+
+function styleBadge(el, ok, okText, failText) {
+  if (ok) {
+    el.textContent = okText;
+    el.className = "px-2 py-0.5 text-[9px] rounded font-bold uppercase tracking-wider bg-emerald-500/15 text-emerald-400 border border-emerald-500/30";
+  } else {
+    el.textContent = failText;
+    el.className = "px-2 py-0.5 text-[9px] rounded font-bold uppercase tracking-wider bg-rose-500/15 text-rose-400 border border-rose-500/30";
   }
 }
 
@@ -811,9 +910,12 @@ async function confirmAndSave(originalExtracted) {
       quantityBilled: parseFloat(get("quantityBilled")) || 0,
       quantityFree: parseFloat(get("quantityFree")) || 0,
       unitPrice: parseFloat(get("unitPrice")) || 0,
-      netValue: parseFloat(get("netValue")) || 0,
+      cdPercent: parseFloat(get("cdPercent")) || 0,
+      taxableValue: parseFloat(get("taxableValue")) || 0,
+      cdValue: parseFloat(get("cdValue")) || 0,
       gstRate: parseFloat(get("gstRate")) || 0,
       gstValue: parseFloat(get("gstValue")) || 0,
+      netValue: parseFloat(get("netValue")) || 0,
     });
   });
 
@@ -822,51 +924,22 @@ async function confirmAndSave(originalExtracted) {
   showLoadingOverlay(true, "Saving to Firestore...");
 
   try {
-    // 1. Write invoice document
-    const invoiceRef = await addDoc(
-      collection(db, "pharmacies", currentPharmacyId, "invoices"),
-      {
+    const saveFn = httpsCallable(functions, "saveInvoice");
+    await saveFn({
+      pharmacyId: currentPharmacyId,
+      invoice: {
         distributor: originalExtracted.distributor || "",
         invoiceNumber: originalExtracted.invoiceNumber || "",
         invoiceDate: originalExtracted.invoiceDate || "",
         invoiceTotal,
-        lineItems,
+        invoiceSummary: originalExtracted.invoiceSummary || {},
         captureQuality: originalExtracted.captureQuality || {},
-        confirmedBy: currentUser.uid,
-        confirmedAt: serverTimestamp(),
-        createdAt: serverTimestamp(),
-      }
-    );
+      },
+      lineItems,
+      confirmedBy: currentUser.uid,
+    });
 
-    // 2. Write/update medicine records
-    for (const item of lineItems) {
-      if (!item.medicineName) continue;
-      // Use composite key as medicineId
-      const medicineId = slugify(`${item.medicineName}_${item.batchNumber}_${item.expiryDate}`);
-      await setDoc(
-        doc(db, "pharmacies", currentPharmacyId, "medicines", medicineId),
-        {
-          medicineName: item.medicineName,
-          batchNumber: item.batchNumber,
-          expiryDate: item.expiryDate,
-          quantityBilled: item.quantityBilled,
-          quantityFree: item.quantityFree,
-          unitPrice: item.unitPrice,
-          netValue: item.netValue,
-          gstRate: item.gstRate,
-          gstValue: item.gstValue,
-          distributor: originalExtracted.distributor || "",
-          invoiceId: invoiceRef.id,
-          pharmacyId: currentPharmacyId,
-          remainingQty: item.quantityBilled + item.quantityFree,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        },
-        { merge: true }
-      );
-    }
-
-    // 3. Delete raw files from Storage
+    // Delete raw files from Storage
     if (reviewSession.storagePaths && reviewSession.storagePaths.length > 0) {
       for (const p of reviewSession.storagePaths) {
         try {
@@ -889,14 +962,6 @@ async function confirmAndSave(originalExtracted) {
     showLoadingOverlay(false);
     showToast("Save failed: " + err.message, "error");
   }
-}
-
-function slugify(str) {
-  return str
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "_")
-    .replace(/^_|_$/g, "")
-    .substring(0, 100);
 }
 
 function revokeReviewSession() {
