@@ -124,16 +124,66 @@ const imageParts = files.map((f) => {
 const genAI = new GoogleGenerativeAI(apiKey);
 const model = genAI.getGenerativeModel({ model: "gemini-3.5-flash-lite" });
 
+function stripMarkdown(text) {
+  return text
+    .replace(/^```json\s*/i, "")
+    .replace(/^```\s*/i, "")
+    .replace(/```\s*$/i, "")
+    .trim();
+}
+
+function checkGstConsistency(parsed) {
+  const issues = [];
+  const lines = Array.isArray(parsed.lineItems) ? parsed.lineItems : [];
+  const summary = parsed.invoiceSummary || {};
+
+  const printedGst = summary.totalGst ?? ((summary.totalCGST || 0) + (summary.totalSGST || 0) + (summary.totalIGST || 0));
+  const lineGstSum = lines.reduce((s, l) => s + (Number(l.gstValue) || 0), 0);
+
+  if (printedGst && Math.abs(lineGstSum - printedGst) > 1) {
+    issues.push(`line GST sum Rs.${lineGstSum.toFixed(2)} != printed Total GST Rs.${printedGst.toFixed(2)}`);
+  }
+
+  for (const l of lines) {
+    const taxable = Number(l.taxableValue) || 0;
+    const rate = Number(l.gstRate) || 0;
+    const gv = Number(l.gstValue) || 0;
+    if (taxable > 0 && rate > 0) {
+      const expected = (taxable * rate) / 100;
+      if (Math.abs(gv - expected) > 1) {
+        issues.push(`"${l.medicineName || "?"}": gstValue Rs.${gv.toFixed(2)} != taxable Rs.${taxable.toFixed(2)} x ${rate}% = Rs.${expected.toFixed(2)} (gstRate or gstValue misread)`);
+      }
+    }
+  }
+  return issues;
+}
+
 (async () => {
   try {
-    const result = await model.generateContent([PROMPT, ...imageParts]);
-    const text = result.response.text();
-    const cleaned = text
-      .replace(/^```json\s*/i, "")
-      .replace(/^```\s*/i, "")
-      .replace(/```\s*$/i, "")
-      .trim();
-    const parsed = JSON.parse(cleaned);
+    let text;
+    let parsed;
+    let result = await model.generateContent([PROMPT, ...imageParts]);
+    text = result.response.text();
+    parsed = JSON.parse(stripMarkdown(text));
+
+    let gstIssues = [];
+    for (let attempt = 0; attempt <= 2; attempt++) {
+      gstIssues = checkGstConsistency(parsed);
+      if (gstIssues.length === 0) break;
+
+      console.warn(`[GST check failed - attempt ${attempt + 1}]`);
+      gstIssues.forEach((i) => console.warn("  - " + i));
+
+      const correction = `You previously returned this JSON for the invoice images:\n\n${JSON.stringify(parsed)}\n\nThe following GST checks FAILED against the printed figures:\n- ${gstIssues.join("\n- ")}\n\nThe printed per-line GST % column and the printed footer GST totals are GROUND TRUTH. Correct ONLY the gstRate / gstValue fields and the footer totalGst / totalCGST / totalSGST / totalIGST if misread, so that:\n1. sum of ALL line gstValue == printed Total GST (within Rs.1)\n2. for EVERY line: gstValue == taxableValue x gstRate / 100 (within Rs.1)\n3. the distinct gstRate values match the GST % slabs in the footer tax table.\nRe-read the ACTUAL printed digits of every line's GST % column — NEVER assume or default a rate such as 12.\nDo NOT change medicineName, batchNumber, expiryDate, quantities, prices, cdPercent, cdValue, or the Cash Discount.\nReturn ONLY the corrected JSON with the SAME schema — no markdown, no explanation.`;
+      result = await model.generateContent([correction, ...imageParts]);
+      text = result.response.text();
+      parsed = JSON.parse(stripMarkdown(text));
+    }
+    if (gstIssues.length > 0) {
+      console.error("[GST still inconsistent after retries]");
+      gstIssues.forEach((i) => console.error("  - " + i));
+    }
+
     console.log(JSON.stringify(parsed, null, 2));
   } catch (err) {
     console.error("ERROR:", err.message);

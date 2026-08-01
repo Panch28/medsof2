@@ -45,6 +45,11 @@ const db = getFirestore(app);
 const storage = getStorage(app);
 const functions = getFunctions(app, "us-central1");
 
+// Global error capture — logs any runtime error to the console so failures
+// (e.g. during save) can be diagnosed.
+window.addEventListener("error", (e) => console.error("[Global error]", e.message, e.error && e.error.stack));
+window.addEventListener("unhandledrejection", (e) => console.error("[Unhandled rejection]", e.reason && e.reason.stack ? e.reason.stack : e.reason));
+
 // Configure PDF.js worker Src
 if (window.pdfjsLib) {
   window.pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.worker.min.js";
@@ -823,6 +828,7 @@ function recalculate() {
   }
 
   const overallMatch = match && gstMatch;
+  console.log("[Recalc] total=", { declaredTotal, computedTotal, diff, match, printedGst, totalGst, gstDiff, gstMatch, overallMatch });
 
   const badge = $("review-arithmetic-badge");
   const gstBadge = $("review-gst-badge");
@@ -890,42 +896,49 @@ function styleBadge(el, ok, okText, failText) {
 // ─── Confirm & Save ───────────────────────────────────────────────────────────
 
 async function confirmAndSave(originalExtracted) {
+  console.log("[Save] confirmAndSave called", originalExtracted && { invoiceNumber: originalExtracted.invoiceNumber, distributor: originalExtracted.distributor });
   const panel = $("extraction-review-panel");
 
-  // Collect edited line items from DOM
-  const lineItemCards = document.querySelectorAll("#review-line-items [data-idx]");
-  const idxSet = new Set();
-  lineItemCards.forEach((el) => idxSet.add(parseInt(el.dataset.idx)));
-
-  const lineItems = [];
-  idxSet.forEach((idx) => {
-    const get = (field) => {
-      const el = document.querySelector(`#review-line-items [data-idx="${idx}"][data-field="${field}"]`);
-      return el ? el.value : "";
-    };
-    lineItems.push({
-      medicineName: get("medicineName"),
-      batchNumber: get("batchNumber"),
-      expiryDate: get("expiryDate"),
-      quantityBilled: parseFloat(get("quantityBilled")) || 0,
-      quantityFree: parseFloat(get("quantityFree")) || 0,
-      unitPrice: parseFloat(get("unitPrice")) || 0,
-      cdPercent: parseFloat(get("cdPercent")) || 0,
-      taxableValue: parseFloat(get("taxableValue")) || 0,
-      cdValue: parseFloat(get("cdValue")) || 0,
-      gstRate: parseFloat(get("gstRate")) || 0,
-      gstValue: parseFloat(get("gstValue")) || 0,
-      netValue: parseFloat(get("netValue")) || 0,
-    });
-  });
-
-  const invoiceTotal = parseFloat($("review-declared-total-input").value) || 0;
-
-  showLoadingOverlay(true, "Saving to Firestore...");
-
   try {
+    // Collect edited line items from DOM
+    const lineItemCards = document.querySelectorAll("#review-line-items [data-idx]");
+    const idxSet = new Set();
+    lineItemCards.forEach((el) => idxSet.add(parseInt(el.dataset.idx)));
+
+    const lineItems = [];
+    idxSet.forEach((idx) => {
+      const get = (field) => {
+        const el = document.querySelector(`#review-line-items [data-idx="${idx}"][data-field="${field}"]`);
+        return el ? el.value : "";
+      };
+      lineItems.push({
+        medicineName: get("medicineName"),
+        batchNumber: get("batchNumber"),
+        expiryDate: get("expiryDate"),
+        quantityBilled: parseFloat(get("quantityBilled")) || 0,
+        quantityFree: parseFloat(get("quantityFree")) || 0,
+        unitPrice: parseFloat(get("unitPrice")) || 0,
+        cdPercent: parseFloat(get("cdPercent")) || 0,
+        taxableValue: parseFloat(get("taxableValue")) || 0,
+        cdValue: parseFloat(get("cdValue")) || 0,
+        gstRate: parseFloat(get("gstRate")) || 0,
+        gstValue: parseFloat(get("gstValue")) || 0,
+        netValue: parseFloat(get("netValue")) || 0,
+      });
+    });
+
+    const invoiceTotal = parseFloat($("review-declared-total-input").value) || 0;
+    console.log("[Save] collected from DOM", { itemCount: lineItems.length, invoiceTotal, authUid: currentUser ? currentUser.uid : null });
+
+    if (!currentUser) {
+      throw new Error("Not signed in. Please log in again and retry.");
+    }
+
+    showLoadingOverlay(true, "Saving to Firestore...");
+
+    console.log("[Save] calling saveInvoice callable...");
     const saveFn = httpsCallable(functions, "saveInvoice");
-    await saveFn({
+    const resp = await saveFn({
       pharmacyId: currentPharmacyId,
       invoice: {
         distributor: originalExtracted.distributor || "",
@@ -934,10 +947,12 @@ async function confirmAndSave(originalExtracted) {
         invoiceTotal,
         invoiceSummary: originalExtracted.invoiceSummary || {},
         captureQuality: originalExtracted.captureQuality || {},
+        rawGeminiResponse: originalExtracted.rawGeminiResponse || "",
       },
       lineItems,
       confirmedBy: currentUser.uid,
     });
+    console.log("[Save] saveInvoice callable succeeded", resp && resp.data);
 
     // Delete raw files from Storage
     if (reviewSession.storagePaths && reviewSession.storagePaths.length > 0) {
@@ -954,13 +969,20 @@ async function confirmAndSave(originalExtracted) {
     panel.classList.add("hidden");
     revokeReviewSession();
     showToast(`Saved! ${lineItems.length} medicine(s) recorded.`, "success");
+    console.log("[Save] done — advancing to next review");
 
     reviewQueueIndex++;
     showNextReviewInQueue();
 
   } catch (err) {
+    console.error("[Save] FAILED", {
+      code: err && err.code,
+      message: err && err.message,
+      details: err && err.details,
+      error: err,
+    });
     showLoadingOverlay(false);
-    showToast("Save failed: " + err.message, "error");
+    showToast("Save failed: " + (err && err.message ? err.message : String(err)), "error");
   }
 }
 

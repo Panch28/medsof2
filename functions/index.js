@@ -18,6 +18,35 @@ initializeApp();
 
 const GEMINI_API_KEY = defineSecret("GEMINI_API_KEY");
 
+// Deterministic GST consistency check. Enforces per-line rate accuracy by
+// arithmetic, not by trusting Gemini's in-prompt self-checks. Returns an array
+// of human-readable discrepancies (empty array = consistent).
+function checkGstConsistency(parsed) {
+  const issues = [];
+  const lines = Array.isArray(parsed.lineItems) ? parsed.lineItems : [];
+  const summary = parsed.invoiceSummary || {};
+
+  const printedGst = summary.totalGst ?? ((summary.totalCGST || 0) + (summary.totalSGST || 0) + (summary.totalIGST || 0));
+  const lineGstSum = lines.reduce((s, l) => s + (Number(l.gstValue) || 0), 0);
+
+  if (printedGst && Math.abs(lineGstSum - printedGst) > 1) {
+    issues.push(`line GST sum ₹${lineGstSum.toFixed(2)} != printed Total GST ₹${printedGst.toFixed(2)}`);
+  }
+
+  for (const l of lines) {
+    const taxable = Number(l.taxableValue) || 0;
+    const rate = Number(l.gstRate) || 0;
+    const gv = Number(l.gstValue) || 0;
+    if (taxable > 0 && rate > 0) {
+      const expected = (taxable * rate) / 100;
+      if (Math.abs(gv - expected) > 1) {
+        issues.push(`"${l.medicineName || "?"}": gstValue ₹${gv.toFixed(2)} != taxable ₹${taxable.toFixed(2)} x ${rate}% = ₹${expected.toFixed(2)} (gstRate or gstValue misread)`);
+      }
+    }
+  }
+  return issues;
+}
+
 // ─── extractInvoice ───────────────────────────────────────────────────────────
 
 exports.extractInvoice = onCall(
@@ -198,7 +227,37 @@ CRITICAL — COPY PRINTED VALUES, DO NOT DERIVE:
       );
     }
 
-    return parsed;
+    // Deterministic GST enforcement: validate the arithmetic ourselves and, if it
+    // fails, send Gemini a corrective turn telling it exactly which lines are
+    // inconsistent. Gemini's in-prompt self-checks are advisory; this backstop is
+    // what makes mixed-rate invoices (5/12/18 etc.) reliable.
+    let gstIssues = [];
+    for (let attempt = 0; attempt <= 2; attempt++) {
+      gstIssues = checkGstConsistency(parsed);
+      if (gstIssues.length === 0) break;
+
+      logger.warn(`[extractInvoice] GST check failed (attempt ${attempt + 1}): ${gstIssues.join(" | ")}`);
+      const correction = `You previously returned this JSON for the invoice images:\n\n${JSON.stringify(parsed)}\n\nThe following GST checks FAILED against the printed figures:\n- ${gstIssues.join("\n- ")}\n\nThe printed per-line GST % column and the printed footer GST totals are GROUND TRUTH. Correct ONLY the gstRate / gstValue fields and the footer totalGst / totalCGST / totalSGST / totalIGST if misread, so that:\n1. sum of ALL line gstValue == printed Total GST (within ₹1)\n2. for EVERY line: gstValue == taxableValue x gstRate / 100 (within ₹1)\n3. the distinct gstRate values match the GST % slabs in the footer tax table.\nRe-read the ACTUAL printed digits of every line's GST % column — NEVER assume or default a rate such as 12.\nDo NOT change medicineName, batchNumber, expiryDate, quantities, prices, cdPercent, cdValue, or the Cash Discount.\nReturn ONLY the corrected JSON with the SAME schema — no markdown, no explanation.`;
+      try {
+        const result = await model.generateContent([correction, ...imageParts]);
+        const text = result.response.text();
+        const cleaned = text
+          .replace(/^```json\s*/i, "")
+          .replace(/^```\s*/i, "")
+          .replace(/```\s*$/i, "")
+          .trim();
+        parsed = JSON.parse(cleaned);
+      } catch (err) {
+        logger.error("[extractInvoice] GST correction attempt failed: " + err.message);
+        break;
+      }
+    }
+    if (gstIssues.length > 0) {
+      logger.warn(`[extractInvoice] GST still inconsistent after retries: ${gstIssues.join(" | ")}`);
+    }
+
+    logger.info(`[extractInvoice] done invoice=${parsed.invoiceNumber || "?"} items=${(parsed.lineItems || []).length}`);
+    return { ...parsed, rawGeminiResponse: geminiResponse };
   }
 );
 
@@ -236,6 +295,7 @@ exports.saveInvoice = onCall(
         invoiceSummary: invoice.invoiceSummary || {},
         lineItems,
         captureQuality: invoice.captureQuality || {},
+        rawGeminiResponse: invoice.rawGeminiResponse || "",
         confirmedBy: confirmedBy || request.auth.uid,
         confirmedAt: FieldValue.serverTimestamp(),
         createdAt: FieldValue.serverTimestamp(),
@@ -305,6 +365,20 @@ exports.scheduledCleanup = onSchedule(
           console.log(`Cleanup: deleted stale file ${file.name}`);
         }
       }
+      // Strip rawGeminiResponse debug field from invoices older than 14 days (TTL)
+      try {
+        const ttlCutoff = new Date(Date.now() - 14 * 24 * 60 * 60 * 1000);
+        const snap = await db.collectionGroup("invoices").where("createdAt", "<=", ttlCutoff).limit(500).get();
+        let stripped = 0;
+        for (const doc of snap.docs) {
+          await doc.ref.update({ rawGeminiResponse: FieldValue.delete() });
+          stripped++;
+        }
+        console.log(`Cleanup: stripped rawGeminiResponse from ${stripped} old invoice(s).`);
+      } catch (stripErr) {
+        console.error("Cleanup strip error:", stripErr.message);
+      }
+
       console.log(`Cleanup complete. Deleted ${deleted} stale file(s).`);
     } catch (err) {
       console.error("Cleanup error:", err);
