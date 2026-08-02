@@ -18,32 +18,110 @@ initializeApp();
 
 const GEMINI_API_KEY = defineSecret("GEMINI_API_KEY");
 
-// Deterministic GST consistency check. Enforces per-line rate accuracy by
-// arithmetic, not by trusting Gemini's in-prompt self-checks. Returns an array
-// of human-readable discrepancies (empty array = consistent).
+function round2(x) {
+  return Math.round(x * 100) / 100;
+}
+
+// Deterministic column-swap repair. When a line's taxable/net columns are
+// swapped AND its GST value is consistent with the swap, this provably fixes
+// it from arithmetic alone (no image re-read needed). Safe gate: only fires
+// when every condition lines up within ₹0.50.
+function repairColumnSwaps(parsed) {
+  const lines = Array.isArray(parsed.lineItems) ? parsed.lineItems : [];
+  let repaired = 0;
+  for (const l of lines) {
+    const t = Number(l.taxableValue) || 0;
+    const g = Number(l.gstValue) || 0;
+    const n = Number(l.netValue) || 0;
+    const r = Number(l.gstRate) || 0;
+    if (!(t > 0 && g > 0 && n > 0 && r > 0)) continue;
+    if (Math.abs(t + g - n) <= 1) continue; // already internally consistent
+    if (Math.abs(n * (1 + r / 100) - t) > 0.5) continue; // not a taxable<->net swap
+    if (Math.abs((t - n) - (n * r) / 100) > 0.5) continue; // repaired GST inconsistent
+    l.taxableValue = round2(n);
+    l.netValue = round2(t);
+    l.gstValue = round2(t - n);
+    repaired++;
+  }
+  return repaired;
+}
+
+// Deterministic GST consistency check. Enforces per-line rate/net accuracy and
+// footer totals by arithmetic, not by trusting Gemini's in-prompt self-checks.
+// Returns an array of human-readable discrepancies (empty array = consistent).
 function checkGstConsistency(parsed) {
   const issues = [];
   const lines = Array.isArray(parsed.lineItems) ? parsed.lineItems : [];
   const summary = parsed.invoiceSummary || {};
 
-  const printedGst = summary.totalGst ?? ((summary.totalCGST || 0) + (summary.totalSGST || 0) + (summary.totalIGST || 0));
-  const lineGstSum = lines.reduce((s, l) => s + (Number(l.gstValue) || 0), 0);
+  // Every printed GST reference present in the footer (may be one or both).
+  const refs = [];
+  const totalGst = Number(summary.totalGst) || 0;
+  const cst =
+    (Number(summary.totalCGST) || 0) +
+    (Number(summary.totalSGST) || 0) +
+    (Number(summary.totalIGST) || 0);
+  if (totalGst > 0) refs.push({ src: "Total GST", v: totalGst });
+  if (cst > 0) refs.push({ src: "CGST+SGST+IGST", v: cst });
 
-  if (printedGst && Math.abs(lineGstSum - printedGst) > 1) {
-    issues.push(`line GST sum ₹${lineGstSum.toFixed(2)} != printed Total GST ₹${printedGst.toFixed(2)}`);
+  if (refs.length >= 2) {
+    for (let i = 0; i < refs.length; i++) {
+      for (let j = i + 1; j < refs.length; j++) {
+        if (Math.abs(refs[i].v - refs[j].v) > 1) {
+          issues.push(`footer GST refs disagree: ${refs[i].src} ₹${refs[i].v.toFixed(2)} vs ${refs[j].src} ₹${refs[j].v.toFixed(2)}`);
+        }
+      }
+    }
+  }
+
+  const lineGstSum = lines.reduce((s, l) => s + (Number(l.gstValue) || 0), 0);
+  for (const ref of refs) {
+    if (Math.abs(lineGstSum - ref.v) > 1) {
+      issues.push(`line GST sum ₹${lineGstSum.toFixed(2)} != printed ${ref.src} ₹${ref.v.toFixed(2)}`);
+    }
   }
 
   for (const l of lines) {
     const taxable = Number(l.taxableValue) || 0;
     const rate = Number(l.gstRate) || 0;
     const gv = Number(l.gstValue) || 0;
+    const net = Number(l.netValue) || 0;
     if (taxable > 0 && rate > 0) {
       const expected = (taxable * rate) / 100;
       if (Math.abs(gv - expected) > 1) {
         issues.push(`"${l.medicineName || "?"}": gstValue ₹${gv.toFixed(2)} != taxable ₹${taxable.toFixed(2)} x ${rate}% = ₹${expected.toFixed(2)} (gstRate or gstValue misread)`);
       }
     }
+    if (taxable > 0 && gv > 0 && net > 0) {
+      const expectedNet = taxable + gv;
+      if (Math.abs(net - expectedNet) > 1) {
+        issues.push(`"${l.medicineName || "?"}": netValue ₹${net.toFixed(2)} != taxable ₹${taxable.toFixed(2)} + GST ₹${gv.toFixed(2)} = ₹${expectedNet.toFixed(2)} (columns misread)`);
+      }
+    }
   }
+
+  // Footer formula: Grand Total = Sale − Sch Disc − Cash Disc + GST + Round Off − CN.NO
+  // Back out the implied printed GST and compare it against every reference.
+  const grandTotal = Number(summary.grandTotal) || 0;
+  const saleValue = Number(summary.saleValue) || 0;
+  if (grandTotal > 0 && saleValue > 0) {
+    const implied =
+      grandTotal -
+      saleValue +
+      (Number(summary.schDisc) || 0) +
+      (Number(summary.cashDiscount) || 0) -
+      (Number(summary.roundOff) || 0) +
+      (Number(summary.cnNo) || 0);
+    if (implied > 0) {
+      const targets = refs.length ? refs : [{ src: "line GST sum", v: lineGstSum }];
+      for (const ref of targets) {
+        if (Math.abs(implied - ref.v) > 1) {
+          issues.push(`footer formula implies GST ₹${implied.toFixed(2)} but ${ref.src} is ₹${ref.v.toFixed(2)}`);
+        }
+      }
+    }
+  }
+
   return issues;
 }
 
@@ -200,6 +278,7 @@ CRITICAL — COPY PRINTED VALUES, DO NOT DERIVE:
    b. Verify the footer formula: saleValue − schDisc − cashDiscount + totalGst + roundOff − cnNo should approximately equal grandTotal (within ₹1). If it does not, you MISREAD a footer field — re-scan the footer summary block and CORRECT the specific misread field from the printed digits. Do NOT change line items to fake a match.
    c. PER-LINE GST RATE check: for EVERY line, gstValue should be within ₹1 of (taxableValue × gstRate / 100). If a line's gstRate disagrees with its gstValue, you MISREAD the GST % column — re-scan that line and correct gstRate from the printed digits.
    d. RATE-SLAB check: the DISTINCT gstRate values across lines must match the GST % slabs shown in the footer tax table. A footer row "CGST 9% + SGST 9%" means those lines are taxed at 18%; "CGST 2.5% + SGST 2.5%" means 5%. If your lines show ONLY ONE rate but the footer shows TWO or MORE slabs, you FLATTENED the GST % column — re-scan EVERY line and read each actual per-line rate.
+   e. PER-LINE NET check: for EVERY line, netValue should be within ₹1 of (taxableValue + gstValue). If a line's netValue disagrees with taxableValue + gstValue, you likely SWAPPED the Taxable and Net columns — re-scan that line and read the two printed amounts back into their correct columns.
    If the footer is genuinely unreadable or off-page, set captureQuality.readable = false (or missingPage = true) and explain in issues[].`;
 
     let geminiResponse;
@@ -232,12 +311,25 @@ CRITICAL — COPY PRINTED VALUES, DO NOT DERIVE:
     // inconsistent. Gemini's in-prompt self-checks are advisory; this backstop is
     // what makes mixed-rate invoices (5/12/18 etc.) reliable.
     let gstIssues = [];
+    let gstAttempts = 0;
     for (let attempt = 0; attempt <= 2; attempt++) {
+      repairColumnSwaps(parsed);
       gstIssues = checkGstConsistency(parsed);
+      gstAttempts = attempt + 1;
       if (gstIssues.length === 0) break;
 
       logger.warn(`[extractInvoice] GST check failed (attempt ${attempt + 1}): ${gstIssues.join(" | ")}`);
-      const correction = `You previously returned this JSON for the invoice images:\n\n${JSON.stringify(parsed)}\n\nThe following GST checks FAILED against the printed figures:\n- ${gstIssues.join("\n- ")}\n\nThe printed per-line GST % column and the printed footer GST totals are GROUND TRUTH. Correct ONLY the gstRate / gstValue fields and the footer totalGst / totalCGST / totalSGST / totalIGST if misread, so that:\n1. sum of ALL line gstValue == printed Total GST (within ₹1)\n2. for EVERY line: gstValue == taxableValue x gstRate / 100 (within ₹1)\n3. the distinct gstRate values match the GST % slabs in the footer tax table.\nRe-read the ACTUAL printed digits of every line's GST % column — NEVER assume or default a rate such as 12.\nDo NOT change medicineName, batchNumber, expiryDate, quantities, prices, cdPercent, cdValue, or the Cash Discount.\nReturn ONLY the corrected JSON with the SAME schema — no markdown, no explanation.`;
+      const lineGstSum = (parsed.lineItems || []).reduce((s, l) => s + (Number(l.gstValue) || 0), 0);
+      const refsInfo = [];
+      const totalGst = Number(parsed.invoiceSummary?.totalGst) || 0;
+      const cst =
+        (Number(parsed.invoiceSummary?.totalCGST) || 0) +
+        (Number(parsed.invoiceSummary?.totalSGST) || 0) +
+        (Number(parsed.invoiceSummary?.totalIGST) || 0);
+      if (totalGst > 0) refsInfo.push(`Total GST ₹${totalGst.toFixed(2)}`);
+      if (cst > 0) refsInfo.push(`CGST+SGST+IGST ₹${cst.toFixed(2)}`);
+      const printedRef = refsInfo.length ? refsInfo.join(", ") : "not extracted";
+      const correction = `You previously returned this JSON for the invoice images:\n\n${JSON.stringify(parsed)}\n\nThe following deterministic GST checks FAILED against the printed figures:\n- ${gstIssues.join("\n- ")}\n\nThe printed footer GST totals are GROUND TRUTH and equal: ${printedRef}. Your line GST sum is ₹${lineGstSum.toFixed(2)} — it must equal the printed total within ₹1.\nRe-read the ACTUAL printed digits of EVERY line: the GST % column, the GST ₹ column, and the Taxable/Net columns. If a line is internally broken (taxableValue + gstValue != netValue) the Taxable and Net columns were probably SWAPPED — swap them back from the printed digits.\nCorrect any of gstRate, gstValue, taxableValue, netValue (only to repair a column swap or rate misread) and the footer totalGst / totalCGST / totalSGST / totalIGST / saleValue / grandTotal / schDisc / roundOff / cnNo if misread, so that:\n1. sum of ALL line gstValue == printed Total GST (within ₹1)\n2. for EVERY line: gstValue == taxableValue x gstRate / 100 (within ₹1)\n3. for EVERY line: netValue == taxableValue + gstValue (within ₹1)\n4. the distinct gstRate values match the GST % slabs in the footer tax table.\nRe-read the ACTUAL printed digits of every line's GST % column — NEVER assume or default a rate such as 12.\nDo NOT change medicineName, batchNumber, expiryDate, quantities, unitPrice, cdPercent, cdValue, or the Cash Discount.\nReturn ONLY the corrected JSON with the SAME schema — no markdown, no explanation.`;
       try {
         const result = await model.generateContent([correction, ...imageParts]);
         const text = result.response.text();
@@ -256,8 +348,12 @@ CRITICAL — COPY PRINTED VALUES, DO NOT DERIVE:
       logger.warn(`[extractInvoice] GST still inconsistent after retries: ${gstIssues.join(" | ")}`);
     }
 
-    logger.info(`[extractInvoice] done invoice=${parsed.invoiceNumber || "?"} items=${(parsed.lineItems || []).length}`);
-    return { ...parsed, rawGeminiResponse: geminiResponse };
+    logger.info(`[extractInvoice] done invoice=${parsed.invoiceNumber || "?"} items=${(parsed.lineItems || []).length} gstPass=${gstIssues.length === 0}`);
+    return {
+      ...parsed,
+      gstCheck: { pass: gstIssues.length === 0, attempts: gstAttempts, issues: gstIssues },
+      rawGeminiResponse: geminiResponse,
+    };
   }
 );
 
@@ -295,6 +391,7 @@ exports.saveInvoice = onCall(
         invoiceSummary: invoice.invoiceSummary || {},
         lineItems,
         captureQuality: invoice.captureQuality || {},
+        gstCheck: invoice.gstCheck || {},
         rawGeminiResponse: invoice.rawGeminiResponse || "",
         confirmedBy: confirmedBy || request.auth.uid,
         confirmedAt: FieldValue.serverTimestamp(),

@@ -670,6 +670,14 @@ function openReviewPanel(extracted) {
       ⚠ Possible missing page detected — verify line items are complete.
     </div>`;
   }
+  const gstCheck = extracted.gstCheck;
+  if (gstCheck && gstCheck.pass === false) {
+    const detail = (gstCheck.issues || []).slice(0, 3).map((i) => `• ${i}`).join("<br>");
+    alertsEl.innerHTML += `<div class="bg-rose-500/10 border border-rose-500/40 rounded-lg p-2 text-[10px] text-rose-300 font-semibold">
+      ⚠ AI GST self-check FAILED after ${gstCheck.attempts || 3} attempt(s). Per-line GST % / ₹ / Net columns may be misread — verify every line below.
+      <div class="font-normal mt-1 text-rose-400/90">${detail}</div>
+    </div>`;
+  }
 
   // Render line items
   renderLineItems(extracted.lineItems || []);
@@ -947,6 +955,7 @@ async function confirmAndSave(originalExtracted) {
         invoiceTotal,
         invoiceSummary: originalExtracted.invoiceSummary || {},
         captureQuality: originalExtracted.captureQuality || {},
+        gstCheck: originalExtracted.gstCheck || {},
         rawGeminiResponse: originalExtracted.rawGeminiResponse || "",
       },
       lineItems,
