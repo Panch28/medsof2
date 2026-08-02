@@ -100,7 +100,7 @@ OPERATIONAL DIRECTIVES:
 9. Return ONLY valid JSON — no markdown, no explanation.
 10. SELF-CHECK before returning (this is mandatory):
     a. sum of ALL line gstValue values should approximately equal the printed Total GST (totalGst) — within ₹1.
-    b. Verify the footer formula: saleValue − schDisc − cashDiscount + totalGst + roundOff − cnNo should approximately equal grandTotal (within ₹1). If it does not, you MISREAD a footer field — re-scan the footer summary block and CORRECT the specific misread field from the printed digits. Do NOT change line items to fake a match.
+    b. Verify the footer formula: saleValue − schDisc − cashDiscount + totalGst + roundOff − cnNo should approximately equal grandTotal (within ₹1). If it does not, you MISREAD a footer field — re-scan the footer summary block and CORRECT the specific misread field from the printed digits (pay special attention to the "Cash Disc." / "Sch Disc." rows — never read a printed discount as ₹0.00). Do NOT change line items to fake a match.
     c. PER-LINE GST RATE check: for EVERY line, gstValue should be within ₹1 of (taxableValue × gstRate / 100). If a line's gstRate disagrees with its gstValue, you MISREAD the GST % column — re-scan that line and correct gstRate from the printed digits.
     d. RATE-SLAB check: the DISTINCT gstRate values across lines must match the GST % slabs shown in the footer tax table. A footer row "CGST 9% + SGST 9%" means those lines are taxed at 18%; "CGST 2.5% + SGST 2.5%" means 5%. If your lines show ONLY ONE rate but the footer shows TWO or MORE slabs, you FLATTENED the GST % column — re-scan EVERY line and read each actual per-line rate.
     e. PER-LINE NET check: for EVERY line, netValue should be within ₹1 of (taxableValue + gstValue). If a line's netValue disagrees with taxableValue + gstValue, you likely SWAPPED the Taxable and Net columns — re-scan that line and read the two printed amounts back into their correct columns.
@@ -160,6 +160,31 @@ function repairColumnSwaps(parsed) {
     repaired++;
   }
   return repaired;
+}
+
+// Uniform-rate inference from the printed footer. When the printed CGST and
+// SGST are equal and together imply a single integer GST slab for the
+// discounted taxable base (saleValue − schDisc − cashDiscount), and that slab
+// reproduces the printed totalGst, the whole invoice is taxed at ONE rate.
+// Returns { slab, base } when confirmed, otherwise null.
+function inferUniformRate(summary) {
+  const saleValue = Number(summary.saleValue) || 0;
+  const base =
+    saleValue -
+    (Number(summary.schDisc) || 0) -
+    (Number(summary.cashDiscount) || 0);
+  const cgst = Number(summary.totalCGST) || 0;
+  const sgst = Number(summary.totalSGST) || 0;
+  const igst = Number(summary.totalIGST) || 0;
+  const totalGst = Number(summary.totalGst) || 0;
+  if (!(base > 1 && cgst > 0 && sgst > 0 && igst === 0)) return null;
+  if (Math.abs(cgst - sgst) > 1) return null;
+  const pct = (cgst / base) * 200;
+  const slab = Math.round(pct);
+  if (![5, 12, 18, 28].includes(slab)) return null;
+  if (Math.abs(pct - slab) > 0.4) return null;
+  if (Math.abs(totalGst - (slab * base) / 100) > 1) return null;
+  return { slab, base };
 }
 
 function checkGstConsistency(parsed) {
@@ -230,6 +255,54 @@ function checkGstConsistency(parsed) {
         }
       }
     }
+
+    // Discount check: back out the implied Cash/Sch discount from the printed
+    // totals. Prevents Gemini defaulting a printed discount to ₹0.00 and then
+    // failing the grand-total validation.
+    const gstRef = refs.length ? refs[0].v : lineGstSum;
+    const impliedDisc =
+      saleValue +
+      gstRef +
+      (Number(summary.roundOff) || 0) -
+      (Number(summary.cnNo) || 0) -
+      grandTotal;
+    const extractedDisc =
+      (Number(summary.schDisc) || 0) + (Number(summary.cashDiscount) || 0);
+    if (impliedDisc > 1 && extractedDisc < 0.5) {
+      issues.push(`discount Rs.${impliedDisc.toFixed(2)} appears missing (footer implies it but cash/sch disc extracted as Rs.0)`);
+    } else if (extractedDisc > 0.5 && Math.abs(extractedDisc - impliedDisc) > 1) {
+      issues.push(`discount total Rs.${extractedDisc.toFixed(2)} != implied Rs.${impliedDisc.toFixed(2)} (cash/sch disc misread)`);
+    }
+  }
+
+  // Taxable-total cross-check. Only on single-rate invoices (totalTaxable may be
+  // a slab subtotal on multi-slab invoices, which would false-fire).
+  const rates = new Set(lines.map((l) => Number(l.gstRate)).filter((r) => r > 0));
+  const totalTaxable = Number(summary.totalTaxable) || 0;
+  if (totalTaxable > 0 && rates.size === 1) {
+    const lineTaxableSum = lines.reduce((s, l) => s + (Number(l.taxableValue) || 0), 0);
+    if (Math.abs(lineTaxableSum - totalTaxable) > 1) {
+      issues.push(`line taxable sum Rs.${lineTaxableSum.toFixed(2)} != printed totalTaxable Rs.${totalTaxable.toFixed(2)}`);
+    }
+  }
+
+  // Uniform-rate enforcement. When the printed CGST/SGST imply a single integer
+  // slab on the discounted base, a line reading a different rate or a taxable
+  // sum that drifts from the base is provably misread — catch the self-consistent
+  // misreads (e.g. a GST % column read as 5% on an all-12% invoice) that pass
+  // every per-line check.
+  const uniform = inferUniformRate(summary);
+  if (uniform) {
+    const lineTaxableSum = lines.reduce((s, l) => s + (Number(l.taxableValue) || 0), 0);
+    if (Math.abs(lineTaxableSum - uniform.base) > 1) {
+      issues.push(`line taxable sum Rs.${lineTaxableSum.toFixed(2)} != uniform-rate taxable base Rs.${uniform.base.toFixed(2)} (printed CGST/SGST imply a single ${uniform.slab}% slab)`);
+    }
+    for (const l of lines) {
+      const rate = Number(l.gstRate) || 0;
+      if (rate > 0 && Math.abs(rate - uniform.slab) > 0.5) {
+        issues.push(`"${l.medicineName || "?"}": gstRate ${rate}% but printed CGST/SGST imply the ENTIRE invoice is taxed at ${uniform.slab}% (gstRate misread)`);
+      }
+    }
   }
 
   return issues;
@@ -245,12 +318,12 @@ function checkGstConsistency(parsed) {
 
     let gstIssues = [];
     let gstAttempts = 0;
-    for (let attempt = 0; attempt <= 3; attempt++) {
+    for (let attempt = 0; attempt <= 4; attempt++) {
       repairColumnSwaps(parsed);
       gstIssues = checkGstConsistency(parsed);
       gstAttempts = attempt + 1;
       if (gstIssues.length === 0) break;
-      if (attempt === 3) break; // correction budget exhausted; final state already checked
+      if (attempt === 4) break; // correction budget exhausted; final state already checked
 
       console.warn(`[GST check failed - attempt ${attempt + 1}]`);
       gstIssues.forEach((i) => console.warn("  - " + i));
@@ -265,7 +338,11 @@ function checkGstConsistency(parsed) {
       if (totalGst > 0) refsInfo.push(`Total GST Rs.${totalGst.toFixed(2)}`);
       if (cst > 0) refsInfo.push(`CGST+SGST+IGST Rs.${cst.toFixed(2)}`);
       const printedRef = refsInfo.length ? refsInfo.join(", ") : "not extracted";
-      const correction = `You previously returned this JSON for the invoice images:\n\n${JSON.stringify(parsed)}\n\nThe following deterministic GST checks FAILED against the printed figures:\n- ${gstIssues.join("\n- ")}\n\nThe printed footer GST totals are GROUND TRUTH and equal: ${printedRef}. Your line GST sum is Rs.${lineGstSum.toFixed(2)} — it must equal the printed total within Rs.1.\nRe-read the ACTUAL printed digits of EVERY line: the GST % column, the GST Rs. column, and the Taxable/Net columns. If a line is internally broken (taxableValue + gstValue != netValue) the Taxable and Net columns were probably SWAPPED — swap them back from the printed digits.\nCorrect any of gstRate, gstValue, taxableValue, netValue (only to repair a column swap or rate misread) and the footer totalGst / totalCGST / totalSGST / totalIGST / saleValue / grandTotal / schDisc / roundOff / cnNo if misread, so that:\n1. sum of ALL line gstValue == printed Total GST (within Rs.1)\n2. for EVERY line: gstValue == taxableValue x gstRate / 100 (within Rs.1)\n3. for EVERY line: netValue == taxableValue + gstValue (within Rs.1)\n4. the distinct gstRate values match the GST % slabs in the footer tax table.\nRe-read the ACTUAL printed digits of every line's GST % column — NEVER assume or default a rate such as 12.\nDo NOT change medicineName, batchNumber, expiryDate, quantities, unitPrice, cdPercent, cdValue, or the Cash Discount.\nReturn ONLY the corrected JSON with the SAME schema — no markdown, no explanation.`;
+      const uniform = inferUniformRate(parsed.invoiceSummary || {});
+      const uniformHint = uniform
+        ? `\nIMPORTANT: the printed CGST Rs.${(Number(parsed.invoiceSummary?.totalCGST) || 0).toFixed(2)} and SGST Rs.${(Number(parsed.invoiceSummary?.totalSGST) || 0).toFixed(2)} are equal and together imply the ENTIRE invoice is taxed at a single ${uniform.slab}% rate (CGST = SGST = ${uniform.slab / 2}% of the discounted taxable base Rs.${uniform.base.toFixed(2)}), and that reproduces the printed Total GST Rs.${(Number(parsed.invoiceSummary?.totalGst) || 0).toFixed(2)}. Therefore EVERY line must have gstRate = ${uniform.slab}; any line reporting a different rate (e.g. 5) is a misread of that line's GST % column, and the sum of ALL line taxableValue must equal Rs.${uniform.base.toFixed(2)}.`
+        : "";
+      const correction = `You previously returned this JSON for the invoice images:\n\n${JSON.stringify(parsed)}\n\nThe following deterministic GST checks FAILED against the printed figures:\n- ${gstIssues.join("\n- ")}\n\nThe printed footer GST totals are GROUND TRUTH and equal: ${printedRef}. Your line GST sum is Rs.${lineGstSum.toFixed(2)} — it must equal the printed total within Rs.1.${uniformHint}\nRe-read the ACTUAL printed digits of EVERY line: the GST % column, the GST Rs. column, and the Taxable/Net columns. If a line is internally broken (taxableValue + gstValue != netValue) the Taxable and Net columns were probably SWAPPED — swap them back from the printed digits.\nCorrect any of gstRate, gstValue, taxableValue, netValue (only to repair a column swap or rate misread) and the footer totalGst / totalCGST / totalSGST / totalIGST / saleValue / grandTotal / totalTaxable / schDisc / cashDiscount / roundOff / cnNo if misread, so that:\n1. sum of ALL line gstValue == printed Total GST (within Rs.1)\n2. for EVERY line: gstValue == taxableValue x gstRate / 100 (within Rs.1)\n3. for EVERY line: netValue == taxableValue + gstValue (within Rs.1)\n4. the distinct gstRate values match the GST % slabs in the footer tax table.\n5. if a "Cash Disc." or "Sch Disc." row is printed in the footer, the discount must be captured — it should equal saleValue + Total GST + Round Off − CN.NO − grandTotal (the implied discount). NEVER leave a printed discount as Rs.0.00; re-read the printed discount row digits.\n6. if totalTaxable is printed, sum of ALL line taxableValue == printed totalTaxable (within Rs.1).\nRe-read the ACTUAL printed digits of every line's GST % column — NEVER assume or default a rate such as 12.\nDo NOT change medicineName, batchNumber, expiryDate, quantities, unitPrice, cdPercent, cdValue.\nReturn ONLY the corrected JSON with the SAME schema — no markdown, no explanation.`;
       result = await model.generateContent([correction, ...imageParts]);
       text = result.response.text();
       parsed = JSON.parse(stripMarkdown(text));
