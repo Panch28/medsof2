@@ -1555,28 +1555,7 @@ async function processQueueItem(item) {
     const qs = qData.status || "";
     if (qs === "extracted" && qData.extracted) {
       item.status = "extracted";
-      // Layer 2: Compound key duplicate check (hard block)
       const extracted = qData.extracted;
-      const distributorId = normalizeDistributorName(extracted.distributor || "");
-      const dupCheck = await checkDuplicateByCompoundKey(currentPharmacyId, distributorId, extracted.invoiceNumber || "");
-      if (dupCheck.isDuplicate) {
-        const m = dupCheck.match;
-        const dateStr = m.savedAt?.toDate ? m.savedAt.toDate().toLocaleString() : "unknown";
-        const override = confirm(
-          `🛑 DUPLICATE INVOICE BLOCKED\n\n` +
-          `This invoice (${m.invoiceNumber} from ${m.distributor || m.distributorId}) ` +
-          `was already saved on ${dateStr}.\n\n` +
-          `Saving again would create duplicate stock entries.\n\n` +
-          `Click OK to override and save anyway, or Cancel to discard.`
-        );
-        if (!override) {
-          // Mark queue item as rejected so it doesn't come back
-          await mutateImportQueue("update", item.imageId, { status: "rejected" });
-          showToast("Duplicate invoice discarded.", "warning");
-          return "done";
-        }
-        // User chose to override — proceed to review
-      }
       item.extracted = extracted;
       await openQueueReview(item, extracted);
       return "awaiting-review";
@@ -1613,28 +1592,7 @@ async function processQueueItem(item) {
 
   if (status === "extracted") {
     item.status = "extracted";
-    // Layer 2: Compound key duplicate check (hard block)
     const extracted = data.extracted || {};
-    const distributorId = normalizeDistributorName(extracted.distributor || "");
-    const dupCheck = await checkDuplicateByCompoundKey(currentPharmacyId, distributorId, extracted.invoiceNumber || "");
-    if (dupCheck.isDuplicate) {
-      const m = dupCheck.match;
-      const dateStr = m.savedAt?.toDate ? m.savedAt.toDate().toLocaleString() : "unknown";
-      const override = confirm(
-        `🛑 DUPLICATE INVOICE BLOCKED\n\n` +
-        `This invoice (${m.invoiceNumber} from ${m.distributor || m.distributorId}) ` +
-        `was already saved on ${dateStr}.\n\n` +
-        `Saving again would create duplicate stock entries.\n\n` +
-        `Click OK to override and save anyway, or Cancel to discard.`
-      );
-      if (!override) {
-        // Mark queue item as rejected so it doesn't come back
-        await mutateImportQueue("update", item.imageId, { status: "rejected" });
-        showToast("Duplicate invoice discarded.", "warning");
-        return "done";
-      }
-      // User chose to override — proceed to review
-    }
     item.extracted = extracted;
     await openQueueReview(item, extracted);
     return "awaiting-review";
@@ -2015,33 +1973,7 @@ async function checkDuplicateByHash(file, pharmacyId) {
   return { isDuplicate: false, match: null, newHash: hash };
 }
 
-// Layer 2: Compound key duplicate check after extraction
-// Checks Firestore for existing invoice with same distributorId + invoiceNumber
-// This is a HARD BLOCK — prevents duplicate stock entries
-async function checkDuplicateByCompoundKey(pharmacyId, distributorId, invoiceNumber) {
-  if (!distributorId || !invoiceNumber) return { isDuplicate: false, match: null };
-  const q = query(
-    collection(db, "pharmacies", pharmacyId, "invoices"),
-    where("distributorId", "==", distributorId),
-    where("invoiceNumber", "==", invoiceNumber),
-    limit(1)
-  );
-  const snap = await getDocs(q);
-  if (!snap.empty) {
-    const doc = snap.docs[0];
-    const d = doc.data();
-    return {
-      isDuplicate: true,
-      match: {
-        invoiceId: doc.id,
-        invoiceNumber: d.invoiceNumber,
-        distributor: d.distributor,
-        distributorId: d.distributorId,
-        invoiceDate: d.invoiceDate,
-        createdAt: d.createdAt,
-        savedAt: d.confirmedAt || d.createdAt,
-      }
-    };
-  }
-return { isDuplicate: false, match: null };
-}
+// Layer 2: Compound key duplicate check has MOVED server-side — saveInvoice now
+// hard-blocks on (distributorId, invoiceNumber) before writing, so it cannot be
+// bypassed by client bugs. The pHash check above (Layer 1) remains as the only
+// client-side duplicate guard, purely as an upload-time UX warning.

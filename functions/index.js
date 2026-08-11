@@ -17,7 +17,9 @@
  *   "processing" (lease expired).
  * - saveInvoice: Writes a confirmed invoice + medicine records. When queueId is
  *   supplied it guards against duplicate saves from stale client retries and
- *   deletes the queue doc + raw Storage image after the write commits.
+ *   deletes the queue doc + raw Storage image after the write commits. It also
+ *   enforces a server-side (distributorId, invoiceNumber) compound-key
+ *   duplicate hard block before any write lands.
  * - discardQueueItem: Staff-authorized permanent discard of a queue item
  *   (deletes the queue doc + raw Storage image).
  * - listPendingInvoices / getPendingInvoice / deletePendingInvoice: legacy
@@ -720,9 +722,40 @@ exports.saveInvoice = onCall(
       }
 
       const distName = normalizeDistributorName(safeInvoice.distributor);
+
+      // ── Server-side compound-key duplicate guard (HARD BLOCK) ────────────
+      // The invoice doc stores the NORMALIZED distributor name as distributorId
+      // (the same normalization the medicine docs use), so re-saving the same
+      // invoice — even from a different upload/queue item — is caught by the
+      // (distributorId, invoiceNumber) compound key before any write lands.
+      // This is the enforcement layer; the client-side pHash check is only a
+      // soft UX warning at upload time and is NOT enforcement. Skipped when
+      // either half of the key is empty (no number / no distributor means we
+      // cannot dedupe safely).
+      const invoiceNumber = safeInvoice.invoiceNumber || "";
+      if (distName && invoiceNumber) {
+        const dupSnap = await db
+          .collection("pharmacies")
+          .doc(pharmacyId)
+          .collection("invoices")
+          .where("distributorId", "==", distName)
+          .where("invoiceNumber", "==", invoiceNumber)
+          .limit(1)
+          .get();
+        if (!dupSnap.empty) {
+          const dup = dupSnap.docs[0];
+          const dupData = dup.data();
+          throw new HttpsError(
+            "already-exists",
+            `Invoice ${invoiceNumber} from ${dupData.distributor || distName} was already saved (${dup.id}).`
+          );
+        }
+      }
+
       const invoiceRef = await db.collection("pharmacies").doc(pharmacyId).collection("invoices").add({
         distributor: distName,
-        invoiceNumber: safeInvoice.invoiceNumber || "",
+        distributorId: distName,
+        invoiceNumber,
         invoiceDate: safeInvoice.invoiceDate || "",
         invoiceTotal: safeInvoice.invoiceTotal || 0,
         invoiceSummary: safeInvoice.invoiceSummary || {},
@@ -815,6 +848,10 @@ exports.saveInvoice = onCall(
           logger.warn("[saveInvoice] Could not revert queue status after failure:", queueErr.message);
         }
       }
+      // Surface the original code (not-found / failed-precondition /
+      // already-exists) to the caller instead of collapsing everything to
+      // "internal".
+      if (err instanceof HttpsError) throw err;
       throw new HttpsError("internal", "Failed to save: " + err.message);
     }
   }
@@ -1424,6 +1461,7 @@ exports.scheduledCleanup = onSchedule(
     }
   }
 );
+
 
 
 
