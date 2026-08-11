@@ -94,6 +94,10 @@ let reviewSession = {
 let importQueue = [];
 let importQueueCursor = 0;
 let importQueueBusy = false;
+// True only while a live upload batch is running (advanceImportQueue keeps
+// chaining review modals). On a resume-from-disk load this stays false so the
+// app lands on Home with the queue list and never auto-opens review modals.
+let importQueueAuto = false;
 
 // ─── DOM Helpers ──────────────────────────────────────────────────────────────
 
@@ -524,21 +528,17 @@ function openReviewPanel(extracted) {
   // Arithmetic check
   recalculate();
 
-  // Reject button
+  // Reject button — permanent discard: deletes the queue doc + raw image.
   $("btn-review-reject").onclick = async () => {
     panel.classList.add("hidden");
-    const pathsToDelete = reviewSession.storagePaths;
     const qid = reviewSession.queueId;
+    // Pending-invoice reviews have no queueId — clean up their page images here.
+    const pathsToDelete = qid ? [] : reviewSession.storagePaths;
     revokeReviewSession();
     showToast("Invoice discarded", "warning");
-    // Mark the queue item rejected (terminal) so a resume never reprocesses it.
     if (qid) {
-      try {
-                    await mutateImportQueue("update", qid, { status: "rejected" });
-      } catch (_) {}
-    }
-    // Delete raw files
-    if (pathsToDelete && pathsToDelete.length > 0) {
+      await discardQueueItem(qid, { silent: true });
+    } else if (pathsToDelete && pathsToDelete.length > 0) {
       for (const p of pathsToDelete) {
         try { await deleteObject(ref(storage, p)); } catch (_) {}
       }
@@ -911,10 +911,18 @@ async function confirmAndSave(originalExtracted) {
 
     showLoadingOverlay(false);
     panel.classList.add("hidden");
-    // If this review came from a staged (partial) invoice, remove the staging
-    // doc so it no longer shows in the "waiting" widget.
+    // Remove the saved item from the local queue (its queue doc + image were
+    // already cleaned up server-side by saveInvoice), so the list never shows a
+    // stale "Ready for review" after a successful save.
+    const qid = reviewSession.queueId;
     const stagedNumber = reviewSession.pendingInvoiceNumber;
     revokeReviewSession();
+    if (qid) {
+      importQueue = importQueue.filter((i) => i.imageId !== qid);
+      if (importQueueCursor >= importQueue.length) {
+        importQueueCursor = Math.max(0, importQueue.length - 1);
+      }
+    }
     if (stagedNumber) {
       try {
         const delFn = httpsCallable(functions, "deletePendingInvoice", { timeout: 30000 });
@@ -1181,10 +1189,11 @@ function subscribeDistributors() {
   );
 }
 
-// ─── Pending Invoices (Staging, live) ───────────────────────────────────────
-// Subscribes directly to /pharmacies/{id}/pending_invoices — the same
-// collection ingestPageToPending CF stages/merges — so the widget updates the
-// instant a page is buffered or an invoice is merged away.
+// ─── Pending Invoices (Staging, legacy) ─────────────────────────────────────
+// Legacy widget kept for backward compatibility. The extraction pipeline no
+// longer writes to pending_invoices (every image now goes straight to the
+// import queue as "extracted"), so this subscription simply shows an empty
+// list unless older staged invoices still exist in the collection.
 
 let pendingUnsub = null;
 
@@ -1492,6 +1501,7 @@ async function handleMultipleFilesSelected(entries) {
   console.log("[handleMultipleFilesSelected] Batch complete, successful:", items.length);
   if (items.length > 0) {
     importQueue.push(...items);
+    importQueueAuto = true;
     renderImportQueueStatus();
     startImportQueue();
   }
@@ -1523,9 +1533,14 @@ async function processNextQueueItem() {
   renderImportQueueStatus();
 }
 
-// User confirmed/rejected the current review — move to the next queue item.
+// Move on from a finished/saved/discarded item. In a live upload batch this
+// chains straight into the next review; on a resume-from-disk load it just
+// refreshes the queue list so the user can tap each item explicitly.
 function advanceImportQueue() {
-  importQueueCursor++;
+  if (!importQueueAuto) {
+    renderImportQueueStatus();
+    return;
+  }
   startImportQueue();
 }
 
@@ -1562,6 +1577,7 @@ async function processQueueItem(item) {
         }
         // User chose to override — proceed to review
       }
+      item.extracted = extracted;
       await openQueueReview(item, extracted);
       return "awaiting-review";
     }
@@ -1619,6 +1635,7 @@ async function processQueueItem(item) {
       }
       // User chose to override — proceed to review
     }
+    item.extracted = extracted;
     await openQueueReview(item, extracted);
     return "awaiting-review";
   }
@@ -1686,7 +1703,9 @@ async function openQueueReview(item, extracted) {
 }
 
 // On page load, pick up any queue item that never reached a terminal state and
-// resume processing automatically (persisted import queue = crash safety).
+// show it in the queue list on Home. Unlike a live upload batch, this does NOT
+// auto-process or auto-open review modals — the user taps Review/Discard per
+// item explicitly (persisted import queue = crash safety without modal ambush).
 async function resumeImportQueue() {
   if (!currentUser || !currentPharmacyId) return;
   try {
@@ -1708,14 +1727,16 @@ async function resumeImportQueue() {
         pollCount: 0,
         pdfPageNumber: dta.pdfPageNumber || null,
         pdfTotalPages: dta.pdfTotalPages || null,
+        extracted: dta.extracted || null,
+        pHash: dta.pHash || null,
       };
     });
     if (items.length > 0) {
       importQueue = items;
       importQueueCursor = 0;
+      importQueueAuto = false;
       renderImportQueueStatus();
-      showToast(`Resuming ${items.length} pending import(s)...`, "info");
-      startImportQueue();
+      showToast(`${items.length} pending import(s) in queue — review or discard below.`, "info");
     }
   } catch (err) {
     console.error("[resumeImportQueue] ERROR:", err.code, err.message, err);
@@ -1763,6 +1784,18 @@ function renderImportQueueStatus() {
       reviewed: "bg-slate-500/15 text-slate-400",
       "ingested-partial": "bg-amber-500/15 text-amber-400",
     }[qs] || "bg-slate-500/15 text-slate-400";
+
+    // Review opens (or re-extracts) the item; Discard permanently deletes it.
+    const showReview = ["uploaded", "processing", "saving", "extracted"].includes(qs);
+    const showDiscard = !["saved", "reviewed", "ingested", "rejected"].includes(qs);
+    let actions = "";
+    if (showReview || showDiscard) {
+      actions = `<div class="flex gap-1.5 shrink-0">
+        ${showReview ? `<button onclick="window.reviewQueueItem('${item.imageId}')" class="text-[9px] px-2 py-1 bg-indigo-500/15 border border-indigo-500/30 text-indigo-300 hover:bg-indigo-500/30 rounded-md font-bold transition-all">Review</button>` : ""}
+        ${showDiscard ? `<button onclick="window.discardQueueItem('${item.imageId}')" class="text-[9px] px-2 py-1 bg-slate-800 border border-slate-700 text-slate-400 hover:text-rose-400 hover:border-rose-500/30 rounded-md font-bold transition-all">Discard</button>` : ""}
+      </div>`;
+    }
+
     return `<div class="flex justify-between items-center gap-2 px-3 py-1.5 rounded-lg ${
       current ? "bg-slate-800/80 border border-indigo-500/40" : "bg-slate-900/60 border border-slate-800"
     }">
@@ -1771,9 +1804,86 @@ function renderImportQueueStatus() {
         <p class="text-[9px] text-slate-500 truncate">${esc(item.storagePath)}</p>
       </div>
       <span class="text-[9px] px-1.5 py-0.5 rounded font-bold shrink-0 ${badgeClass}">${label}</span>
+      ${actions}
     </div>`;
   }).join("");
 }
+
+// Explicit per-item Review action (queue list). Extracted items open the review
+// panel directly; queued/processing items are run through the extraction
+// pipeline first, then the review panel opens when they're ready.
+window.reviewQueueItem = async (imageId) => {
+  const item = importQueue.find((i) => i.imageId === imageId);
+  if (!item) return;
+
+  if (item.status === "extracted") {
+    let extracted = item.extracted;
+    if (!extracted) {
+      try {
+        const qSnap = await getDoc(queueItemRef(imageId));
+        if (qSnap.exists) {
+          extracted = qSnap.data().extracted || null;
+          item.extracted = extracted;
+        }
+      } catch (_) {}
+    }
+    if (!extracted) {
+      showToast("No extracted data for this item yet.", "error");
+      return;
+    }
+    await openQueueReview(item, extracted);
+    return;
+  }
+
+  if (["uploaded", "processing", "saving"].includes(item.status)) {
+    showLoadingOverlay(true, "Extracting invoice…");
+    try {
+      let outcome = "retry";
+      let attempts = 0;
+      while (outcome === "retry" && attempts < 20) {
+        outcome = await processQueueItem(item);
+        attempts++;
+        renderImportQueueStatus();
+      }
+      if (outcome === "done" && !["ingested", "ingested-partial", "failed"].includes(item.status)) {
+        showToast(`Item is ${item.status}.`, "info");
+      }
+    } catch (err) {
+      console.error("[reviewQueueItem] failed:", err);
+      showToast("Processing failed: " + err.message, "error");
+    } finally {
+      showLoadingOverlay(false);
+    }
+    return;
+  }
+
+  showToast(`Nothing to review — item is ${item.status}.`, "info");
+};
+
+// Explicit per-item Discard action (queue list). Deletes the queue doc and the
+// raw Storage image via the discardQueueItem callable.
+window.discardQueueItem = async (imageId, opts = {}) => {
+  const item = importQueue.find((i) => i.imageId === imageId) || null;
+  const label = item ? (item.fileName || item.imageId) : imageId;
+  if (!opts.silent && !confirm(`Discard "${label}"? The uploaded image will be permanently deleted.`)) return;
+
+  showLoadingOverlay(true, "Discarding…");
+  try {
+    const fn = httpsCallable(functions, "discardQueueItem", { timeout: 30000 });
+    await fn({ pharmacyId: currentPharmacyId, docId: imageId });
+    importQueue = importQueue.filter((i) => i.imageId !== imageId);
+    if (importQueueCursor >= importQueue.length) {
+      importQueueCursor = Math.max(0, importQueue.length - 1);
+    }
+    renderImportQueueStatus();
+    if (!opts.silent) showToast("Discarded.", "warning");
+  } catch (err) {
+    console.error("[discardQueueItem] failed:", err.code, err.message, err);
+    showToast("Discard failed: " + (err.message || err), "error");
+  } finally {
+    showLoadingOverlay(false);
+  }
+};
 
 function updateReviewVisualSource() {
   const imgEl = $("review-invoice-img");

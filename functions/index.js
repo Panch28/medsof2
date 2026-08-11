@@ -8,21 +8,25 @@
  *   structured data. Deterministic GST enforcement runs server-side.
  * - processImportQueueItem: The resilient bulk-import worker. Claims an item
  *   from /pharmacies/{id}/importQueue/{imageId} (leased, resumable), downloads
- *   the raw file, runs the shared Gemini pipeline, and routes the result:
- *     * Partial (no footer totals / page N of M, N<M)  → pending_invoices
- *     * Full single-page invoice                        → status "extracted"
- *   Queue statuses: uploaded → processing → extracted/ingested → saved,
- *   with terminal states reviewed/saved/ingested/failed. Processing resumes on
- *   page load for items in "uploaded"/"extracted"/"processing" (lease expired).
+ *   the raw file, runs the shared Gemini pipeline, and persists the result as
+ *   status "extracted" for human review. Every image is processed as a
+ *   standalone invoice — there is NO cross-page merging/waiting.
+ *   Queue statuses: uploaded → processing → extracted → saved (or rejected /
+ *   discarded). Terminal states: saved/reviewed/ingested/failed/rejected.
+ *   Processing resumes on page load for items in "uploaded"/"extracted"/
+ *   "processing" (lease expired).
  * - saveInvoice: Writes a confirmed invoice + medicine records. When queueId is
- *   supplied it guards against duplicate saves from stale client retries.
- * - ingestExtractedPage: Multi-page staging & auto-merge via structural
- *   pagination ("Page: X of Y").
- * - listPendingInvoices / deletePendingInvoice: staging management.
+ *   supplied it guards against duplicate saves from stale client retries and
+ *   deletes the queue doc + raw Storage image after the write commits.
+ * - discardQueueItem: Staff-authorized permanent discard of a queue item
+ *   (deletes the queue doc + raw Storage image).
+ * - listPendingInvoices / getPendingInvoice / deletePendingInvoice: legacy
+ *   staging management kept for backward compatibility — the extraction
+ *   pipeline no longer writes to pending_invoices.
  * - scheduledCleanup: daily — deletes raw uploads older than 30 days, strips
  *   rawGeminiResponse from old invoices, drops stale pending invoices, recovers
- *   queue items stuck in "processing" with an expired lease, and purges "failed"
- *   queue items older than 7 days.
+ *   queue items stuck in "processing" with an expired lease, and purges
+ *   terminal failed/rejected (>7 days) and ingested (>24h) queue items.
  */
 
 const { onCall, HttpsError } = require("firebase-functions/v2/https");
@@ -471,13 +475,10 @@ async function runGeminiExtraction(imageParts, genAI, hints = null) {
     );
   }
 
-  // ── Partial-page detection ──────────────────────────────────────────────
-  // A single page of a multi-page invoice (no footer totals, or Page X of Y
-  // with X < Y, or a continuation page) CANNOT be validated against the
-  // printed footer totals — they live on the last page. Never surface false
-  // "GST self-check FAILED" mismatches or burn corrective Gemini turns on
-  // incomplete data. All math validation is deferred until ingestExtractedPage
-  // merges the full invoice.
+  // ── Footer-totals detection ────────────────────────────────────────────────
+  // Determines whether the printed financial summary block (Grand Total, GST,
+  // discount rows) appears on THIS image. Purely informational now — every
+  // image is processed standalone, so nothing gates on it.
   const hasFooterTotals =
     parsed.hasFooterTotals !== undefined
       ? parsed.hasFooterTotals
@@ -502,31 +503,18 @@ async function runGeminiExtraction(imageParts, genAI, hints = null) {
   pgNum = Math.max(1, Math.min(pgNum, pgTot));
   pgTot = Math.max(pgNum, pgTot);
 
-  // pgNum > 1 OR pgTot > 1 always implies a multi-page invoice — even when
-  // Gemini omitted totalPages and left a footer page at "1/1", the page index
-  // alone proves staging is required (otherwise that page would bypass the
-  // multi-page flow and be validated against only its own lines).
-  const isPartialPage =
-    pgNum > 1 ||
-    pgTot > 1 ||
-    !hasFooterTotals ||
-    parsed.looksLikeContinuationPage === true;
-
+  // Every image is processed standalone, so the deterministic GST enforcement
+  // below ALWAYS runs against this page's own parsed figures — there is no
+  // multi-page merge to defer validation to.
   logger.info(
-    `[gemini] page ${pgNum}/${pgTot} of ${parsed.invoiceNumber || "?"} — ${
-      isPartialPage ? "PARTIAL (staged for multi-page merge)" : "SINGLE-PAGE (full invoice)"
-    } (footer=${hasFooterTotals}, hints=${
+    `[gemini] page ${pgNum}/${pgTot} of ${parsed.invoiceNumber || "?"} — SINGLE-PAGE (full invoice) (footer=${hasFooterTotals}, hints=${
       hints && Number(hints.pageNumber) >= 1 ? hints.pageNumber + "/" + hints.totalPages : "none"
     })`
   );
 
   let gstIssues = [];
   let gstAttempts = 0;
-  if (isPartialPage) {
-    logger.info(
-      `[gemini] GST validation deferred for page ${pgNum}/${pgTot} until pages are merged.`
-    );
-  } else {
+  {
     // Deterministic GST enforcement: validate the arithmetic ourselves and, if it
     // fails, send Gemini a corrective turn telling it exactly which lines are
     // inconsistent. Gemini's in-prompt self-checks are advisory; this backstop is
@@ -575,9 +563,7 @@ async function runGeminiExtraction(imageParts, genAI, hints = null) {
     pageNumber: pgNum,
     totalPages: pgTot,
     looksLikeContinuationPage: parsed.looksLikeContinuationPage === true || pgNum > 1,
-    gstCheck: isPartialPage
-      ? { pass: true, deferred: true, attempts: 0, issues: [], message: "Validation deferred until all pages are merged." }
-      : { pass: gstIssues.length === 0, attempts: gstAttempts, issues: gstIssues },
+    gstCheck: { pass: gstIssues.length === 0, attempts: gstAttempts, issues: gstIssues },
     rawGeminiResponse: geminiResponse,
   };
 }
@@ -643,6 +629,36 @@ exports.extractInvoice = onCall(
     return sanitizeNumbers(parsed);
   }
 );
+// ─── isStaff ──────────────────────────────────────────────────────────────────
+// Authorizes a caller against the pharmacy's staff registry
+// (pharmacies/{pharmacyId}/staff/{uid}). This app currently ships WITHOUT a
+// staff collection — every existing callable authorizes on request.auth alone —
+// so if the pharmacy has no staff subcollection at all, any signed-in user is
+// treated as staff. Once a staff registry is introduced, this becomes a real
+// membership check with no call-site changes.
+async function isStaff(pharmacyId, uid) {
+  if (!pharmacyId || !uid) return false;
+  const db = getFirestore();
+  try {
+    const staffRef = db
+      .collection("pharmacies")
+      .doc(pharmacyId)
+      .collection("staff")
+      .doc(uid);
+    if ((await staffRef.get()).exists) return true;
+    const anyStaff = await db
+      .collection("pharmacies")
+      .doc(pharmacyId)
+      .collection("staff")
+      .limit(1)
+      .get();
+    return anyStaff.empty; // no staff configured → permissive (matches current auth model)
+  } catch (err) {
+    logger.warn(`[isStaff] membership check failed for ${uid}@${pharmacyId}:`, err.message);
+    return false;
+  }
+}
+
 // ─── saveInvoice ───────────────────────────────────────────────────────────────
 // Client SDK writes fail due to rules/Console mismatch; Admin SDK
 // bypasses rules entirely. This is also more secure (server-side).
@@ -678,6 +694,7 @@ exports.saveInvoice = onCall(
     const queueRef = queueId
       ? db.collection("pharmacies").doc(pharmacyId).collection("importQueue").doc(queueId)
       : null;
+    let queueStoragePath = null;
 
     try {
       // ── Queue guard (idempotency) ────────────────────────────────────────
@@ -687,6 +704,7 @@ exports.saveInvoice = onCall(
           throw new HttpsError("not-found", "Queue item not found: " + queueId);
         }
         const qData = qSnap.data();
+        queueStoragePath = qData.storagePath || null;
         const status = qData.status || "";
         if (["reviewed", "saved", "ingested", "failed"].includes(status)) {
           throw new HttpsError(
@@ -748,15 +766,35 @@ exports.saveInvoice = onCall(
       }
       await batch.commit();
 
-      // Mark the queue item saved (idempotency committed AFTER the write).
+      // ── Queue lifecycle cleanup (AFTER the invoice+medicines write commits) ──
+      // Storage deletes cannot be part of a Firestore transaction, so this runs
+      // post-commit as best-effort: delete the queue doc (idempotency is now
+      // preserved by the doc being gone — a stale retry hits "not-found") and
+      // delete the raw upload so no orphaned image is left behind.
       if (queueRef) {
-        await queueRef.update({
-          status: "saved",
-          savedInvoiceId: invoiceRef.id,
-          confirmedBy: confirmedBy || request.auth.uid,
-          completedAt: FieldValue.serverTimestamp(),
-          updatedAt: FieldValue.serverTimestamp(),
-        });
+        try {
+          await queueRef.delete();
+        } catch (delErr) {
+          logger.warn(`[saveInvoice] Queue doc delete failed (non-fatal): ${delErr.message}`);
+          // Fall back to a terminal "saved" marker so the item is never stuck
+          // in the half-open "saving" state.
+          try {
+            await queueRef.update({
+              status: "saved",
+              savedInvoiceId: invoiceRef.id,
+              confirmedBy: confirmedBy || request.auth.uid,
+              completedAt: FieldValue.serverTimestamp(),
+              updatedAt: FieldValue.serverTimestamp(),
+            });
+          } catch (_) {}
+        }
+        if (queueStoragePath) {
+          try {
+            await getStorage().bucket().file(queueStoragePath).delete();
+          } catch (delErr) {
+            logger.warn(`[saveInvoice] Storage image delete failed (non-fatal): ${delErr.message}`);
+          }
+        }
       }
 
       logger.info(`[saveInvoice] Saved invoice ${invoiceRef.id} with ${safeLineItems.length} items for pharmacy=${pharmacyId}`);
@@ -764,283 +802,87 @@ exports.saveInvoice = onCall(
       return { success: true, invoiceId: invoiceRef.id };
     } catch (err) {
       logger.error("[saveInvoice] Write failed:", err.message);
+      // The queue guard flipped the item to "saving" above; revert it so the
+      // user can retry the save instead of being stuck in a half-open state.
+      if (queueRef) {
+        try {
+          await queueRef.update({
+            status: "extracted",
+            error: { code: "save_failed", message: err.message, at: new Date().toISOString() },
+            updatedAt: FieldValue.serverTimestamp(),
+          });
+        } catch (queueErr) {
+          logger.warn("[saveInvoice] Could not revert queue status after failure:", queueErr.message);
+        }
+      }
       throw new HttpsError("internal", "Failed to save: " + err.message);
     }
   }
 );
-// ─── ingestPageToPending (shared) ───────────────────────────────────────────
-// Multi-page invoice staging & auto-merge via STRUCTURAL PAGINATION. Shared by
-// ingestExtractedPage and processImportQueueItem.
-//
-// Flow:
-// 1. Each page is extracted individually by runGeminiExtraction, which reports
-//    pageNumber / totalPages (from the printed "Page: X of Y") and
-//    hasFooterTotals.
-// 2. This buffers every page into pending_invoices keyed by invoiceNumber.
-// 3. It merges + saves to the invoices collection as soon as the invoice is
-//    COMPLETE: either every page 1..totalPages is buffered, OR the page
-//    carrying the final Grand Total footer summary has arrived (and the
-//    invoice is not a known multi-pager with pages still missing).
-// 4. Incomplete invoices stay staged with status
-//    "Incomplete - Waiting for remaining pages" — they never fail/reject.
-//
-// Returns a discriminated result:
-//   { status: "no-invoice-number", ... }
-//   { status: "staged", pageNumber, pageTotal, pageCount, message }
-//   { status: "merged", invoiceRef, invoiceNumber, footerPage, allLineItems,
-//     effectiveTotal, gstIssues, message }
-async function ingestPageToPending(db, { pharmacyId, extracted, storagePath, uid }) {
-  const invoiceNumber = (extracted.invoiceNumber || "").trim();
-  if (!invoiceNumber) {
-    return {
-      status: "no-invoice-number",
-      message: "invoiceNumber is required for staging (continuation pages must repeat the invoice number from page 1).",
-    };
-  }
+// ─── discardQueueItem ─────────────────────────────────────────────────────────
+// Permanently discards an import queue item: deletes the queue doc AND the raw
+// Storage image. Refuses items that are already saved/merged (terminal) or
+// mid-flight (actively processing / saving), so an image whose extraction is in
+// progress — or whose invoice was already written — is never deleted.
 
-  // Pagination metadata — accept both pageNumber/page_current and
-  // totalPages/page_total namings for forward compatibility.
-  const pageCurrent = Number(extracted.pageNumber ?? extracted.page_current) || 1;
-  const pageTotalIncoming = Number(extracted.totalPages ?? extracted.page_total) || 1;
-  const hasFooter = extracted.hasFooterTotals === true;
-
-  const pendingRef = db
-    .collection("pharmacies")
-    .doc(pharmacyId)
-    .collection("pending_invoices")
-    .doc(invoiceNumber);
-
-  const pageData = {
-    lineItems: sanitizeNumbers(extracted.lineItems || []),
-    distributor: normalizeDistributorName(extracted.distributor || ""),
-    invoiceDate: extracted.invoiceDate || "",
-    pageNumber: pageCurrent,
-    totalPages: pageTotalIncoming,
-    hasFooterTotals: hasFooter,
-    looksLikeContinuationPage: extracted.looksLikeContinuationPage || false,
-    storagePath: storagePath || "",
-    gstCheck: sanitizeNumbers(extracted.gstCheck || {}),
-    invoiceSummary: sanitizeNumbers(extracted.invoiceSummary || {}),
-    extracted: sanitizeNumbers(extracted),
-    uploadedBy: uid,
-    uploadedAt: new Date(),
-  };
-
-  // ── Buffer this page, then decide whether the invoice is complete ───────
-  // Everything happens inside one transaction so concurrent page uploads for
-  // the same invoice cannot both finalize / lose a page.
-  let txResult;
-  await db.runTransaction(async (tx) => {
-    const doc = await tx.get(pendingRef);
-    const base = doc.exists ? doc.data() : {};
-    const existingPages = (base && base.pages) || [];
-
-    // Dedupe: replace a re-uploaded page with the same number/path, but keep
-    // all other pages so arrival order never matters.
-    const deduped = [
-      ...existingPages.filter(
-        (p) => Number(p.pageNumber) !== pageCurrent && p.storagePath !== storagePath
-      ),
-      pageData,
-    ].sort((a, b) => (Number(a.pageNumber) || 0) - (Number(b.pageNumber) || 0));
-
-    // Effective total = highest totalPages any buffered page reports.
-    const effectiveTotal = Math.max(
-      pageTotalIncoming,
-      ...deduped.map((p) => Number(p.totalPages) || 1)
-    );
-
-    // Completeness signals.
-    const present = new Set(
-      deduped.map((p) => Number(p.pageNumber)).filter((n) => n >= 1)
-    );
-    let allPagesPresent = true;
-    for (let i = 1; i <= effectiveTotal; i++) {
-      if (!present.has(i)) {
-        allPagesPresent = false;
-        break;
-      }
-    }
-    const hasFooterAny = deduped.some((p) => p.hasFooterTotals);
-    const isMultiPageClaim = effectiveTotal >= 2;
-
-    // Complete when we possess every page 1..totalPages, OR when the Grand
-    // Total footer page is present and the invoice is NOT a known multi-pager
-    // still missing pages (avoids premature merge on out-of-order uploads).
-    const complete = allPagesPresent || (hasFooterAny && !isMultiPageClaim);
-
-    if (!complete) {
-      tx.set(
-        pendingRef,
-        {
-          invoiceNumber,
-          distributor: normalizeDistributorName(extracted.distributor || base.distributor || ""),
-          invoiceDate: extracted.invoiceDate || base.invoiceDate || "",
-          tenantId: pharmacyId,
-          pages: deduped,
-          status: "Incomplete - Waiting for remaining pages",
-          createdAt: base.createdAt || FieldValue.serverTimestamp(),
-          updatedAt: FieldValue.serverTimestamp(),
-        },
-        { merge: true }
-      );
-      txResult = { complete: false, effectiveTotal, pageCount: deduped.length };
-      return;
-    }
-
-    // ── Invoice complete — merge pages in page order and save ─────────────
-    const footerPage =
-      deduped.find((p) => p.hasFooterTotals) || deduped[deduped.length - 1];
-    const allLineItems = deduped.flatMap((p) => p.lineItems || []);
-    const summary = footerPage.invoiceSummary || extracted.invoiceSummary || {};
-    const firstPage = deduped[0] || {};
-
-    const merged = {
-      distributor: normalizeDistributorName(footerPage.distributor || firstPage.distributor || ""),
-      invoiceNumber,
-      invoiceDate: footerPage.invoiceDate || firstPage.invoiceDate || "",
-      invoiceTotal: summary.grandTotal || 0,
-      invoiceSummary: summary,
-      lineItems: allLineItems,
-      captureQuality: footerPage.extracted?.captureQuality || {},
-      rawGeminiResponse: footerPage.extracted?.rawGeminiResponse || "",
-      hasFooterTotals: true,
-      pageNumber: footerPage.pageNumber || effectiveTotal,
-      totalPages: effectiveTotal,
-      looksLikeContinuationPage: false,
-      mergedFromPages: deduped.length,
-    };
-
-    // Deterministic GST validation on the merged record.
-    const gstIssues = checkGstConsistency(merged);
-    merged.gstCheck = { pass: gstIssues.length === 0, attempts: 1, issues: gstIssues };
-
-    const invoiceRef = db
-      .collection("pharmacies")
-      .doc(pharmacyId)
-      .collection("invoices")
-      .doc();
-    tx.set(invoiceRef, {
-      distributor: merged.distributor,
-      invoiceNumber: merged.invoiceNumber,
-      invoiceDate: merged.invoiceDate,
-      invoiceTotal: merged.invoiceTotal,
-      invoiceSummary: merged.invoiceSummary,
-      lineItems: merged.lineItems,
-      captureQuality: merged.captureQuality,
-      gstCheck: merged.gstCheck,
-      rawGeminiResponse: merged.rawGeminiResponse,
-      pHash: (footerPage.extracted && footerPage.extracted.pHash) || null,
-      mergedFromPages: merged.mergedFromPages,
-      confirmedBy: uid,
-      confirmedAt: FieldValue.serverTimestamp(),
-      createdAt: FieldValue.serverTimestamp(),
-    });
-
-    for (const item of allLineItems) {
-      if (!item.medicineName) continue;
-      const medRef = db
-        .collection("pharmacies")
-        .doc(pharmacyId)
-        .collection("medicines")
-        .doc();
-      tx.set(medRef, {
-        medicineName: item.medicineName,
-        batchNumber: item.batchNumber || "",
-        expiryDate: item.expiryDate || "",
-        quantityBilled: item.quantityBilled || 0,
-        quantityFree: item.quantityFree || 0,
-        unitPrice: item.unitPrice || 0,
-        cdPercent: item.cdPercent || 0,
-        taxableValue: item.taxableValue || 0,
-        cdValue: item.cdValue || 0,
-        netValue: item.netValue || 0,
-        gstRate: item.gstRate || 0,
-        gstValue: item.gstValue || 0,
-        remainingQty: (item.quantityBilled || 0) + (item.quantityFree || 0),
-        distributor: merged.distributor,
-        invoiceId: invoiceRef.id,
-        invoiceNumber: merged.invoiceNumber || "",
-        distributorId: normalizeDistributorName(merged.distributor || ""),
-        invoiceDate: merged.invoiceDate || "",
-        pharmacyId,
-        createdAt: FieldValue.serverTimestamp(),
-        updatedAt: FieldValue.serverTimestamp(),
-      });
-    }
-
-    tx.delete(pendingRef);
-
-    txResult = {
-      complete: true,
-      effectiveTotal,
-      invoiceRef,
-      allLineItems,
-      footerPage,
-      gstIssues,
-    };
-  });
-
-  if (!txResult.complete) {
-    logger.info(
-      `[ingestPageToPending] staged page ${pageCurrent}/${txResult.effectiveTotal} for invoice ${invoiceNumber} (${(extracted.lineItems || []).length} items, ${txResult.pageCount} buffered)`
-    );
-    return {
-      status: "staged",
-      invoiceNumber,
-      pageNumber: pageCurrent,
-      pageTotal: txResult.effectiveTotal,
-      pageCount: txResult.pageCount,
-      message: `Page ${pageCurrent} of ${txResult.effectiveTotal} saved. Incomplete - Waiting for remaining pages.`,
-    };
-  }
-
-  logger.info(
-    `[ingestPageToPending] merged & saved invoice ${invoiceNumber} → ${txResult.invoiceRef.id} (${txResult.allLineItems.length} items from ${txResult.effectiveTotal} pages)`
-  );
-  return {
-    status: "merged",
-    invoiceId: txResult.invoiceRef.id,
-    invoiceNumber,
-    pageNumber: txResult.footerPage.pageNumber || txResult.effectiveTotal,
-    pageTotal: txResult.effectiveTotal,
-    totalItems: txResult.allLineItems.length,
-    totalPages: txResult.effectiveTotal,
-    gstPass: txResult.gstIssues.length === 0,
-    gstIssues: txResult.gstIssues,
-    message: `Invoice merged from ${txResult.effectiveTotal} page(s) (${txResult.allLineItems.length} items) and saved.`,
-  };
-}
-
-// ─── ingestExtractedPage ─────────────────────────────────────────────────────
-
-exports.ingestExtractedPage = onCall(
+exports.discardQueueItem = onCall(
   {
     region: "us-central1",
-    memory: "256MiB",
-    timeoutSeconds: 60,
+    memory: "128MiB",
+    timeoutSeconds: 30,
   },
   async (request) => {
     if (!request.auth) {
       throw new HttpsError("unauthenticated", "Login required.");
     }
-
-    const { extracted, storagePath, pharmacyId } = request.data;
-    if (!extracted) throw new HttpsError("invalid-argument", "extracted data is required");
-    if (!pharmacyId) throw new HttpsError("invalid-argument", "pharmacyId is required");
+    const { pharmacyId, docId } = request.data || {};
+    if (!pharmacyId || !docId) {
+      throw new HttpsError("invalid-argument", "pharmacyId and docId are required.");
+    }
+    if (!(await isStaff(pharmacyId, request.auth.uid))) {
+      throw new HttpsError("permission-denied", "You are not staff for this pharmacy.");
+    }
 
     const db = getFirestore();
-    const result = await ingestPageToPending(db, {
-      pharmacyId,
-      extracted,
-      storagePath: storagePath || "",
-      uid: request.auth.uid,
-    });
+    const queueRef = db
+      .collection("pharmacies")
+      .doc(pharmacyId)
+      .collection("importQueue")
+      .doc(docId);
 
-    if (result.status === "no-invoice-number") {
-      throw new HttpsError("invalid-argument", result.message);
+    const snap = await queueRef.get();
+    if (!snap.exists) {
+      return { success: true, alreadyGone: true };
     }
-    return result;
+    const data = snap.data();
+    const status = data.status || "";
+    if (["saved", "reviewed", "ingested", "saving"].includes(status)) {
+      throw new HttpsError(
+        "failed-precondition",
+        `Queue item is ${status}; it cannot be discarded.`
+      );
+    }
+    if (status === "processing") {
+      const leaseExpiresAt = Number(data.leaseExpiresAt) || 0;
+      if (leaseExpiresAt > Date.now()) {
+        throw new HttpsError(
+          "failed-precondition",
+          "This item is currently being processed; try again in a moment."
+        );
+      }
+    }
+
+    await queueRef.delete();
+    const storagePath = data.storagePath || "";
+    if (storagePath) {
+      try {
+        await getStorage().bucket().file(storagePath).delete();
+      } catch (delErr) {
+        logger.warn(`[discardQueueItem] Storage delete failed (non-fatal): ${delErr.message}`);
+      }
+    }
+    logger.info(`[discardQueueItem] ${pharmacyId}/importQueue/${docId} discarded by ${request.auth.uid}`);
+    return { success: true, discarded: docId };
   }
 );
 // ─── processImportQueueItem ───────────────────────────────────────────────────
@@ -1049,11 +891,16 @@ exports.ingestExtractedPage = onCall(
 // Queue contract (documented in the frontend too):
 //   status: "uploaded" (raw file persisted, nothing else) →
 //           "processing" (leased claim by a worker) →
-//           "extracted" (full single-page invoice, raw result stored for
-//                        review) | "ingested" (multi-page invoice merged &
-//                        saved) | "ingested-partial" (page staged) →
+//           "extracted" (invoice parsed, raw result stored for review) →
 //           "saved" (user confirmed via saveInvoice)
 //   Terminal states: "saved", "reviewed", "ingested", "failed", "rejected".
+//   ("ingested"/"ingested-partial" are legacy statuses from the removed
+//   multi-page staging flow; existing docs with them still render in the UI
+//   so they can be discarded, but new items never reach them.)
+//
+// Every image is processed as a standalone invoice: whatever line items /
+// totals / GST appear on that image are used directly. No cross-page
+// grouping, no waiting for a footer-totals page.
 //
 // Crash-safety: a worker that dies mid-extraction leaves status "processing"
 // with a leaseExpiresAt; once that lease expires the item is claimable again
@@ -1112,6 +959,10 @@ exports.processImportQueueItem = onCall(
           }
           // Expired lease (crashed worker) — reclaim it.
           logger.warn(`[processImportQueueItem] reclaiming ${imageId}: lease expired, status was "processing"`);
+        }
+        if (status === "saving") {
+          // Another invocation is mid-save; never re-claim/re-extract it.
+          return { claimed: false, busy: true, data };
         }
         const claimAttempts = Number(data.claimAttempts) || 0;
         tx.update(queueRef, {
@@ -1201,39 +1052,9 @@ exports.processImportQueueItem = onCall(
     }
 
     // ── 4. Route the result ────────────────────────────────────────────────
-    const isPartial =
-      extracted.pageNumber > 1 ||
-      extracted.totalPages > 1 ||
-      !extracted.hasFooterTotals ||
-      extracted.looksLikeContinuationPage === true;
-
-    if (isPartial) {
-      // Page of a multi-page invoice → stage in pending_invoices; the merge is
-      // handled by ingestPageToPending when the final page arrives.
-      const ingestResult = await ingestPageToPending(db, {
-        pharmacyId,
-        extracted,
-        storagePath,
-        uid: request.auth.uid,
-      });
-      if (ingestResult.status === "no-invoice-number") {
-        return await markFailed("missing_invoice_number", ingestResult.message);
-      }
-      const queueStatus = ingestResult.status === "merged" ? "ingested" : "ingested-partial";
-      await queueRef.update({
-        status: queueStatus,
-        extracted,
-        ingestResult,
-        completedAt: FieldValue.serverTimestamp(),
-        leaseExpiresAt: FieldValue.delete(),
-        updatedAt: FieldValue.serverTimestamp(),
-      });
-      logger.info(`[processImportQueueItem] ${imageId} → ${queueStatus} (invoice ${ingestResult.invoiceNumber || "?"})`);
-      return { status: queueStatus, ...ingestResult };
-    }
-
-    // Full single-page invoice → persist raw result for review; the client
-    // (or a future review screen) calls saveInvoice with queueId to confirm.
+    // Every image is a standalone invoice: persist whatever Gemini parsed from
+    // THIS image (line items, totals, GST) straight to "extracted" for review.
+    // No cross-page merging, no waiting for a footer-totals page.
     await queueRef.update({
       status: "extracted",
       extracted,
@@ -1539,25 +1360,64 @@ exports.scheduledCleanup = onSchedule(
         console.error("Cleanup import queue error:", queueErr.message);
       }
 
-      // Purge "failed" importQueue items older than 7 days (terminal, no retry).
+      // Purge terminal "failed" / "rejected" importQueue items older than 7
+      // days (no retry/review, so the doc and raw image are no longer needed).
       try {
         const failedCutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
         const failedSnap = await db
           .collectionGroup("importQueue")
-          .where("status", "==", "failed")
+          .where("status", "in", ["failed", "rejected"])
           .where("updatedAt", "<=", failedCutoff)
           .limit(200)
           .get();
         let failedPurged = 0;
         for (const doc of failedSnap.docs) {
+          const storagePath = doc.data().storagePath || "";
           await doc.ref.delete();
+          if (storagePath) {
+            try {
+              await bucket.file(storagePath).delete();
+            } catch (imgErr) {
+              console.warn(`Cleanup: could not delete queue image ${storagePath}: ${imgErr.message}`);
+            }
+          }
           failedPurged++;
         }
         if (failedPurged > 0) {
-          console.log(`Cleanup: purged ${failedPurged} old failed import queue item(s).`);
+          console.log(`Cleanup: purged ${failedPurged} old failed/rejected import queue item(s).`);
         }
       } catch (failedErr) {
         console.error("Cleanup failed-queue error:", failedErr.message);
+      }
+
+      // Purge "ingested" importQueue items older than 24h — their invoice was
+      // auto-merged & saved, so the queue doc and raw image are no longer needed.
+      try {
+        const ingestedCutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+        const ingestedSnap = await db
+          .collectionGroup("importQueue")
+          .where("status", "==", "ingested")
+          .where("updatedAt", "<=", ingestedCutoff)
+          .limit(200)
+          .get();
+        let ingestedPurged = 0;
+        for (const doc of ingestedSnap.docs) {
+          const storagePath = doc.data().storagePath || "";
+          await doc.ref.delete();
+          if (storagePath) {
+            try {
+              await bucket.file(storagePath).delete();
+            } catch (imgErr) {
+              console.warn(`Cleanup: could not delete ingested image ${storagePath}: ${imgErr.message}`);
+            }
+          }
+          ingestedPurged++;
+        }
+        if (ingestedPurged > 0) {
+          console.log(`Cleanup: purged ${ingestedPurged} ingested import queue item(s).`);
+        }
+      } catch (ingestedErr) {
+        console.error("Cleanup ingested-queue error:", ingestedErr.message);
       }
     } catch (err) {
       console.error("Cleanup error:", err);
