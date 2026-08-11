@@ -3,12 +3,17 @@
  *
  * Flow:
  * 1. Phone OTP auth (Firebase Auth)
- * 2. File selection (camera/gallery/PDF) — one at a time
- * 3. Local quality filter (blur variance via canvas, exposure check, PDF text layer)
- * 4. Upload raw file to Storage → call extractInvoice CF synchronously
- * 5. If captureQuality.readable = false → show reupload prompt
- * 6. If readable → Review screen: image + editable fields, confidence highlights, arithmetic check
- * 7. Confirm & Save → write Firestore medicines + invoice docs → delete raw file
+ * 2. File selection (camera/gallery/PDF) — single or batch
+ * 3. Each raw file is uploaded to Storage and immediately recorded in the
+ *    persisted import queue at /pharmacies/{id}/importQueue/{imageId} with
+ *    status "uploaded" BEFORE any AI work (browser close is now safe).
+ * 4. processImportQueueItem CF extracts each item (leased, resumable, Gemini
+ *    only — no local OCR). Multi-page pages are staged & merged server-side.
+ * 5. Full invoices open the Review screen: image + editable fields, confidence
+ *    highlights, arithmetic check → Confirm & Save → saveInvoice CF writes
+ *    Firestore medicines + invoice docs and marks the queue item "saved".
+ * 6. On page load, resumeImportQueue() re-processes any item whose status is
+ *    not yet terminal (uploaded / processing / extracted / ingested-partial).
  */
 
 import { firebaseConfig } from "./firebaseConfig.js";
@@ -24,12 +29,23 @@ import {
   getFirestore,
   collection,
   getDocs,
+  doc,
+  getDoc,
+  setDoc,
+  updateDoc,
+  query,
+  where,
+  onSnapshot,
+  orderBy,
+  limit,
+  serverTimestamp,
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
 import {
   getStorage,
   ref,
   uploadBytes,
   deleteObject,
+  getDownloadURL,
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-storage.js";
 import {
   getFunctions,
@@ -69,13 +85,15 @@ let reviewSession = {
   currentPageIndex: 0,
   fileType: 'image',
   extracted: null,
+  queueId: null,
+  pendingInvoiceNumber: null,
 };
 
-// Triage and queue variables
-let triageFiles = []; // Array of { id, file, objectUrl, text, invoiceNo, pageNum, totalPages }
-let triageGroups = []; // Array of { id, invoiceNo, files: [triageFileId, ...] }
-let reviewQueue = []; // Queue of { storagePaths: string[], objectUrls: string[], extracted: parsedGeminiResult }
-let reviewQueueIndex = 0;
+// Import queue state (persisted queue drives bulk import; see
+// "Import Queue (persisted, resumable)" section below).
+let importQueue = [];
+let importQueueCursor = 0;
+let importQueueBusy = false;
 
 // ─── DOM Helpers ──────────────────────────────────────────────────────────────
 
@@ -215,8 +233,10 @@ function initApp() {
   initNavTabs();
   initThemeToggle();
   initUploadHandlers();
-  loadExpiringMedicines();
-  loadDistributors();
+  subscribeExpiringMedicines();
+  subscribeDistributors();
+  subscribePendingInvoices();
+  resumeImportQueue();
 }
 
 // ─── Nav Tabs ─────────────────────────────────────────────────────────────────
@@ -245,84 +265,6 @@ function initNavTabs() {
 function initThemeToggle() {
   $("theme-toggle")?.addEventListener("click", () => {
     document.documentElement.classList.toggle("dark");
-  });
-}
-
-// ─── Quality Filter (local, no AI) ───────────────────────────────────────────
-
-/**
- * Returns { pass: bool, blurVariance: number, luminance: number, issues: string[] }
- * For images: checks Laplacian variance (blur) and mean luminance (exposure).
- * For PDFs: checks if the PDF has a text layer (not a scanned image PDF).
- */
-async function runQualityFilter(file) {
-  const issues = [];
-
-  if (file.type === "application/pdf") {
-    // For PDF: try to read text content. We use a simple heuristic —
-    // if the file is < 10 KB it likely has no real content.
-    // A more robust check would use PDF.js but that adds overhead.
-    // We'll pass PDFs and let Gemini judge readability.
-    return { pass: true, blurVariance: 999, luminance: 128, issues: [] };
-  }
-
-  // Image: draw onto canvas and run pixel analysis
-  return new Promise((resolve) => {
-    const img = new Image();
-    const url = URL.createObjectURL(file);
-    img.onload = () => {
-      URL.revokeObjectURL(url);
-      const canvas = document.createElement("canvas");
-      // Downsample for speed
-      const maxDim = 400;
-      const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
-      canvas.width = Math.floor(img.width * scale);
-      canvas.height = Math.floor(img.height * scale);
-      const ctx = canvas.getContext("2d");
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      const { data } = ctx.getImageData(0, 0, canvas.width, canvas.height);
-
-      // Compute grayscale values
-      const gray = [];
-      let sumLum = 0;
-      for (let i = 0; i < data.length; i += 4) {
-        const g = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-        gray.push(g);
-        sumLum += g;
-      }
-      const meanLum = sumLum / gray.length;
-
-      // Laplacian variance (blur detection)
-      // Simplified: variance of pixel-to-pixel differences
-      let diffSum = 0;
-      for (let i = 1; i < gray.length; i++) {
-        const d = gray[i] - gray[i - 1];
-        diffSum += d * d;
-      }
-      const blurVariance = diffSum / gray.length;
-
-      // Thresholds (relaxed to always pass)
-      const BLUR_THRESHOLD = 0;   // below this → too blurry
-      const MIN_LUM = 0;          // below this → too dark
-      const MAX_LUM = 255;         // above this → overexposed
-
-      if (blurVariance < BLUR_THRESHOLD) {
-        issues.push(`Image is too blurry (variance ${blurVariance.toFixed(1)}, need ≥${BLUR_THRESHOLD})`);
-      }
-      if (meanLum < MIN_LUM) {
-        issues.push(`Image is too dark (luminance ${meanLum.toFixed(1)}, need ≥${MIN_LUM})`);
-      }
-      if (meanLum > MAX_LUM) {
-        issues.push(`Image is overexposed (luminance ${meanLum.toFixed(1)}, need ≤${MAX_LUM})`);
-      }
-
-      resolve({ pass: issues.length === 0, blurVariance, luminance: meanLum, issues });
-    };
-    img.onerror = () => {
-      URL.revokeObjectURL(url);
-      resolve({ pass: false, blurVariance: 0, luminance: 0, issues: ["Could not decode image."] });
-    };
-    img.src = url;
   });
 }
 
@@ -433,93 +375,23 @@ function stopCamera() {
 // ─── Core Pipeline ────────────────────────────────────────────────────────────
 
 async function handleFileSelected(file) {
-  // Show precheck panel
-  const precheckPanel = $("precheck-feedback-panel");
-  precheckPanel.classList.remove("hidden");
-  $("precheck-status-msg").textContent = "Running quality checks...";
-  $("precheck-status-msg").className = "text-xs font-semibold py-1.5 px-3 rounded text-center text-slate-400";
-  $("precheck-blur-val").textContent = "Calculating...";
-  $("precheck-exposure-val").textContent = "Calculating...";
-  $("precheck-blur-bar").style.width = "0%";
-  $("precheck-exposure-bar").style.width = "0%";
-
-  // Run local quality filter
-  const qc = await runQualityFilter(file);
-
-  // Update UI with results
-  $("precheck-blur-val").textContent = qc.blurVariance.toFixed(1);
-  $("precheck-exposure-val").textContent = qc.luminance.toFixed(1);
-  $("precheck-blur-bar").style.width = Math.min(100, (qc.blurVariance / 200) * 100) + "%";
-  $("precheck-blur-bar").className = "h-full transition-all duration-300 " + (qc.blurVariance >= 30 ? "bg-emerald-500" : "bg-rose-500");
-  $("precheck-exposure-bar").style.width = (qc.luminance / 255) * 100 + "%";
-  $("precheck-exposure-bar").className = "h-full transition-all duration-300 " + (qc.luminance >= 30 && qc.luminance <= 225 ? "bg-emerald-500" : "bg-amber-500");
-
-  if (!qc.pass) {
-    $("precheck-status-msg").textContent = "⚠ Low quality: " + qc.issues.join("; ") + " — proceeding anyway...";
-    $("precheck-status-msg").className = "text-xs font-semibold py-1.5 px-3 rounded text-center bg-amber-500/10 text-amber-400 border border-amber-500/30";
-    showToast("Low quality warning, proceeding...", "warning");
-  } else {
-    $("precheck-status-msg").textContent = "✓ Quality check passed — uploading...";
-    $("precheck-status-msg").className = "text-xs font-semibold py-1.5 px-3 rounded text-center bg-emerald-500/10 text-emerald-400 border border-emerald-500/30";
-  }
-
-  // Upload to Storage
-  const ext = file.type === "application/pdf" ? "pdf" : "jpg";
-  const filename = `${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
-  const storagePath = `invoices/${currentPharmacyId}/${filename}`;
-  const storageRef = ref(storage, storagePath);
-
+  // Single-file path (camera) — routes through the same persisted queue as bulk.
+  console.log("[handleFileSelected] Starting upload for", file.name, file.type, file.size);
   showLoadingOverlay(true, "Uploading...");
+  let item;
   try {
-    await uploadBytes(storageRef, file, { contentType: file.type });
+    item = await enqueueFile(file);
+    console.log("[handleFileSelected] Upload succeeded, queue item:", item);
   } catch (err) {
+    console.error("[handleFileSelected] Upload FAILED:", err.code, err.message, err);
     showLoadingOverlay(false);
     showToast("Upload failed: " + err.message, "error");
-    precheckPanel.classList.add("hidden");
     return;
   }
-
-  // Call extractInvoice CF synchronously
-  showLoadingOverlay(true, "Extracting invoice with AI...");
-  const extractFn = httpsCallable(functions, "extractInvoice", { timeout: 120000 });
-
-  let extracted;
-  try {
-    const result = await extractFn({ storagePath, pharmacyId: currentPharmacyId });
-    console.log("Gemini single raw extraction result:", result.data);
-    extracted = result.data;
-  } catch (err) {
-    console.error("Gemini single extraction failed:", err);
-    showLoadingOverlay(false);
-    precheckPanel.classList.add("hidden");
-    showToast("Extraction failed: " + err.message, "error");
-    // Clean up the uploaded file
-    try { await deleteObject(storageRef); } catch (_) {}
-    return;
-  }
-
   showLoadingOverlay(false);
-  precheckPanel.classList.add("hidden");
-
-  // Store session
-  reviewSession.storagePaths = [storagePath];
-  const url = URL.createObjectURL(file);
-  reviewSession.objectUrls = [url];
-  reviewSession.currentPageIndex = 0;
-  reviewSession.fileType = file.type === "application/pdf" ? "pdf" : "image";
-  reviewSession.extracted = extracted;
-
-  // Check captureQuality
-  const cq = extracted?.captureQuality;
-  if (!cq || !cq.readable) {
-    showReuploadPrompt(cq?.issues || ["Invoice could not be read."]);
-    // Clean up
-    try { await deleteObject(storageRef); } catch (_) {}
-    return;
-  }
-
-  // Show review screen
-  openReviewPanel(extracted);
+  importQueue.push(item);
+  renderImportQueueStatus();
+  startImportQueue();
 }
 
 // ─── Loading Overlay ──────────────────────────────────────────────────────────
@@ -547,39 +419,6 @@ function showLoadingOverlay(show, message = "Processing...") {
   } else {
     overlay.classList.add("hidden");
   }
-}
-
-// ─── Reupload Prompt ──────────────────────────────────────────────────────────
-
-function showReuploadPrompt(issues) {
-  let modal = $("reupload-modal");
-  if (!modal) {
-    modal = document.createElement("div");
-    modal.id = "reupload-modal";
-    modal.className = "fixed inset-0 bg-slate-950/90 z-[90] flex items-center justify-center p-4";
-    modal.innerHTML = `
-      <div class="bg-slate-900 border border-rose-500/30 rounded-2xl p-6 w-full max-w-sm shadow-2xl space-y-4">
-        <div class="flex items-center gap-3">
-          <div class="w-10 h-10 rounded-xl bg-rose-500/20 flex items-center justify-center">
-            <svg class="w-5 h-5 text-rose-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z"/>
-            </svg>
-          </div>
-          <h3 class="font-heading font-bold text-slate-100 text-sm">Invoice Unreadable</h3>
-        </div>
-        <p class="text-xs text-slate-400">The AI could not read this invoice clearly. Please retake with better conditions:</p>
-        <ul id="reupload-issues" class="space-y-1 text-xs text-rose-300"></ul>
-        <button id="btn-reupload-dismiss" class="w-full py-2.5 bg-rose-600 hover:bg-rose-500 text-white font-bold rounded-xl text-sm transition-all active:scale-[0.98]">
-          Dismiss &amp; Retake
-        </button>
-      </div>
-    `;
-    document.body.appendChild(modal);
-  }
-  const ul = $("reupload-issues");
-  ul.innerHTML = issues.map((i) => `<li class="flex items-start gap-1.5"><span class="mt-0.5 text-rose-500">•</span>${i}</li>`).join("");
-  modal.classList.remove("hidden");
-  $("btn-reupload-dismiss").onclick = () => modal.classList.add("hidden");
 }
 
 // ─── Review Panel ─────────────────────────────────────────────────────────────
@@ -689,17 +528,22 @@ function openReviewPanel(extracted) {
   $("btn-review-reject").onclick = async () => {
     panel.classList.add("hidden");
     const pathsToDelete = reviewSession.storagePaths;
+    const qid = reviewSession.queueId;
     revokeReviewSession();
     showToast("Invoice discarded", "warning");
+    // Mark the queue item rejected (terminal) so a resume never reprocesses it.
+    if (qid) {
+      try {
+                    await mutateImportQueue("update", qid, { status: "rejected" });
+      } catch (_) {}
+    }
     // Delete raw files
     if (pathsToDelete && pathsToDelete.length > 0) {
       for (const p of pathsToDelete) {
         try { await deleteObject(ref(storage, p)); } catch (_) {}
       }
     }
-    
-    reviewQueueIndex++;
-    showNextReviewInQueue();
+    advanceImportQueue();
   };
 
   // Approve button
@@ -715,6 +559,8 @@ function renderLineItems(lineItems) {
 
   lineItems.forEach((item, idx) => {
     const conf = item.confidence || {};
+    const avgConf = avgConfidenceValue(conf);
+    const isLowConf = avgConf < 90;
     const fields = [
       { key: "medicineName", label: "Medicine", type: "text", value: item.medicineName },
       { key: "batchNumber", label: "Batch", type: "text", value: item.batchNumber },
@@ -733,6 +579,8 @@ function renderLineItems(lineItems) {
     const card = document.createElement("div");
     card.className = "bg-slate-800/60 border border-slate-700/60 rounded-xl p-3 space-y-2";
     card.dataset.idx = idx;
+    // Store avg confidence as data attribute for reliable reading in recalculate()
+    card.dataset.avgConf = avgConf.toFixed(0);
 
     const nameConf = conf.medicineName ?? 1;
     const nameClass = nameConf < 0.8 ? "text-amber-400" : "text-slate-100";
@@ -740,10 +588,11 @@ function renderLineItems(lineItems) {
     card.innerHTML = `
       <div class="flex justify-between items-center">
         <span class="text-[10px] font-bold text-slate-500 uppercase tracking-wider">Line ${idx + 1}</span>
-        <span class="text-[9px] px-1.5 py-0.5 rounded ${nameConf < 0.8 ? "bg-amber-500/15 text-amber-400 border border-amber-500/30" : "bg-emerald-500/10 text-emerald-400"}">
-          avg conf ${avgConfidence(conf)}
+        <span class="text-[9px] px-1.5 py-0.5 rounded ${isLowConf ? "bg-amber-500/20 text-amber-400 border border-amber-500/40" : "bg-emerald-500/10 text-emerald-400"}" data-conf-badge>
+          avg conf ${avgConf.toFixed(0)}%
         </span>
       </div>
+      ${isLowConf ? `<div class="text-[9px] text-amber-400 font-semibold flex items-center gap-1"><svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" /></svg> Low confidence — review this line before saving</div>` : ""}
       <div class="grid grid-cols-2 gap-1.5">
         ${fields.map((f) => {
           const c = conf[f.key] ?? 1;
@@ -772,10 +621,16 @@ function renderLineItems(lineItems) {
   });
 }
 
-function avgConfidence(conf) {
+// Returns numeric average confidence (0-100) for a confidence object
+function avgConfidenceValue(conf) {
   const vals = Object.values(conf).filter((v) => typeof v === "number");
-  if (!vals.length) return "100%";
-  return ((vals.reduce((a, b) => a + b, 0) / vals.length) * 100).toFixed(0) + "%";
+  if (!vals.length) return 100;
+  return (vals.reduce((a, b) => a + b, 0) / vals.length) * 100;
+}
+
+// Returns formatted string (e.g. "87%") for display
+function avgConfidence(conf) {
+  return avgConfidenceValue(conf).toFixed(0) + "%";
 }
 
 function recalculate() {
@@ -805,7 +660,7 @@ function recalculate() {
 
   const summary = window._invoiceSummary;
 
-  // 1) GRAND TOTAL check — printed footer formula:
+  // 1) GRAND TOTAL check — printed footer formula (REFERENCE ONLY, non-blocking):
   //    Grand Total = Sale Value − Sch Disc − Cash Disc + Total GST + Round Off − CN.NO
   if (summary && summary.saleValue) {
     const sVal = summary.saleValue || 0;
@@ -815,28 +670,79 @@ function recalculate() {
     const ro = summary.roundOff || 0;
     const cn = summary.cnNo || 0;
     computedTotal = sVal - sch - cash + gstSum + ro - cn;
-    diff = Math.abs(computedTotal - declaredTotal);
-    match = diff <= 2;
   } else if (summary) {
     computedTotal = totalNet + totalGst;
-    diff = Math.abs(computedTotal - declaredTotal);
-    match = diff <= 2;
   } else {
     computedTotal = totalNet + totalGst;
-    diff = Math.abs(computedTotal - declaredTotal);
-    match = diff <= 2;
   }
+  diff = Math.abs(computedTotal - declaredTotal);
+  match = diff <= 2;
 
-  // 2) Independent GST cross-check vs printed footer totals
+  // 2) Independent GST cross-check vs printed footer totals (REFERENCE ONLY, non-blocking)
   const printedGst = summary && (summary.totalGst ?? ((summary.totalCGST || 0) + (summary.totalSGST || 0) + (summary.totalIGST || 0)));
-  let gstMatch = true, gstDiff = 0;
+  let gstDiff = 0;
   if (printedGst) {
     gstDiff = Math.abs(totalGst - printedGst);
-    gstMatch = gstDiff <= 1;
   }
 
-  const overallMatch = match && gstMatch;
-  console.log("[Recalc] total=", { declaredTotal, computedTotal, diff, match, printedGst, totalGst, gstDiff, gstMatch, overallMatch });
+  // 3) Per-line arithmetic checks — WARNING ONLY
+  //    a) netValue vs taxableValue + gstValue (catches column swaps)
+  //    b) taxableValue vs unitPrice × qtyBilled × (1 - cdPercent/100) (GOLDEN ROW FORMULA — bug #2 from VN-23-341141)
+  let arithmeticIssues = [];
+  document.querySelectorAll("#review-line-items [data-idx]").forEach((card) => {
+    const idx = card.dataset.idx;
+    const taxableEl = card.querySelector("[data-field='taxableValue']");
+    const gstEl = card.querySelector("[data-field='gstValue']");
+    const netEl = card.querySelector("[data-field='netValue']");
+    const unitPriceEl = card.querySelector("[data-field='unitPrice']");
+    const qtyBilledEl = card.querySelector("[data-field='quantityBilled']");
+    const cdPercentEl = card.querySelector("[data-field='cdPercent']");
+    const nameEl = card.querySelector("[data-field='medicineName']");
+    const name = nameEl ? nameEl.value : `Line ${parseInt(idx) + 1}`;
+
+    // Check a: netValue = taxableValue + gstValue
+    if (taxableEl && gstEl && netEl) {
+      const taxable = parseFloat(taxableEl.value) || 0;
+      const gst = parseFloat(gstEl.value) || 0;
+      const net = parseFloat(netEl.value) || 0;
+      if (taxable > 0 && gst > 0 && net > 0) {
+        const expectedNet = taxable + gst;
+        if (Math.abs(net - expectedNet) > 1) {
+          arithmeticIssues.push(`"${name}": netValue ₹${net.toFixed(2)} ≠ taxable ₹${taxable.toFixed(2)} + GST ₹${gst.toFixed(2)} = ₹${expectedNet.toFixed(2)} (columns may be swapped)`);
+        }
+      }
+    }
+
+    // Check b: taxableValue ≈ unitPrice × qtyBilled × (1 - cdPercent/100)
+    if (taxableEl && unitPriceEl && qtyBilledEl && cdPercentEl) {
+      const taxable = parseFloat(taxableEl.value) || 0;
+      const unitPrice = parseFloat(unitPriceEl.value) || 0;
+      const qtyBilled = parseFloat(qtyBilledEl.value) || 0;
+      const cdPercent = parseFloat(cdPercentEl.value) || 0;
+      if (unitPrice > 0 && qtyBilled > 0 && taxable > 0) {
+        const expectedTaxable = unitPrice * qtyBilled * (1 - cdPercent / 100);
+        if (Math.abs(taxable - expectedTaxable) > 2) {
+          arithmeticIssues.push(`"${name}": taxableValue ₹${taxable.toFixed(2)} ≠ unitPrice ₹${unitPrice.toFixed(2)} × qty ${qtyBilled} × (1 - ${cdPercent}%) = ₹${expectedTaxable.toFixed(2)} (taxableValue or unitPrice/qty/CD% may be misread)`);
+        }
+      }
+    }
+  });
+
+  // 4) Confidence-based gate: any line with avgConf < 90% gets flagged
+  let lowConfLines = [];
+  document.querySelectorAll("#review-line-items [data-idx]").forEach((card) => {
+    const idx = card.dataset.idx;
+    const avgConf = parseInt(card.dataset.avgConf || "100", 10);
+    if (avgConf < 90) {
+      const nameEl = card.querySelector("[data-field='medicineName']");
+      const name = nameEl ? nameEl.value : `Line ${parseInt(idx) + 1}`;
+      lowConfLines.push({ name, conf: avgConf, idx });
+    }
+  });
+
+  // Overall gate: block save if ANY low-confidence lines exist (unless acknowledged)
+  // The per-line arithmetic and footer mismatches are now WARNINGS only, not blockers.
+  const hasLowConf = lowConfLines.length > 0;
 
   const badge = $("review-arithmetic-badge");
   const gstBadge = $("review-gst-badge");
@@ -845,39 +751,35 @@ function recalculate() {
   const ackContainer = $("arithmetic-ack-container");
   const approveBtn = $("btn-review-approve");
 
-  styleBadge(badge, match, "✓ Totals Match", `⚠ Total ₹${diff.toFixed(2)}`);
+  // Update badges (reference only)
+  styleBadge(badge, match, "✓ Totals Match (ref)", `⚠ Total ₹${diff.toFixed(2)} (ref)`);
   if (gstBadge) {
     if (!printedGst) {
       gstBadge.classList.add("hidden");
     } else {
       gstBadge.classList.remove("hidden");
-      styleBadge(gstBadge, gstMatch, "✓ GST Matches", `⚠ GST ₹${gstDiff.toFixed(2)}`);
+      styleBadge(gstBadge, gstDiff <= 1, "✓ GST Matches (ref)", `⚠ GST ₹${gstDiff.toFixed(2)} (ref)`);
     }
   }
 
-  if (overallMatch) {
+  if (!hasLowConf) {
+    // No low-confidence lines — save is enabled (warnings shown but not blocking)
     warning.classList.add("hidden");
     ackContainer.classList.add("hidden");
     approveBtn.disabled = false;
     approveBtn.className = "py-2.5 bg-indigo-600 text-white font-bold rounded-lg text-xs hover:bg-indigo-500 transition-all active:scale-[0.98]";
   } else {
+    // Low-confidence lines exist — block save until acknowledged
     warning.classList.remove("hidden");
     if (warningDetail) {
       const fails = [];
-      if (!match) fails.push(`Grand total mismatch ₹${diff.toFixed(2)}`);
-      if (printedGst && !gstMatch) fails.push(`GST: sum ₹${totalGst.toFixed(2)} ≠ printed ₹${printedGst.toFixed(2)}`);
-
-      if (!match && summary && !(summary.cashDiscount || summary.schDisc || 0) && !totalCd) {
-        const netTaxable = summary.saleValue || totalNet;
-        const roundOff = summary.roundOff || 0;
-        const implied = netTaxable + (summary.totalGst || totalGst) + roundOff - declaredTotal;
-        const impliedNet = netTaxable + roundOff - declaredTotal;
-        const impliedDisc = Math.abs(implied) < Math.abs(impliedNet) ? implied : impliedNet;
-        if (impliedDisc > 0.01) {
-          fails.push(`Discount of ~₹${impliedDisc.toFixed(2)} appears missing (Gemini read ₹0.00)`);
-        }
+      if (!match) fails.push(`Grand total mismatch ₹${diff.toFixed(2)} (reference)`);
+      if (printedGst && gstDiff > 1) fails.push(`GST: sum ₹${totalGst.toFixed(2)} ≠ printed ₹${printedGst.toFixed(2)} (reference)`);
+      if (arithmeticIssues.length > 0) fails.push(...arithmeticIssues);
+      if (lowConfLines.length > 0) {
+        fails.push(`⚠ ${lowConfLines.length} line(s) below 90% confidence — review required`);
+        lowConfLines.forEach(lc => fails.push(`  • ${lc.name}: ${lc.conf}%`));
       }
-
       warningDetail.textContent = fails.join(" · ");
     }
     ackContainer.classList.remove("hidden");
@@ -908,35 +810,65 @@ async function confirmAndSave(originalExtracted) {
   const panel = $("extraction-review-panel");
 
   try {
-    // Collect edited line items from DOM
-    const lineItemCards = document.querySelectorAll("#review-line-items [data-idx]");
-    const idxSet = new Set();
-    lineItemCards.forEach((el) => idxSet.add(parseInt(el.dataset.idx)));
-
-    const lineItems = [];
-    idxSet.forEach((idx) => {
-      const get = (field) => {
-        const el = document.querySelector(`#review-line-items [data-idx="${idx}"][data-field="${field}"]`);
-        return el ? el.value : "";
-      };
-      lineItems.push({
-        medicineName: get("medicineName"),
-        batchNumber: get("batchNumber"),
-        expiryDate: get("expiryDate"),
-        quantityBilled: parseFloat(get("quantityBilled")) || 0,
-        quantityFree: parseFloat(get("quantityFree")) || 0,
-        unitPrice: parseFloat(get("unitPrice")) || 0,
-        cdPercent: parseFloat(get("cdPercent")) || 0,
-        taxableValue: parseFloat(get("taxableValue")) || 0,
-        cdValue: parseFloat(get("cdValue")) || 0,
-        gstRate: parseFloat(get("gstRate")) || 0,
-        gstValue: parseFloat(get("gstValue")) || 0,
-        netValue: parseFloat(get("netValue")) || 0,
+    // Build a map of user edits from DOM (only for fields the user actually edited)
+    const domEdits = new Map();
+    document.querySelectorAll("#review-line-items [data-idx]").forEach((card) => {
+      const idx = parseInt(card.dataset.idx);
+      const edits = {};
+      card.querySelectorAll("[data-field]").forEach((input) => {
+        edits[input.dataset.field] = input.value;
       });
+      domEdits.set(idx, edits);
     });
 
+    // Start with the FULL extraction result — this guarantees all 17 (or however many)
+    // line items are preserved even if some aren't currently rendered in DOM.
+    const extractedLineItems = originalExtracted.lineItems || [];
+    const expectedCount = extractedLineItems.length;
+
+    // Provenance fields (Priority 3) — trace every medicine record back to its source invoice
+    const provenance = {
+      invoiceNumber: originalExtracted.invoiceNumber || "",
+      distributorId: normalizeDistributorName(originalExtracted.distributor || ""),
+      invoiceDate: originalExtracted.invoiceDate || "",
+      // invoiceId will be added by backend after invoice doc is created
+    };
+
+    // Merge DOM edits onto the full extraction array, and attach provenance
+    const lineItems = extractedLineItems.map((item, idx) => {
+      const edits = domEdits.get(idx);
+      const base = edits ? {
+        ...item,
+        medicineName: edits.medicineName ?? item.medicineName,
+        batchNumber: edits.batchNumber ?? item.batchNumber,
+        expiryDate: edits.expiryDate ?? item.expiryDate,
+        quantityBilled: numOr(edits.quantityBilled, item.quantityBilled),
+        quantityFree: numOr(edits.quantityFree, item.quantityFree),
+        unitPrice: numOr(edits.unitPrice, item.unitPrice),
+        cdPercent: numOr(edits.cdPercent, item.cdPercent),
+        taxableValue: numOr(edits.taxableValue, item.taxableValue),
+        cdValue: numOr(edits.cdValue, item.cdValue),
+        gstRate: numOr(edits.gstRate, item.gstRate),
+        gstValue: numOr(edits.gstValue, item.gstValue),
+        netValue: numOr(edits.netValue, item.netValue),
+      } : item;
+
+      // Attach provenance to every line item
+      return { ...base, ...provenance };
+    });
+
+    // HARD GUARD: Never let a partial save succeed silently.
+    // If the final array length doesn't match the extraction, block and alert.
+    if (lineItems.length !== expectedCount) {
+      throw new Error(
+        `Save blocked: line item count mismatch. Extraction had ${expectedCount} items, ` +
+        `but save pipeline produced ${lineItems.length}. This indicates a bug — ` +
+        `please report this and do not proceed.`
+      );
+    }
+
     const invoiceTotal = parseFloat($("review-declared-total-input").value) || 0;
-    console.log("[Save] collected from DOM", { itemCount: lineItems.length, invoiceTotal, authUid: currentUser ? currentUser.uid : null });
+    console.log("[Save] prepared for write", { itemCount: lineItems.length, expectedCount, invoiceTotal, authUid: currentUser ? currentUser.uid : null });
 
     if (!currentUser) {
       throw new Error("Not signed in. Please log in again and retry.");
@@ -946,8 +878,9 @@ async function confirmAndSave(originalExtracted) {
 
     console.log("[Save] calling saveInvoice callable...");
     const saveFn = httpsCallable(functions, "saveInvoice");
-    const resp = await saveFn({
+    const payload = sanitizeForCallable({
       pharmacyId: currentPharmacyId,
+      queueId: reviewSession.queueId || null,
       invoice: {
         distributor: originalExtracted.distributor || "",
         invoiceNumber: originalExtracted.invoiceNumber || "",
@@ -957,10 +890,12 @@ async function confirmAndSave(originalExtracted) {
         captureQuality: originalExtracted.captureQuality || {},
         gstCheck: originalExtracted.gstCheck || {},
         rawGeminiResponse: originalExtracted.rawGeminiResponse || "",
+        pHash: reviewSession.pHash || null,
       },
       lineItems,
       confirmedBy: currentUser.uid,
     });
+    const resp = await saveFn(payload);
     console.log("[Save] saveInvoice callable succeeded", resp && resp.data);
 
     // Delete raw files from Storage
@@ -976,12 +911,22 @@ async function confirmAndSave(originalExtracted) {
 
     showLoadingOverlay(false);
     panel.classList.add("hidden");
+    // If this review came from a staged (partial) invoice, remove the staging
+    // doc so it no longer shows in the "waiting" widget.
+    const stagedNumber = reviewSession.pendingInvoiceNumber;
     revokeReviewSession();
+    if (stagedNumber) {
+      try {
+        const delFn = httpsCallable(functions, "deletePendingInvoice", { timeout: 30000 });
+        await delFn({ pharmacyId: currentPharmacyId, invoiceNumber: stagedNumber });
+      } catch (cleanupErr) {
+        console.warn("[Save] could not remove staged invoice (non-fatal):", cleanupErr.message);
+      }
+    }
     showToast(`Saved! ${lineItems.length} medicine(s) recorded.`, "success");
     console.log("[Save] done — advancing to next review");
 
-    reviewQueueIndex++;
-    showNextReviewInQueue();
+    advanceImportQueue();
 
   } catch (err) {
     console.error("[Save] FAILED", {
@@ -999,127 +944,378 @@ function revokeReviewSession() {
   if (reviewSession.objectUrls && reviewSession.objectUrls.length > 0) {
     reviewSession.objectUrls.forEach(url => URL.revokeObjectURL(url));
   }
-  reviewSession = { storagePaths: [], objectUrls: [], currentPageIndex: 0, fileType: 'image', extracted: null };
+  reviewSession = { storagePaths: [], objectUrls: [], currentPageIndex: 0, fileType: 'image', extracted: null, queueId: null, pendingInvoiceNumber: null };
 }
 
-// ─── Expiring Medicines List ──────────────────────────────────────────────────
+// ─── Expiring Medicines List (live) ──────────────────────────────────────────
+// Real-time onSnapshot subscription on the same "medicines" collection the
+// saveInvoice CF writes (the flattened aggregate of ALL saved invoices) — the
+// widget updates instantly when an invoice is confirmed, without a page
+// refresh. No query limit: every batch in the collection is counted and
+// rendered, so the total reflects the true database count.
 
-async function loadExpiringMedicines() {
+let expiringUnsub = null;
+
+function subscribeExpiringMedicines() {
+  if (expiringUnsub) return;
   const listEl = $("expiring-list");
-  const countEl = $("expiring-count");
   if (!listEl) return;
 
-  listEl.innerHTML = `<div class="text-center py-6 text-xs text-slate-500">Loading...</div>`;
+  expiringUnsub = onSnapshot(
+    collection(db, "pharmacies", currentPharmacyId, "medicines"),
+    (snapshot) => {
+      const now = new Date();
+      const ninetyDaysOut = new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000);
+      const withDate = [];
+      const noDate = [];
 
-  try {
-    const snapshot = await getDocs(
-      collection(db, "pharmacies", currentPharmacyId, "medicines")
-    );
+      snapshot.forEach((docSnap) => {
+        const d = docSnap.data();
+        const expDate = parseExpiryDate(d.expiryDate);
+        const row = { id: docSnap.id, ...d, expDate };
+        if (expDate) withDate.push(row);
+        else noDate.push(row);
+      });
 
-    const now = new Date();
-    const ninetyDaysOut = new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000);
-    const items = [];
+      withDate.sort((a, b) => a.expDate - b.expDate);
+      const items = [...withDate, ...noDate];
 
-    snapshot.forEach((docSnap) => {
-      const d = docSnap.data();
-      // Parse expiry: try MM/YYYY then DD/MM/YYYY
-      const expDate = parseExpiryDate(d.expiryDate);
-      if (expDate && expDate <= ninetyDaysOut) {
-        items.push({ id: docSnap.id, ...d, expDate });
+      // True database count — every batch stored in the medicines collection,
+      // not just the expiring subset.
+      const countEl = $("expiring-count");
+      if (countEl) countEl.textContent = `${items.length} record${items.length !== 1 ? "s" : ""}`;
+
+      if (items.length === 0) {
+        listEl.innerHTML = `<div class="text-center py-6 text-xs text-slate-500">No batches recorded yet. Save an invoice to populate.</div>`;
+        return;
       }
-    });
 
-    items.sort((a, b) => a.expDate - b.expDate);
-    countEl.textContent = `${items.length} record${items.length !== 1 ? "s" : ""}`;
-
-    if (items.length === 0) {
-      listEl.innerHTML = `<div class="text-center py-6 text-xs text-slate-500">No medicines expiring within 90 days.</div>`;
-      return;
-    }
-
-    listEl.innerHTML = items.map((item) => {
-      const daysLeft = Math.ceil((item.expDate - now) / (1000 * 60 * 60 * 24));
-      const urgency = daysLeft <= 30 ? "border-rose-500/40 bg-rose-500/5" : daysLeft <= 60 ? "border-amber-500/40 bg-amber-500/5" : "border-slate-700/60 bg-slate-800/40";
-      const badgeClass = daysLeft <= 30 ? "bg-rose-500/20 text-rose-400" : daysLeft <= 60 ? "bg-amber-500/20 text-amber-400" : "bg-slate-700 text-slate-400";
-      return `
-        <div class="border ${urgency} rounded-xl p-3 space-y-1.5">
-          <div class="flex justify-between items-start">
-            <div>
-              <p class="text-xs font-bold text-slate-100 leading-tight">${item.medicineName}</p>
-              <p class="text-[9px] font-mono text-slate-500">Batch: ${item.batchNumber}</p>
+      listEl.innerHTML = items.map((item) => {
+        const daysLeft = item.expDate ? Math.ceil((item.expDate - now) / (1000 * 60 * 60 * 24)) : null;
+        const urgency = !item.expDate
+          ? "border-slate-700/60 bg-slate-800/40"
+          : daysLeft <= 30 ? "border-rose-500/40 bg-rose-500/5"
+          : daysLeft <= 60 ? "border-amber-500/40 bg-amber-500/5"
+          : daysLeft <= 90 ? "border-amber-500/30 bg-amber-500/5"
+          : "border-slate-700/60 bg-slate-800/40";
+        const badgeClass = !item.expDate
+          ? "bg-slate-700 text-slate-400"
+          : daysLeft <= 0 ? "bg-rose-500/20 text-rose-400"
+          : daysLeft <= 30 ? "bg-rose-500/20 text-rose-400"
+          : daysLeft <= 60 ? "bg-amber-500/20 text-amber-400"
+          : daysLeft <= 90 ? "bg-amber-500/15 text-amber-400"
+          : "bg-slate-700 text-slate-400";
+        const badge = !item.expDate
+          ? "NO EXPIRY"
+          : daysLeft <= 0 ? "EXPIRED" : `${daysLeft}d left`;
+        return `
+          <div class="border ${urgency} rounded-xl p-3 space-y-1.5">
+            <div class="flex justify-between items-start">
+              <div>
+                <p class="text-xs font-bold text-slate-100 leading-tight">${item.medicineName}</p>
+                <p class="text-[9px] font-mono text-slate-500">Batch: ${item.batchNumber}</p>
+              </div>
+              <span class="text-[9px] px-2 py-0.5 rounded-full font-bold ${badgeClass}">
+                ${badge}
+              </span>
             </div>
-            <span class="text-[9px] px-2 py-0.5 rounded-full font-bold ${badgeClass}">
-              ${daysLeft <= 0 ? "EXPIRED" : `${daysLeft}d left`}
-            </span>
+            <div class="flex items-center justify-between text-[10px] text-slate-400">
+              <span>Exp: ${item.expiryDate || "—"}</span>
+              <span>Qty: ${item.remainingQty ?? item.quantityBilled}</span>
+              <span class="text-slate-500">${normalizeDistributorName(item.distributor) || "—"}</span>
+            </div>
           </div>
-          <div class="flex items-center justify-between text-[10px] text-slate-400">
-            <span>Exp: ${item.expiryDate}</span>
-            <span>Qty: ${item.remainingQty ?? item.quantityBilled}</span>
-            <span class="text-slate-500">${item.distributor || "—"}</span>
-          </div>
-        </div>
-      `;
-    }).join("");
-  } catch (err) {
-    listEl.innerHTML = `<div class="text-center py-6 text-xs text-rose-400">Error loading: ${err.message}</div>`;
-  }
+        `;
+      }).join("");
+    },
+    (err) => {
+      listEl.innerHTML = `<div class="text-center py-6 text-xs text-rose-400">Error loading: ${err.message}</div>`;
+    }
+  );
 }
 
+// Tolerant expiry-date parser covering every format the Gemini pipeline may
+// have stored: MM/YYYY, MM-YYYY, MM.YYYY, YYYY-MM, DD/MM/YYYY, DD-MM-YYYY,
+// DD.MM.YYYY, MM/YY, MMM-YYYY, bare YYYY, and any Date-parseable string.
+// Records whose expiry fails to parse are surfaced as "NO EXPIRY" instead of
+// silently vanishing from the dashboard count.
 function parseExpiryDate(str) {
-  if (!str) return null;
-  // MM/YYYY
-  let m = str.match(/^(\d{1,2})\/(\d{4})$/);
-  if (m) return new Date(parseInt(m[2]), parseInt(m[1]) - 1, 28);
-  // DD/MM/YYYY
-  m = str.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
-  if (m) return new Date(parseInt(m[3]), parseInt(m[2]) - 1, parseInt(m[1]));
-  // YYYY-MM-DD
-  m = str.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (str == null) return null;
+  const s = String(str).trim();
+  if (!s) return null;
+  let m;
+
+  // YYYY-MM-DD / YYYY/MM/DD / YYYY.MM.DD
+  m = s.match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$/);
   if (m) return new Date(parseInt(m[1]), parseInt(m[2]) - 1, parseInt(m[3]));
+
+  // DD-MM-YYYY / DD/MM/YYYY / DD.MM.YYYY (Indian invoices are day-first)
+  m = s.match(/^(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})$/);
+  if (m && parseInt(m[1]) <= 31 && parseInt(m[2]) <= 12) {
+    return new Date(parseInt(m[3]), parseInt(m[2]) - 1, parseInt(m[1]));
+  }
+
+  // MM-YYYY / MM/YYYY / MM.YYYY / MM YYYY
+  m = s.match(/^(\d{1,2})[-/.\s](\d{4})$/);
+  if (m) return new Date(parseInt(m[2]), parseInt(m[1]) - 1, 28);
+
+  // YYYY-MM / YYYY/MM
+  m = s.match(/^(\d{4})[-/.](\d{1,2})$/);
+  if (m) return new Date(parseInt(m[1]), parseInt(m[2]) - 1, 28);
+
+  // MM/YY short year (e.g. 05/27)
+  m = s.match(/^(\d{1,2})[-/.](\d{2})$/);
+  if (m) return new Date(parseInt(m[2]) + 2000, parseInt(m[1]) - 1, 28);
+
+  // MMM-YYYY / MMM YYYY / MMM.YYYY (e.g. MAY 2027, "MAY-27")
+  m = s.match(/^([a-z]{3})[-/.\s]+(\d{2,4})$/i);
+  if (m) {
+    const months = { jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5, jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11 };
+    const idx = months[m[1].toLowerCase().slice(0, 3)];
+    if (idx !== undefined) {
+      const y = m[2].length === 2 ? parseInt(m[2]) + 2000 : parseInt(m[2]);
+      return new Date(y, idx, 28);
+    }
+  }
+
+  // Bare year (e.g. 2027)
+  m = s.match(/^(\d{4})$/);
+  if (m) return new Date(parseInt(m[1]), 11, 31);
+
+  // Last resort: native Date.parse
+  const t = Date.parse(s);
+  if (!isNaN(t)) return new Date(t);
   return null;
 }
 
-// ─── Distributors ─────────────────────────────────────────────────────────────
+// ─── Distributors (live) ──────────────────────────────────────────────────────
+// Groups by a normalized distributor key (mirror of the backend
+// normalizeDistributorName) so legacy rows already fragmented across casing /
+// punctuation / legal-suffix variants also consolidate into one profile.
 
-async function loadDistributors() {
+const DISTRIBUTOR_LEGAL_SUFFIXES = [
+  "PRIVATE LIMITED",
+  "PRIVATE LTD",
+  "PVT LIMITED",
+  "PVT LTD",
+  "PRIVATE",
+  "PVT",
+  "LIMITED",
+  "LTD",
+  "LLP",
+  "CO",
+  "COMPANY",
+  "CORPORATION",
+  "INCORPORATED",
+  "INC",
+];
+
+function normalizeDistributorName(name) {
+  if (name == null) return "";
+  let s = String(name)
+    .toUpperCase()
+    .replace(/&/g, " AND ")
+    .replace(/[^\w\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!s) return "";
+  let prev = null;
+  while (s && s !== prev) {
+    prev = s;
+    let stripped = false;
+    for (const suffix of DISTRIBUTOR_LEGAL_SUFFIXES) {
+      const re = new RegExp(`(?:^|\\s)${suffix.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`, "i");
+      if (re.test(s)) {
+        s = s.slice(0, s.length - suffix.length).replace(/\s+$/, "").trim();
+        stripped = true;
+        break;
+      }
+    }
+    if (!stripped) break;
+  }
+  return s;
+}
+
+let distributorsUnsub = null;
+
+function subscribeDistributors() {
+  if (distributorsUnsub) return;
   const listEl = $("distributors-list");
   if (!listEl) return;
 
-  try {
-    const snapshot = await getDocs(
-      collection(db, "pharmacies", currentPharmacyId, "medicines")
-    );
-    const distributorMap = {};
-    snapshot.forEach((docSnap) => {
-      const d = docSnap.data();
-      if (d.distributor) {
-        distributorMap[d.distributor] = (distributorMap[d.distributor] || 0) + 1;
-      }
-    });
+  distributorsUnsub = onSnapshot(
+    collection(db, "pharmacies", currentPharmacyId, "medicines"),
+    (snapshot) => {
+      const distributorMap = {};
+      snapshot.forEach((docSnap) => {
+        const d = docSnap.data();
+        const name = normalizeDistributorName(d.distributor);
+        if (name) {
+          distributorMap[name] = (distributorMap[name] || 0) + 1;
+        }
+      });
 
-    const distributors = Object.entries(distributorMap);
-    if (distributors.length === 0) {
-      listEl.innerHTML = `<div class="text-center py-8 text-xs text-slate-500">No distributors recorded yet.</div>`;
-      return;
+      const distributors = Object.entries(distributorMap);
+      if (distributors.length === 0) {
+        listEl.innerHTML = `<div class="text-center py-8 text-xs text-slate-500">No distributors recorded yet.</div>`;
+        return;
+      }
+
+      listEl.innerHTML = distributors.map(([name, count]) => `
+        <div class="bg-slate-800/60 border border-slate-700/60 rounded-xl p-3 flex justify-between items-center">
+          <div>
+            <p class="text-xs font-bold text-slate-100">${name}</p>
+            <p class="text-[9px] text-slate-400">${count} medicine batch${count !== 1 ? "es" : ""}</p>
+          </div>
+          <div class="w-8 h-8 rounded-lg bg-indigo-600/20 flex items-center justify-center">
+            <svg class="w-4 h-4 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"/>
+            </svg>
+          </div>
+        </div>
+      `).join("");
+    },
+    (err) => {
+      listEl.innerHTML = `<div class="text-xs text-rose-400 text-center py-4">${err.message}</div>`;
+    }
+  );
+}
+
+// ─── Pending Invoices (Staging, live) ───────────────────────────────────────
+// Subscribes directly to /pharmacies/{id}/pending_invoices — the same
+// collection ingestPageToPending CF stages/merges — so the widget updates the
+// instant a page is buffered or an invoice is merged away.
+
+let pendingUnsub = null;
+
+function subscribePendingInvoices() {
+  if (pendingUnsub) return;
+  const listEl = $("pending-invoices-list");
+  if (!listEl) return;
+
+  const q = query(
+    collection(db, "pharmacies", currentPharmacyId, "pending_invoices"),
+    orderBy("createdAt", "desc"),
+    limit(50)
+  );
+
+  pendingUnsub = onSnapshot(
+    q,
+    (snapshot) => {
+      const pending = [];
+      snapshot.forEach((docSnap) => {
+        const d = docSnap.data();
+        const pages = d.pages || [];
+        const pageTotal = Math.max(...pages.map((p) => Number(p.totalPages) || 1), 1);
+        const pageNumbers = pages
+          .map((p) => Number(p.pageNumber))
+          .filter((n) => n >= 1)
+          .sort((a, b) => a - b);
+        pending.push({
+          id: docSnap.id,
+          invoiceNumber: d.invoiceNumber || docSnap.id,
+          distributor: d.distributor || "",
+          pageCount: pages.length,
+          pageTotal,
+          pageNumbers,
+          hasFooter: pages.some((p) => p.hasFooterTotals),
+          totalItems: pages.reduce((sum, p) => sum + (p.lineItems || []).length, 0),
+          status: d.status || "Incomplete - Waiting for remaining pages",
+          createdAt: d.createdAt,
+        });
+      });
+
+      const countEl = $("pending-invoices-count");
+      if (countEl) countEl.textContent = `${pending.length} waiting`;
+      if (pending.length === 0) {
+        listEl.innerHTML = `<div class="text-center py-3 text-[10px] text-slate-500">No partial invoices staged.</div>`;
+        return;
+      }
+
+      listEl.innerHTML = pending.map((p) => {
+        const pagesLabel = p.pageNumbers && p.pageNumbers.length
+          ? p.pageNumbers.join(", ")
+          : `${p.pageCount} page(s)`;
+        const pageInfo = (p.pageTotal && p.pageTotal > 1)
+          ? `${pagesLabel} of ${p.pageTotal}`
+          : pagesLabel;
+        return `
+        <div class="bg-amber-500/5 border border-amber-500/20 rounded-xl p-3 flex justify-between items-center">
+          <div>
+            <p class="text-xs font-bold text-slate-100">${p.invoiceNumber}</p>
+            <p class="text-[9px] text-slate-400">${normalizeDistributorName(p.distributor) || "Unknown"} · Pages ${pageInfo} · ${p.totalItems} item(s)</p>
+          </div>
+          <div class="flex gap-1.5 shrink-0">
+            <button onclick="window.openPendingReview('${p.invoiceNumber.replace(/'/g, "")}')" class="text-[9px] px-2 py-1 bg-indigo-500/15 border border-indigo-500/30 text-indigo-300 hover:bg-indigo-500/30 rounded-md font-bold transition-all">
+              Review
+            </button>
+            <button onclick="window.discardPending('${p.invoiceNumber.replace(/'/g, "")}')" class="text-[9px] px-2 py-1 bg-slate-800 border border-slate-700 text-slate-400 hover:text-rose-400 hover:border-rose-500/30 rounded-md font-bold transition-all">
+              Discard
+            </button>
+          </div>
+        </div>`;
+      }).join("");
+    },
+    (err) => {
+      listEl.innerHTML = `<div class="text-center py-3 text-[10px] text-rose-400">${err.message}</div>`;
+    }
+  );
+}
+
+window.discardPending = async (invoiceNumber) => {
+  try {
+    const delFn = httpsCallable(functions, "deletePendingInvoice", { timeout: 30000 });
+    await delFn({ pharmacyId: currentPharmacyId, invoiceNumber });
+    showToast(`Discarded ${invoiceNumber}`, "warning");
+    // The live pending_invoices subscription already removed the card.
+  } catch (err) {
+    showToast("Failed to discard: " + err.message, "error");
+  }
+};
+
+// Open a staged (partial) invoice from the pending_invoices widget in the full
+// review panel so it can be verified and confirmed/saved manually.
+window.openPendingReview = async (invoiceNumber) => {
+  try {
+    showLoadingOverlay(true, "Loading staged invoice...");
+    const getFn = httpsCallable(functions, "getPendingInvoice", { timeout: 30000 });
+    const resp = await getFn({ pharmacyId: currentPharmacyId, invoiceNumber });
+    const data = resp.data;
+
+    // Resolve one object URL per buffered page so review pagination works.
+    const objectUrls = [];
+    const storagePaths = [];
+    for (const pg of data.pages || []) {
+      if (!pg.storagePath) continue;
+      storagePaths.push(pg.storagePath);
+      try {
+        const url = await getDownloadURL(ref(storage, pg.storagePath));
+        if (url) objectUrls.push(url);
+      } catch (_) {}
     }
 
-    listEl.innerHTML = distributors.map(([name, count]) => `
-      <div class="bg-slate-800/60 border border-slate-700/60 rounded-xl p-3 flex justify-between items-center">
-        <div>
-          <p class="text-xs font-bold text-slate-100">${name}</p>
-          <p class="text-[9px] text-slate-400">${count} medicine batch${count !== 1 ? "es" : ""}</p>
-        </div>
-        <div class="w-8 h-8 rounded-lg bg-indigo-600/20 flex items-center justify-center">
-          <svg class="w-4 h-4 text-indigo-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 7h12m0 0l-4-4m4 4l-4 4m0 6H4m0 0l4 4m-4-4l4-4"/>
-          </svg>
-        </div>
-      </div>
-    `).join("");
+    reviewSession = {
+      storagePaths,
+      objectUrls,
+      currentPageIndex: 0,
+      fileType: (storagePaths[0] || "").endsWith(".pdf") ? "pdf" : "image",
+      extracted: data,
+      queueId: null,
+      pHash: null,
+      pendingInvoiceNumber: invoiceNumber,
+    };
+
+    openReviewPanel(data);
+    showLoadingOverlay(false);
+    showToast(
+      `Staged invoice opened — ${data.lineItems.length} item(s) from ${data.pageCount} page(s). Review & confirm to save.`,
+      "info"
+    );
   } catch (err) {
-    listEl.innerHTML = `<div class="text-xs text-rose-400 text-center py-4">${err.message}</div>`;
+    showLoadingOverlay(false);
+    showToast("Failed to open staged invoice: " + (err.message || err), "error");
   }
-}
+};
 
 // ─── Bootstrap ────────────────────────────────────────────────────────────────
 
@@ -1130,454 +1326,460 @@ document.addEventListener("DOMContentLoaded", () => {
   initAuth();
 });
 
-// ─── Client-Side OCR & Grouping Triage ────────────────────────────────────────
+// ─── Import Queue (persisted, resumable) ────────────────────────────────────
+// Every selected raw file is uploaded to Storage and immediately recorded as a
+// queue doc at /pharmacies/{pharmacyId}/importQueue/{imageId} with
+// status "uploaded" BEFORE any AI work. If the browser closes mid-batch, the
+// docs survive; the resume loop below picks up any item whose status is not yet
+// terminal (saved/reviewed/ingested/failed/rejected) on the next page load.
+// The extraction itself runs server-side in the processImportQueueItem CF
+// (leased claim, crash-safe); this client loop only enqueues and drives review.
 
-let _ocrWorker = null;
-
-async function getOcrWorker() {
-  if (!_ocrWorker) {
-    _ocrWorker = await Tesseract.createWorker("eng", 1, {
-      logger: (m) => {
-        if (m.status === "recognizing text") return;
-      }
-    });
-  }
-  return _ocrWorker;
+function queueItemRef(imageId) {
+  return doc(db, "pharmacies", currentPharmacyId, "importQueue", imageId);
 }
 
-async function terminateOcrWorker() {
-  if (_ocrWorker) {
-    await _ocrWorker.terminate();
-    _ocrWorker = null;
-  }
-}
-
-function preprocessForOcr(file) {
-  return new Promise((resolve) => {
-    const img = new Image();
-    const url = URL.createObjectURL(file);
-    img.onload = () => {
-      URL.revokeObjectURL(url);
-      const canvas = document.createElement("canvas");
-      const maxDim = 1200;
-      const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
-      canvas.width = Math.floor(img.width * scale);
-      canvas.height = Math.floor(img.height * scale);
-      const ctx = canvas.getContext("2d");
-      ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
-      const d = imageData.data;
-      for (let i = 0; i < d.length; i += 4) {
-        const r = d[i], g = d[i + 1], b = d[i + 2];
-        const gray = 0.299 * r + 0.587 * g + 0.114 * b;
-        const contrasted = gray < 128 ? Math.max(0, gray - 20) : Math.min(255, gray + 20);
-        d[i] = d[i + 1] = d[i + 2] = contrasted;
-      }
-      ctx.putImageData(imageData, 0, 0);
-      canvas.toBlob((blob) => {
-        resolve(blob);
-      }, "image/jpeg", 0.92);
-    };
-    img.src = url;
+// Queue-doc writes are routed through the mutateImportQueue callable because
+// the Firestore backend has been observed enforcing stale rules that deny
+// direct client writes to the importQueue subtree (Admin SDK bypasses rules).
+async function mutateImportQueue(op, imageId, data) {
+  const fn = httpsCallable(functions, "mutateImportQueue", { timeout: 30000 });
+  const res = await fn({
+    op,
+    pharmacyId: currentPharmacyId,
+    imageId,
+    data,
   });
+  return res.data;
 }
 
-async function performOcr(file) {
-  const processedBlob = await preprocessForOcr(file);
-  const worker = await getOcrWorker();
-  const { data: { text } } = await worker.recognize(processedBlob);
-  return text;
+function esc(str) {
+  return String(str == null ? "" : str).replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
 }
 
-async function performOcrWithRetry(file, retries = 2) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
+// parseFloat that never yields NaN: empty/garbage input falls back to the
+// provided default. (NaN ?? default does NOT fall back — NaN is not nullish.)
+function numOr(v, fallback) {
+  const n = typeof v === "string" ? parseFloat(v) : Number(v);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+// Deep-clean a payload before it goes through httpsCallable: JSON cannot
+// represent NaN/Infinity, so replace any non-finite number with null.
+function sanitizeForCallable(obj) {
+  if (Array.isArray(obj)) return obj.map(sanitizeForCallable);
+  if (obj && typeof obj === "object") {
+    const out = {};
+    for (const k of Object.keys(obj)) {
+      const v = obj[k];
+      if (typeof v === "number" && !Number.isFinite(v)) out[k] = null;
+      else if (v && typeof v === "object") out[k] = sanitizeForCallable(v);
+      else out[k] = v;
+    }
+    return out;
+  }
+  return obj;
+}
+
+// Upload a raw file and persist the "uploaded" queue doc BEFORE extraction.
+// hints = { pageNumber, totalPages } — authoritative pagination captured from
+// the source file metadata (e.g. pdf.numPages for split PDF pages) and stored
+// on the queue doc so the worker can never misclassify a multi-page invoice.
+async function enqueueFile(file, fileIndex = 0, hints = null) {
+  const ext = file.type === "application/pdf" ? "pdf" : "jpg";
+  const imageId = `${Date.now()}_${fileIndex}_${Math.random().toString(36).slice(2)}`;
+  const storagePath = `invoices/${currentPharmacyId}/${imageId}.${ext}`;
+  const storageRef = ref(storage, storagePath);
+
+  // Layer 1: pHash duplicate check (soft warning, not a hard block)
+  let pHash = null;
+  let duplicateWarning = null;
+  if (file.type.startsWith("image/")) {
     try {
-      return await performOcr(file);
+      console.log("[enqueueFile] Starting pHash duplicate check for", file.name);
+      const dupCheck = await checkDuplicateByHash(file, currentPharmacyId);
+      console.log("[enqueueFile] pHash check result:", dupCheck);
+      pHash = dupCheck.newHash;
+      if (dupCheck.isDuplicate) {
+        const m = dupCheck.match;
+        const dateStr = m.createdAt?.toDate ? m.createdAt.toDate().toLocaleDateString() : "recently";
+        duplicateWarning = `⚠ This image looks like invoice ${m.invoiceNumber} from ${m.distributor || "unknown distributor"} (uploaded ${dateStr}, hash distance ${m.distance}). Proceed anyway?`;
+        if (!confirm(duplicateWarning)) {
+          throw new Error("Upload cancelled by user (duplicate detected).");
+        }
+      }
     } catch (err) {
-      console.warn(`OCR attempt ${attempt}/${retries} failed:`, err.message);
-      if (attempt === retries) throw err;
-      await new Promise(r => setTimeout(r, 500));
+      if (err.message?.includes("cancelled")) throw err;
+      console.warn("[pHash] duplicate check failed (non-fatal):", err.message, err);
     }
   }
-}
 
-function parseInvoiceNo(text) {
-  const cleaned = text.replace(/\s+/g, " ");
-  const invPatterns = [
-    /tax\s+invoice\s*(?:no|num|number|#)?\.?\s*[:#\s-]+\s*([a-z0-9\-/]+)/i,
-    /invoice\s*(?:no|num|number|#)?\.?\s*[:#\s-]+\s*([a-z0-9\-/]+)/i,
-    /(?:proforma|pro\.?\s*forma)?\s*invoice\s*(?:no|num|number|#)?\.?\s*[:#\s-]+\s*([a-z0-9\-/]+)/i,
-    /bill\s*(?:no|num|number|#)?\.?\s*[:#\s-]+\s*([a-z0-9\-/]+)/i,
-    /inv\s*(?:no|num|number|#)?\.?\s*[:#\s-]+\s*([a-z0-9\-/]+)/i,
-    /invoice#\s*([a-z0-9\-/]+)/i,
-    /bill#\s*([a-z0-9\-/]+)/i,
-    /(?:tax\s+)?invoice\s*[#:]\s*([a-z0-9\-/]+)/i,
-  ];
-  for (const regex of invPatterns) {
-    const match = cleaned.match(regex);
-    if (match && match[1]) {
-      const val = match[1].trim().replace(/[^a-z0-9\-/]/ig, "").replace(/^0+/, "");
-      if (val.length >= 3 && /\d/.test(val)) return val;
-    }
-  }
-  const fallback = cleaned.match(/(?:no|number|#)\s*[:#\s-]*\s*([A-Z0-9]{4,}(?:\/[A-Z0-9]+)*)/i);
-  if (fallback && fallback[1] && /\d/.test(fallback[1])) return fallback[1].replace(/[^a-z0-9\-/]/ig, "");
-  return "";
-}
-
-function parsePageInfo(text) {
-  const cleaned = text.replace(/\s+/g, " ");
-  const pagePatterns = [
-    /page\s*(\d+)\s*(?:of|out\s*of|\/)\s*(\d+)/i,
-    /p(?:age)?\.?\s*no\.?\s*[:#\s-]*(\d+)\s*(?:of|out\s*of|\/)\s*(\d+)/i,
-    /(?:sheet|page)\s+(\d+)\s*[-/]\s*(\d+)/i,
-    /page\s*no\.?\s*[:#\s-]*(\d+)/i,
-    /p\.?\s*(\d+)\s*[/]\s*(\d+)/i,
-    /page\s*(\d+)/i,
-    /p\.?\s*(\d+)\b/i,
-  ];
-  for (const regex of pagePatterns) {
-    const match = cleaned.match(regex);
-    if (match) {
-      const current = parseInt(match[1]);
-      const total = match[2] ? parseInt(match[2]) : (current >= 1 ? Math.max(current, 1) : 1);
-      if (current >= 1 && total >= 1 && current <= total) {
-        return { current, total };
+  console.log("[enqueueFile] Uploading to Storage:", storagePath);
+  await uploadBytes(storageRef, file, { contentType: file.type });
+  console.log("[enqueueFile] Storage upload complete, writing queue doc");
+  const queueRef = queueItemRef(imageId);
+  
+  // Diagnostic: check actual auth state and app config
+  console.log("[enqueueFile] Diagnostic - app.options.projectId:", app.options.projectId);
+  console.log("[enqueueFile] Diagnostic - auth.currentUser:", auth.currentUser?.uid, "vs app currentUser:", currentUser?.uid, "providers:", auth.currentUser?.providerData?.map(p => p.providerId), "phone:", auth.currentUser?.phoneNumber);
+  try {
+    const token = await auth.currentUser?.getIdToken();
+    console.log("[enqueueFile] Diagnostic - getIdToken() succeeded:", !!token, "length:", token?.length);
+    if (token) {
+      const parts = token.split(".");
+      if (parts.length === 3) {
+        const payload = JSON.parse(atob(parts[1].replace(/-/g, "+").replace(/_/g, "/")));
+        console.log("[enqueueFile] Diagnostic - token payload:", { iss: payload.iss, aud: payload.aud, sub: payload.sub, exp: payload.exp, iat: payload.iat, auth_time: payload.auth_time, firebase: payload.firebase });
       }
-      return { current, total: Math.max(current, total) };
     }
+  } catch (tokenErr) {
+    console.error("[enqueueFile] Diagnostic - getIdToken() FAILED:", tokenErr.code, tokenErr.message);
   }
-  return { current: 1, total: 1 };
+  
+  console.log("[enqueueFile] About to write:", queueRef.path, "auth.uid:", currentUser?.uid, "currentPharmacyId:", currentPharmacyId);
+  try {
+    await mutateImportQueue("create", imageId, {
+      imageId,
+      storagePath,
+      fileName: file.name,
+      status: "uploaded",
+      pdfPageNumber: hints && Number(hints.pageNumber) >= 1 ? Number(hints.pageNumber) : null,
+      pdfTotalPages: hints && Number(hints.totalPages) >= 1 ? Number(hints.totalPages) : null,
+      pHash: pHash || null,
+      duplicateWarning: duplicateWarning || null,
+    });
+  } catch (writeErr) {
+    console.error("[enqueueFile] mutateImportQueue FAILED - code:", writeErr.code, "message:", writeErr.message, "details:", writeErr.details, "full error:", JSON.stringify(writeErr, Object.getOwnPropertyNames(writeErr)));
+    throw writeErr;
+  }
+  console.log("[enqueueFile] Queue doc written:", imageId);
+
+  return {
+    imageId,
+    storagePath,
+    fileName: file.name,
+    status: "uploaded",
+    retries: 0,
+    pollCount: 0,
+    pdfPageNumber: hints && Number(hints.pageNumber) >= 1 ? Number(hints.pageNumber) : null,
+    pdfTotalPages: hints && Number(hints.totalPages) >= 1 ? Number(hints.totalPages) : null,
+    pHash,
+    file,
+  };
 }
 
-async function handleMultipleFilesSelected(files) {
-  showLoadingOverlay(true, "Initializing OCR scanner...");
-  triageFiles = [];
-  triageGroups = [];
-
-  let count = 0;
-  for (const file of files) {
-    count++;
-    showLoadingOverlay(true, `OCR Analysis: File ${count}/${files.length}...`);
+async function handleMultipleFilesSelected(entries) {
+  console.log("[handleMultipleFilesSelected] Starting batch upload:", entries.length, "files");
+  showLoadingOverlay(true, `Uploading ${entries.length} file(s)...`);
+  const items = [];
+  for (let i = 0; i < entries.length; i++) {
     try {
-      const text = await performOcrWithRetry(file);
-      const invoiceNo = parseInvoiceNo(text);
-      const { current: pageNum, total: totalPages } = parsePageInfo(text);
-      
-      console.log(`OCR Raw Text for ${file.name}:`, text);
-      console.log(`OCR Parsed Metadata for ${file.name}:`, { invoiceNo, pageNum, totalPages });
-
-      triageFiles.push({
-        id: `file_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
-        file,
-        objectUrl: URL.createObjectURL(file),
-        text,
-        invoiceNo,
-        pageNum,
-        totalPages
-      });
+      // PDF split pages arrive as { file, pageNumber, totalPages }; gallery
+      // files arrive as raw File objects.
+      const entry = entries[i];
+      const file = entry instanceof File ? entry : entry.file;
+      const hints = entry instanceof File ? null : { pageNumber: entry.pageNumber, totalPages: entry.totalPages };
+      console.log(`[handleMultipleFilesSelected] Uploading file ${i+1}/${entries.length}:`, file.name);
+      items.push(await enqueueFile(file, i, hints));
     } catch (err) {
-      console.error("OCR failed for file: " + file.name, err);
-      triageFiles.push({
-        id: `file_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
-        file,
-        objectUrl: URL.createObjectURL(file),
-        text: "",
-        invoiceNo: "",
-        pageNum: 1,
-        totalPages: 1
-      });
+      console.error(`[handleMultipleFilesSelected] Upload FAILED for file ${i}:`, err.code, err.message, err);
+      showToast(`Upload failed for ${entries[i].name || "file"}: ${err.message}`, "error");
     }
   }
-
-  await terminateOcrWorker();
   showLoadingOverlay(false);
-  autoGroupTriageFiles();
-
-  // If there are no multi-page groups (every group has exactly 1 file), bypass the triage modal entirely!
-  const hasMultiPageGroup = triageGroups.some(g => g.files.length > 1);
-  if (!hasMultiPageGroup) {
-    console.log("No multi-page invoices detected, bypassing triage modal and proceeding to extraction...");
-    startTriageUploadAndExtraction();
-  } else {
-    openTriageModal();
+  console.log("[handleMultipleFilesSelected] Batch complete, successful:", items.length);
+  if (items.length > 0) {
+    importQueue.push(...items);
+    renderImportQueueStatus();
+    startImportQueue();
   }
 }
 
-function autoGroupTriageFiles() {
-  triageGroups = [];
-  const groupsMap = {};
-  const unidentifiedFiles = [];
+function startImportQueue() {
+  if (importQueueBusy) return;
+  importQueueBusy = true;
+  processNextQueueItem();
+}
 
-  triageFiles.forEach((tf) => {
-    if (tf.invoiceNo) {
-      if (!groupsMap[tf.invoiceNo]) {
-        groupsMap[tf.invoiceNo] = {
-          id: `group_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
-          invoiceNo: tf.invoiceNo,
-          files: []
-        };
-        triageGroups.push(groupsMap[tf.invoiceNo]);
-      }
-      groupsMap[tf.invoiceNo].files.push(tf.id);
-    } else {
-      unidentifiedFiles.push(tf);
+async function processNextQueueItem() {
+  while (importQueueCursor < importQueue.length) {
+    const item = importQueue[importQueueCursor];
+    renderImportQueueStatus();
+    const outcome = await processQueueItem(item);
+    if (outcome === "awaiting-review") {
+      importQueueBusy = false;
+      renderImportQueueStatus();
+      return; // review panel open — advanceImportQueue() resumes after save/reject
     }
-  });
+    if (outcome === "retry") {
+      renderImportQueueStatus();
+      continue; // transient — re-attempt the same item
+    }
+    importQueueCursor++;
+  }
+  importQueueBusy = false;
+  renderImportQueueStatus();
+}
 
-  let lastGroupId = null;
-  if (triageGroups.length > 0) {
-    lastGroupId = triageGroups[triageGroups.length - 1].id;
+// User confirmed/rejected the current review — move to the next queue item.
+function advanceImportQueue() {
+  importQueueCursor++;
+  startImportQueue();
+}
+
+async function processQueueItem(item) {
+  // Fast paths that need no re-extraction (resume-safe).
+  let qData = null;
+  try {
+    const qSnap = await getDoc(queueItemRef(item.imageId));
+    qData = qSnap.exists ? qSnap.data() : null;
+  } catch (_) {}
+  if (qData) {
+    const qs = qData.status || "";
+    if (qs === "extracted" && qData.extracted) {
+      item.status = "extracted";
+      // Layer 2: Compound key duplicate check (hard block)
+      const extracted = qData.extracted;
+      const distributorId = normalizeDistributorName(extracted.distributor || "");
+      const dupCheck = await checkDuplicateByCompoundKey(currentPharmacyId, distributorId, extracted.invoiceNumber || "");
+      if (dupCheck.isDuplicate) {
+        const m = dupCheck.match;
+        const dateStr = m.savedAt?.toDate ? m.savedAt.toDate().toLocaleString() : "unknown";
+        const override = confirm(
+          `🛑 DUPLICATE INVOICE BLOCKED\n\n` +
+          `This invoice (${m.invoiceNumber} from ${m.distributor || m.distributorId}) ` +
+          `was already saved on ${dateStr}.\n\n` +
+          `Saving again would create duplicate stock entries.\n\n` +
+          `Click OK to override and save anyway, or Cancel to discard.`
+        );
+        if (!override) {
+          // Mark queue item as rejected so it doesn't come back
+          await mutateImportQueue("update", item.imageId, { status: "rejected" });
+          showToast("Duplicate invoice discarded.", "warning");
+          return "done";
+        }
+        // User chose to override — proceed to review
+      }
+      await openQueueReview(item, extracted);
+      return "awaiting-review";
+    }
+    if (qs === "ingested" || qs === "ingested-partial") {
+      item.status = qs;
+      return "done"; // merged already, or a staged page awaiting its footer page
+    }
+    if (["saved", "reviewed", "failed", "rejected"].includes(qs)) {
+      item.status = qs;
+      return "done";
+    }
   }
 
-  unidentifiedFiles.forEach((tf) => {
-    if (tf.pageNum > 1 && lastGroupId) {
-      const group = triageGroups.find(g => g.id === lastGroupId);
-      group.files.push(tf.id);
-    } else {
-      const newGroup = {
-        id: `group_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
-        invoiceNo: `UNIDENTIFIED_${triageGroups.length + 1}`,
-        files: [tf.id]
-      };
-      triageGroups.push(newGroup);
-      lastGroupId = newGroup.id;
-    }
-  });
-
-  triageGroups.forEach((group) => {
-    group.files.sort((aId, bId) => {
-      const a = triageFiles.find(f => f.id === aId);
-      const b = triageFiles.find(f => f.id === bId);
-      return a.pageNum - b.pageNum;
+  // Let the server claim (leased) and extract.
+  console.log("[processQueueItem] Calling processImportQueueItem for", item.imageId, { pharmacyId: currentPharmacyId, pdfPageNumber: item.pdfPageNumber, pdfTotalPages: item.pdfTotalPages });
+  const processFn = httpsCallable(functions, "processImportQueueItem", { timeout: 120000 });
+  let result;
+  try {
+    result = await processFn({
+      pharmacyId: currentPharmacyId,
+      imageId: item.imageId,
+      pdfPageNumber: item.pdfPageNumber || null,
+      pdfTotalPages: item.pdfTotalPages || null,
     });
-  });
+    console.log("[processQueueItem] CF response:", result.data);
+  } catch (err) {
+    console.error("[processQueueItem] CF ERROR:", err.code, err.message, err.details, err);
+    showToast(`Queue processing error: ${err.message}`, "error");
+    return "done";
+  }
+  const data = result.data || {};
+  const status = data.status || "unknown";
+
+  if (status === "extracted") {
+    item.status = "extracted";
+    // Layer 2: Compound key duplicate check (hard block)
+    const extracted = data.extracted || {};
+    const distributorId = normalizeDistributorName(extracted.distributor || "");
+    const dupCheck = await checkDuplicateByCompoundKey(currentPharmacyId, distributorId, extracted.invoiceNumber || "");
+    if (dupCheck.isDuplicate) {
+      const m = dupCheck.match;
+      const dateStr = m.savedAt?.toDate ? m.savedAt.toDate().toLocaleString() : "unknown";
+      const override = confirm(
+        `🛑 DUPLICATE INVOICE BLOCKED\n\n` +
+        `This invoice (${m.invoiceNumber} from ${m.distributor || m.distributorId}) ` +
+        `was already saved on ${dateStr}.\n\n` +
+        `Saving again would create duplicate stock entries.\n\n` +
+        `Click OK to override and save anyway, or Cancel to discard.`
+      );
+      if (!override) {
+        // Mark queue item as rejected so it doesn't come back
+        await mutateImportQueue("update", item.imageId, { status: "rejected" });
+        showToast("Duplicate invoice discarded.", "warning");
+        return "done";
+      }
+      // User chose to override — proceed to review
+    }
+    await openQueueReview(item, extracted);
+    return "awaiting-review";
+  }
+  if (status === "ingested") {
+    item.status = "ingested";
+    showToast(data.message || "Invoice merged & saved.", "success");
+    return "done";
+  }
+  if (status === "ingested-partial" || status === "staged") {
+    item.status = "ingested-partial";
+    showToast(data.message || "Page staged — waiting for remaining pages.", "info");
+    return "done";
+  }
+  if (status === "uploaded") {
+    // Transient failure — the server reverted the item for a retry.
+    item.retries = (item.retries || 0) + 1;
+    if (item.retries >= 3) {
+      item.status = "failed";
+      showToast(`Extraction failed after retries: ${data.error || ""}`, "error");
+      return "done";
+    }
+    await new Promise((r) => setTimeout(r, 2000));
+    return "retry";
+  }
+  if (status === "failed") {
+    item.status = "failed";
+    showToast(`Extraction failed: ${data.error || ""}`, "error");
+    return "done";
+  }
+  if (data.busy || status === "processing" || status === "saving") {
+    // Another invocation (or a stale lease) owns the item — poll until free.
+    item.pollCount = (item.pollCount || 0) + 1;
+    if (item.pollCount > 10) {
+      item.status = status;
+      showToast(`Queue item still in progress: ${item.imageId}`, "info");
+      return "done";
+    }
+    await new Promise((r) => setTimeout(r, 3000));
+    return "retry";
+  }
+  // saved/reviewed/rejected or unknown — nothing to do.
+  item.status = status;
+  return "done";
 }
 
-function openTriageModal() {
-  $("triage-modal").classList.remove("hidden");
-  renderTriageGroups();
-  
-  $("btn-close-triage").onclick = () => {
-    $("triage-modal").classList.add("hidden");
-    triageFiles.forEach(f => URL.revokeObjectURL(f.objectUrl));
-  };
-  
-  $("btn-triage-add-group").onclick = () => {
-    const newGroup = {
-      id: `group_${Date.now()}_${Math.random().toString(36).substr(2, 5)}`,
-      invoiceNo: `NEW_GROUP_${triageGroups.length + 1}`,
-      files: []
-    };
-    triageGroups.push(newGroup);
-    renderTriageGroups();
-  };
-  
-  $("btn-triage-confirm").onclick = startTriageUploadAndExtraction;
-}
-
-function renderTriageGroups() {
-  const container = $("triage-groups-container");
-  container.innerHTML = "";
-
-  triageGroups.forEach((group) => {
-    const card = document.createElement("div");
-    card.className = "bg-slate-800/60 border border-slate-700/60 rounded-xl p-4 space-y-3";
-    card.dataset.groupId = group.id;
-
-    const headerHtml = `
-      <div class="flex justify-between items-center gap-2">
-        <div class="flex items-center gap-1.5 flex-1">
-          <label class="text-[10px] font-bold text-slate-500 uppercase">Invoice No:</label>
-          <input type="text" value="${group.invoiceNo}" 
-            class="flex-1 bg-slate-900 border border-slate-700 rounded-md px-2 py-1 text-xs text-slate-200 focus:outline-none focus:border-indigo-500 font-mono"
-            onchange="window.updateTriageGroupName('${group.id}', this.value)"
-          >
-        </div>
-        <button class="text-slate-400 hover:text-rose-400 p-1 rounded" onclick="window.deleteTriageGroup('${group.id}')" title="Delete Group">
-          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/></svg>
-        </button>
-      </div>
-    `;
-
-    let pagesHtml = `<div class="grid grid-cols-2 gap-2">`;
-    if (group.files.length === 0) {
-      pagesHtml += `<div class="col-span-2 text-center text-xs text-slate-500 py-3">No pages in this group. Move pages here.</div>`;
-    } else {
-      group.files.forEach((fileId) => {
-        const tf = triageFiles.find(f => f.id === fileId);
-        pagesHtml += `
-          <div class="bg-slate-900 border border-slate-800 rounded-lg p-2 flex flex-col gap-2 relative">
-            <div class="aspect-[4/3] bg-black rounded overflow-hidden relative">
-              <img src="${tf.objectUrl}" class="w-full h-full object-contain">
-              <span class="absolute bottom-1 right-1 bg-black/75 px-1.5 py-0.5 rounded text-[8px] font-mono text-slate-300">
-                Page ${tf.pageNum}
-              </span>
-            </div>
-            <div class="flex flex-col gap-1">
-              <span class="text-[9px] text-slate-500 truncate">${tf.file.name}</span>
-              <div class="flex items-center gap-1">
-                <span class="text-[8px] text-slate-500 uppercase">Move:</span>
-                <select class="flex-1 bg-slate-800 border border-slate-700 rounded text-[9px] px-1 py-0.5 text-slate-300"
-                  onchange="window.moveTriageFile('${tf.id}', this.value)"
-                >
-                  ${triageGroups.map(g => `<option value="${g.id}" ${g.id === group.id ? "selected" : ""}>${g.invoiceNo}</option>`).join("")}
-                </select>
-              </div>
-            </div>
-          </div>
-        `;
-      });
-    }
-    pagesHtml += `</div>`;
-
-    card.innerHTML = headerHtml + pagesHtml;
-    container.appendChild(card);
-  });
-
-  $("triage-stats-txt").textContent = `${triageFiles.length} file(s) · ${triageGroups.length} invoice group(s)`;
-}
-
-window.updateTriageGroupName = (groupId, val) => {
-  const group = triageGroups.find(g => g.id === groupId);
-  if (group) {
-    group.invoiceNo = val.trim();
-    renderTriageGroups();
-  }
-};
-
-window.deleteTriageGroup = (groupId) => {
-  const group = triageGroups.find(g => g.id === groupId);
-  if (group) {
-    triageGroups = triageGroups.filter(g => g.id !== groupId);
-    if (group.files.length > 0) {
-      if (triageGroups.length > 0) {
-        triageGroups[0].files.push(...group.files);
-      } else {
-        triageGroups.push({
-          id: `group_${Date.now()}`,
-          invoiceNo: "ORPHANED_PAGES",
-          files: group.files
-        });
-      }
-    }
-    renderTriageGroups();
-  }
-};
-
-window.moveTriageFile = (fileId, targetGroupId) => {
-  triageGroups.forEach((g) => {
-    g.files = g.files.filter(id => id !== fileId);
-  });
-  const targetGroup = triageGroups.find(g => g.id === targetGroupId);
-  if (targetGroup) {
-    targetGroup.files.push(fileId);
-    targetGroup.files.sort((aId, bId) => {
-      const a = triageFiles.find(f => f.id === aId);
-      const b = triageFiles.find(f => f.id === bId);
-      return a.pageNum - b.pageNum;
-    });
-  }
-  renderTriageGroups();
-};
-
-async function startTriageUploadAndExtraction() {
-  $("triage-modal").classList.add("hidden");
-  
-  const groupsToProcess = triageGroups.filter(g => g.files.length > 0);
-  if (groupsToProcess.length === 0) {
-    showToast("No invoices to process", "warning");
-    return;
-  }
-
-  showLoadingOverlay(true, "Uploading invoice files...");
-  reviewQueue = [];
-  reviewQueueIndex = 0;
-
-  const extractFn = httpsCallable(functions, "extractInvoice", { timeout: 120000 });
-
-  for (let i = 0; i < groupsToProcess.length; i++) {
-    const group = groupsToProcess[i];
-    showLoadingOverlay(true, `Processing invoice ${i + 1}/${groupsToProcess.length}...`);
-
-    const storagePaths = [];
-    const objectUrls = [];
-    
-    try {
-      for (let j = 0; j < group.files.length; j++) {
-        const tf = triageFiles.find(f => f.id === group.files[j]);
-        const ext = tf.file.type === "application/pdf" ? "pdf" : "jpg";
-        const filename = `${Date.now()}_grp_${i}_p_${j}_${Math.random().toString(36).slice(2)}.${ext}`;
-        const storagePath = `invoices/${currentPharmacyId}/${filename}`;
-        const storageRef = ref(storage, storagePath);
-        
-        await uploadBytes(storageRef, tf.file, { contentType: tf.file.type });
-        storagePaths.push(storagePath);
-        objectUrls.push(tf.objectUrl);
-      }
-    } catch (uploadErr) {
-      showLoadingOverlay(false);
-      showToast(`Upload failed for group ${group.invoiceNo}: ${uploadErr.message}`, "error");
-      return;
-    }
-
-    showLoadingOverlay(true, `Extracting Invoice "${group.invoiceNo}" with Gemini AI...`);
-    try {
-      const result = await extractFn({ storagePaths, pharmacyId: currentPharmacyId });
-      reviewQueue.push({
-        storagePaths,
-        objectUrls,
-        extracted: result.data
-      });
-    } catch (geminiErr) {
-      console.error(`Gemini extraction failed for group "${group.invoiceNo}":`, geminiErr);
-      showLoadingOverlay(false);
-      showToast(`Gemini extraction failed for group ${group.invoiceNo}: ${geminiErr.message}`, "error");
-      for (const p of storagePaths) {
-        try { await deleteObject(ref(storage, p)); } catch (_) {}
-      }
-      return;
-    }
-  }
-
-  showLoadingOverlay(false);
-  
-  triageFiles.forEach((tf) => {
-    const isUsed = reviewQueue.some(item => item.objectUrls.includes(tf.objectUrl));
-    if (!isUsed) URL.revokeObjectURL(tf.objectUrl);
-  });
-
-  if (reviewQueue.length > 0) {
-    showNextReviewInQueue();
+async function openQueueReview(item, extracted) {
+  let objectUrl = "";
+  if (item.file) {
+    objectUrl = URL.createObjectURL(item.file);
   } else {
-    showToast("No invoices extracted successfully", "error");
+    try {
+      objectUrl = await getDownloadURL(ref(storage, item.storagePath));
+    } catch (_) {}
   }
-}
-
-function showNextReviewInQueue() {
-  if (reviewQueueIndex >= reviewQueue.length) {
-    showToast("All invoice extractions reviewed and saved!", "success");
-    loadExpiringMedicines();
-    return;
-  }
-
-  const reviewItem = reviewQueue[reviewQueueIndex];
   reviewSession = {
-    storagePaths: reviewItem.storagePaths,
-    objectUrls: reviewItem.objectUrls,
+    storagePaths: [item.storagePath],
+    objectUrls: objectUrl ? [objectUrl] : [],
     currentPageIndex: 0,
-    fileType: 'image',
-    extracted: reviewItem.extracted
+    fileType: item.storagePath.endsWith(".pdf") ? "pdf" : "image",
+    extracted,
+    queueId: item.imageId,
+    pHash: item.pHash || null,
   };
+  openReviewPanel(extracted);
+}
 
-  openReviewPanel(reviewItem.extracted);
+// On page load, pick up any queue item that never reached a terminal state and
+// resume processing automatically (persisted import queue = crash safety).
+async function resumeImportQueue() {
+  if (!currentUser || !currentPharmacyId) return;
+  try {
+    console.log("[resumeImportQueue] Checking for pending items in", currentPharmacyId);
+    const q = query(
+      collection(db, "pharmacies", currentPharmacyId, "importQueue"),
+      where("status", "in", ["uploaded", "processing", "extracted", "ingested-partial"])
+    );
+    const snap = await getDocs(q);
+    console.log("[resumeImportQueue] Found", snap.docs.length, "pending queue items");
+    const items = snap.docs.map((d) => {
+      const dta = d.data();
+      return {
+        imageId: d.id,
+        storagePath: dta.storagePath || "",
+        fileName: dta.fileName || d.id,
+        status: dta.status || "uploaded",
+        retries: 0,
+        pollCount: 0,
+        pdfPageNumber: dta.pdfPageNumber || null,
+        pdfTotalPages: dta.pdfTotalPages || null,
+      };
+    });
+    if (items.length > 0) {
+      importQueue = items;
+      importQueueCursor = 0;
+      renderImportQueueStatus();
+      showToast(`Resuming ${items.length} pending import(s)...`, "info");
+      startImportQueue();
+    }
+  } catch (err) {
+    console.error("[resumeImportQueue] ERROR:", err.code, err.message, err);
+  }
+}
+
+function renderImportQueueStatus() {
+  const panel = $("import-queue-panel");
+  if (!panel) return;
+  const list = $("import-queue-list");
+  if (!list) return;
+
+  if (importQueue.length === 0) {
+    panel.classList.add("hidden");
+    return;
+  }
+  panel.classList.remove("hidden");
+  const countEl = $("import-queue-count");
+  if (countEl) countEl.textContent = `${importQueue.length} item(s) · ${importQueue.filter((i) => i.status === "extracted").length} ready for review`;
+
+  list.innerHTML = importQueue.map((item, idx) => {
+    const current = idx === importQueueCursor;
+    const qs = item.status || "uploaded";
+    const label = {
+      uploaded: "Queued",
+      processing: "Processing…",
+      saving: "Saving…",
+      extracted: "Ready for review",
+      ingested: "Saved (merged)",
+      "ingested-partial": "Staged",
+      saved: "Saved",
+      reviewed: "Reviewed",
+      failed: "Failed",
+      rejected: "Rejected",
+    }[qs] || qs;
+    const badgeClass = {
+      failed: "bg-rose-500/15 text-rose-400",
+      ingested: "bg-emerald-500/15 text-emerald-400",
+      saved: "bg-emerald-500/15 text-emerald-400",
+      extracted: "bg-amber-500/15 text-amber-400",
+      uploaded: "bg-indigo-500/15 text-indigo-400",
+      processing: "bg-indigo-500/15 text-indigo-400 animate-pulse",
+      saving: "bg-indigo-500/15 text-indigo-400 animate-pulse",
+      rejected: "bg-slate-500/15 text-slate-400",
+      reviewed: "bg-slate-500/15 text-slate-400",
+      "ingested-partial": "bg-amber-500/15 text-amber-400",
+    }[qs] || "bg-slate-500/15 text-slate-400";
+    return `<div class="flex justify-between items-center gap-2 px-3 py-1.5 rounded-lg ${
+      current ? "bg-slate-800/80 border border-indigo-500/40" : "bg-slate-900/60 border border-slate-800"
+    }">
+      <div class="min-w-0">
+        <p class="text-[10px] font-mono text-slate-300 truncate">${esc(item.fileName || item.imageId)}</p>
+        <p class="text-[9px] text-slate-500 truncate">${esc(item.storagePath)}</p>
+      </div>
+      <span class="text-[9px] px-1.5 py-0.5 rounded font-bold shrink-0 ${badgeClass}">${label}</span>
+    </div>`;
+  }).join("");
 }
 
 function updateReviewVisualSource() {
   const imgEl = $("review-invoice-img");
   const pdfEl = $("review-invoice-pdf");
   const url = reviewSession.objectUrls[reviewSession.currentPageIndex];
-  
+
   if (url && (url.includes("pdf") || url.startsWith("blob:") && reviewSession.fileType === "pdf")) {
     imgEl.classList.add("hidden");
     pdfEl.classList.remove("hidden");
@@ -1613,13 +1815,123 @@ async function splitPdfToImages(file) {
     const ctx = canvas.getContext('2d');
     canvas.width = viewport.width;
     canvas.height = viewport.height;
-    
-    await page.render({ canvasContext: ctx, viewport: viewport }).promise;
-    
+
+    await page.render({ canvasContext: ctx, viewport: viewport }).promise();
+
     const blob = await new Promise(resolve => canvas.toBlob(resolve, 'image/jpeg', 0.9));
     const pageFile = new File([blob], `${file.name.replace(/\.[^/.]+$/, "")}_page_${pageNum}.jpg`, { type: 'image/jpeg' });
-    images.push(pageFile);
+    images.push({ file: pageFile, pageNumber: pageNum, totalPages: pdf.numPages });
   }
   return images;
 }
 
+// ─── Perceptual Hash (dHash) for Duplicate Detection ───────────────────────────
+// Difference hash: resize to 9x8 grayscale, compare adjacent pixels.
+// Returns a 64-bit hash as hex string. Low Hamming distance = visually similar.
+
+async function computeDHash(file) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => {
+      const size = 9; // 9x8 = 72 pixels, 64 bits of differences
+      const canvas = document.createElement('canvas');
+      canvas.width = size;
+      canvas.height = size - 1; // 8
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, size, size - 1);
+      const data = ctx.getImageData(0, 0, size, size - 1).data;
+      let hash = 0;
+      for (let y = 0; y < size - 1; y++) {
+        for (let x = 0; x < size - 1; x++) {
+          const i = (y * size + x) * 4;
+          const j = (y * size + x + 1) * 4;
+          // Grayscale luminance
+          const left = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+          const right = 0.299 * data[j] + 0.587 * data[j + 1] + 0.114 * data[j + 2];
+          hash = (hash << 1) | (left > right ? 1 : 0);
+        }
+      }
+      resolve(hash.toString(16).padStart(16, '0'));
+    };
+    img.onerror = reject;
+    img.src = URL.createObjectURL(file);
+  });
+}
+
+function hammingDistance(hexA, hexB) {
+  const a = BigInt('0x' + hexA);
+  const b = BigInt('0x' + hexB);
+  let diff = a ^ b;
+  let dist = 0;
+  while (diff > 0) {
+    dist += Number(diff & 1n);
+    diff >>= 1n;
+  }
+  return dist;
+}
+
+// Fetch recent invoice pHashes for this pharmacy (last 60 days)
+async function fetchRecentInvoiceHashes(pharmacyId) {
+  const cutoff = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000);
+  const q = query(
+    collection(db, "pharmacies", pharmacyId, "invoices"),
+    where("createdAt", ">=", cutoff),
+    orderBy("createdAt", "desc"),
+    limit(200)
+  );
+  const snap = await getDocs(q);
+  const hashes = [];
+  snap.forEach((doc) => {
+    const d = doc.data();
+    if (d.pHash) {
+      hashes.push({ pHash: d.pHash, invoiceNumber: d.invoiceNumber, distributor: d.distributor, createdAt: d.createdAt });
+    }
+  });
+  return hashes;
+}
+
+// Check if a new image is a near-duplicate of any recent invoice
+// Returns { isDuplicate: boolean, match: { pHash, invoiceNumber, distributor, createdAt, distance } | null }
+async function checkDuplicateByHash(file, pharmacyId) {
+  const hash = await computeDHash(file);
+  const recent = await fetchRecentInvoiceHashes(pharmacyId);
+  const THRESHOLD = 8; // Hamming distance ≤ 8 = likely same invoice (tune as needed)
+  for (const h of recent) {
+    const dist = hammingDistance(hash, h.pHash);
+    if (dist <= THRESHOLD) {
+      return { isDuplicate: true, match: { ...h, distance: dist, newHash: hash } };
+    }
+  }
+  return { isDuplicate: false, match: null, newHash: hash };
+}
+
+// Layer 2: Compound key duplicate check after extraction
+// Checks Firestore for existing invoice with same distributorId + invoiceNumber
+// This is a HARD BLOCK — prevents duplicate stock entries
+async function checkDuplicateByCompoundKey(pharmacyId, distributorId, invoiceNumber) {
+  if (!distributorId || !invoiceNumber) return { isDuplicate: false, match: null };
+  const q = query(
+    collection(db, "pharmacies", pharmacyId, "invoices"),
+    where("distributorId", "==", distributorId),
+    where("invoiceNumber", "==", invoiceNumber),
+    limit(1)
+  );
+  const snap = await getDocs(q);
+  if (!snap.empty) {
+    const doc = snap.docs[0];
+    const d = doc.data();
+    return {
+      isDuplicate: true,
+      match: {
+        invoiceId: doc.id,
+        invoiceNumber: d.invoiceNumber,
+        distributor: d.distributor,
+        distributorId: d.distributorId,
+        invoiceDate: d.invoiceDate,
+        createdAt: d.createdAt,
+        savedAt: d.confirmedAt || d.createdAt,
+      }
+    };
+  }
+return { isDuplicate: false, match: null };
+}

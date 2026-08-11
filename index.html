@@ -43,12 +43,10 @@
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800&family=Plus+Jakarta+Sans:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="style.css">
-    <!-- Tesseract.js for client-side OCR -->
-    <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
     <!-- PDF.js for client-side PDF rendering -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js"></script>
     <!-- Firebase SDK (v10 modular via CDN) -->
-    <script type="module" src="script.js?v=1.0.12"></script>
+    <script type="module" src="script.js?v=1.0.18"></script>
 </head>
 <body class="h-full bg-slate-950 text-slate-100 font-body transition-colors duration-300 selection:bg-indigo-500/30">
     <!-- Glow Background Effects -->
@@ -212,34 +210,16 @@
                         </div>
                     </div>
 
-                    <!-- Client-Side Scan Precheck Overlay/Feedback -->
-                    <div id="precheck-feedback-panel" class="hidden bg-slate-900 border-2 border-brand-warning/30 rounded-2xl p-4 space-y-3">
+                    <!-- Import Queue Status (persisted, resumable batch) -->
+                    <div id="import-queue-panel" class="hidden bg-slate-900 border border-slate-800 rounded-2xl p-3 space-y-2">
                         <div class="flex justify-between items-center">
-                            <span class="text-xs font-bold uppercase tracking-wider text-brand-warning flex items-center gap-1.5">
-                                <span class="w-2 h-2 rounded-full bg-brand-warning animate-ping"></span>
-                                Client-Side Quality Check
+                            <span class="text-xs font-bold uppercase tracking-wider text-indigo-400 flex items-center gap-1.5">
+                                <span class="w-2 h-2 rounded-full bg-indigo-400 animate-pulse"></span>
+                                Import Queue (Auto-Resume)
                             </span>
-                            <button id="btn-cancel-scan" class="text-[10px] text-slate-400 hover:text-slate-200">Dismiss</button>
+                            <span id="import-queue-count" class="text-[10px] text-slate-400 font-bold"></span>
                         </div>
-                        <div class="space-y-2">
-                            <!-- Blur status -->
-                            <div class="flex items-center justify-between text-xs">
-                                <span class="text-slate-400">Image Blur Variance:</span>
-                                <span id="precheck-blur-val" class="font-mono font-bold text-slate-200">Calculating...</span>
-                            </div>
-                            <div class="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
-                                <div id="precheck-blur-bar" class="bg-indigo-500 h-full transition-all duration-300" style="width: 0%"></div>
-                            </div>
-                            <!-- Exposure status -->
-                            <div class="flex items-center justify-between text-xs">
-                                <span class="text-slate-400">Exposure (Luminance):</span>
-                                <span id="precheck-exposure-val" class="font-mono font-bold text-slate-200">Calculating...</span>
-                            </div>
-                            <div class="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
-                                <div id="precheck-exposure-bar" class="bg-indigo-500 h-full transition-all duration-300" style="width: 0%"></div>
-                            </div>
-                        </div>
-                        <div id="precheck-status-msg" class="text-xs font-semibold py-1.5 px-3 rounded text-center"></div>
+                        <div id="import-queue-list" class="space-y-1.5"></div>
                     </div>
 
                     <!-- Live Camera Feed (Hidden by default, triggered on Camera Scan click) -->
@@ -373,35 +353,19 @@
                         </div>
                     </div>
 
-                    <!-- Grouping Triage Modal -->
-                    <div id="triage-modal" class="hidden fixed inset-0 bg-slate-950/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
-                        <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-2xl h-[80vh] flex flex-col overflow-hidden shadow-2xl">
-                            <div class="p-4 border-b border-slate-800 flex justify-between items-center bg-slate-900 shrink-0">
-                                <div>
-                                    <h3 class="text-sm font-heading font-extrabold text-slate-100">Invoice Grouping Triage</h3>
-                                    <p class="text-[10px] text-slate-400">Confirm or adjust page grouping before sending to Gemini</p>
-                                </div>
-                                <button id="btn-close-triage" class="p-1.5 rounded-lg text-slate-400 hover:text-slate-200">
-                                    <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"/></svg>
-                                </button>
-                            </div>
-                            
-                            <!-- Groups Container -->
-                            <div id="triage-groups-container" class="flex-1 overflow-y-auto p-4 space-y-4 min-h-0">
-                                <!-- Populated dynamically -->
-                            </div>
-                            
-                            <!-- Footer -->
-                            <div class="p-4 border-t border-slate-800 bg-slate-950/60 flex justify-between items-center shrink-0">
-                                <span id="triage-stats-txt" class="text-xs text-slate-400 font-mono">0 files · 0 groups</span>
-                                <div class="flex gap-2">
-                                    <button id="btn-triage-add-group" class="py-2 px-3.5 bg-slate-800 text-slate-200 hover:bg-slate-700 text-xs font-bold rounded-lg transition-all">Add Invoice Group</button>
-                                    <button id="btn-triage-confirm" class="py-2 px-4 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-lg transition-all shadow-md active:scale-95">Analyze with Gemini</button>
-                                </div>
-                            </div>
+                    <!-- Pending Invoices (Staging Area) -->
+                    <div id="pending-invoices-section" class="space-y-2">
+                        <div class="flex justify-between items-baseline">
+                            <h3 class="text-sm font-heading font-extrabold text-slate-100 flex items-center gap-1.5">
+                                <span class="w-1.5 h-1.5 rounded-full bg-amber-400 animate-pulse"></span>
+                                Staged Invoices (Waiting)
+                            </h3>
+                            <span id="pending-invoices-count" class="text-[10px] text-slate-400 font-bold">0 waiting</span>
+                        </div>
+                        <div id="pending-invoices-list" class="space-y-2">
+                            <div class="text-center py-3 text-[10px] text-slate-500">No partial invoices staged.</div>
                         </div>
                     </div>
-
 
                     <!-- Expiring Soon Header -->
                     <div class="space-y-2">

@@ -1,5 +1,15 @@
 {
   "projects": {
     "default": "medsof-17a68"
-  }
+  },
+  "targets": {
+    "medsof-17a68": {
+      "storage": {
+        "rules": [
+          "medsof-17a68.firebasestorage.app"
+        ]
+      }
+    }
+  },
+  "etags": {}
 }
