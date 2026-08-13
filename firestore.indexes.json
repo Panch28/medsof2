@@ -7,6 +7,13 @@
         { "fieldPath": "distributorId", "order": "ASCENDING" },
         { "fieldPath": "invoiceNumber", "order": "ASCENDING" }
       ]
+    },
+    {
+      "collectionGroup": "invoices",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "pHash", "order": "ASCENDING" }
+      ]
     }
   ],
   "fieldOverrides": []

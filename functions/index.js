@@ -18,8 +18,12 @@
  * - saveInvoice: Writes a confirmed invoice + medicine records. When queueId is
  *   supplied it guards against duplicate saves from stale client retries and
  *   deletes the queue doc + raw Storage image after the write commits. It also
- *   enforces a server-side (distributorId, invoiceNumber) compound-key
- *   duplicate hard block before any write lands.
+ *   enforces a server-side pHash duplicate hard block (a re-upload of the same
+ *   page) before any write lands; the (distributorId, invoiceNumber) compound
+ *   key is now a soft warning only, because multi-page invoices legitimately
+ *   save one doc per page under the same key. Pages without the printed footer
+ *   totals are stored partial=true with invoiceTotal 0 so reporting never
+ *   double-counts across the pages of one invoice.
  * - discardQueueItem: Staff-authorized permanent discard of a queue item
  *   (deletes the queue doc + raw Storage image).
  * - listPendingInvoices / getPendingInvoice / deletePendingInvoice: legacy
@@ -264,7 +268,8 @@ function inferUniformRate(summary) {
 // cross-checking against footer totals. Returns an array of human-readable
 // discrepancies (empty array = all lines internally consistent).
 function checkGstConsistency(parsed) {
-  const issues = [];
+  const fixable = [];
+  const informational = [];
   const lines = Array.isArray(parsed.lineItems) ? parsed.lineItems : [];
 
   for (const l of lines) {
@@ -281,7 +286,7 @@ function checkGstConsistency(parsed) {
     if (taxable > 0 && rate > 0) {
       const expected = (taxable * rate) / 100;
       if (Math.abs(gv - expected) > 1) {
-        issues.push(`"${l.medicineName || "?"}": gstValue ₹${gv.toFixed(2)} != taxable ₹${taxable.toFixed(2)} x ${rate}% = ₹${expected.toFixed(2)} (gstRate or gstValue misread)`);
+        fixable.push(`"${l.medicineName || "?"}": gstValue ₹${gv.toFixed(2)} != taxable ₹${taxable.toFixed(2)} x ${rate}% = ₹${expected.toFixed(2)} (gstRate or gstValue misread)`);
       }
     }
 
@@ -290,23 +295,25 @@ function checkGstConsistency(parsed) {
     if (taxable > 0 && gv > 0 && net > 0) {
       const expectedNet = taxable + gv;
       if (Math.abs(net - expectedNet) > 1) {
-        issues.push(`"${l.medicineName || "?"}": netValue ₹${net.toFixed(2)} != taxable ₹${taxable.toFixed(2)} + GST ₹${gv.toFixed(2)} = ₹${expectedNet.toFixed(2)} (columns misread)`);
+        fixable.push(`"${l.medicineName || "?"}": netValue ₹${net.toFixed(2)} != taxable ₹${taxable.toFixed(2)} + GST ₹${gv.toFixed(2)} = ₹${expectedNet.toFixed(2)} (columns misread)`);
       }
     }
 
     // Per-line taxableValue arithmetic: taxableValue ≈ unitPrice × qtyBilled × (1 - cdPercent/100)
-    // This is the "GOLDEN ROW FORMULA" check from the prompt — bug #2 from VN-23-341141 (GUDCEF CV line)
-    // On Vardhman/MCS invoices this often does NOT hold exactly due to additional per-line adjustments.
-    // Use a wider tolerance (₹2) and only flag when the discrepancy is significant.
+    // This is the "GOLDEN ROW FORMULA" check from the prompt — bug #2 from VN-23-341141 (GUDCEF CV line).
+    // INFORMATION ONLY — NEVER drives a corrective Gemini turn: the correction prompt locks
+    // unitPrice / quantity / cdPercent, so this formula can never be corrected server-side, and on
+    // Vardhman/MCS invoices it legitimately does NOT hold (extra per-line adjustments). Flagging it
+    // as fixable burned the full 5-attempt correction budget on every such page.
     if (unitPrice > 0 && qtyBilled > 0) {
       const expectedTaxable = unitPrice * qtyBilled * (1 - cdPercent / 100);
       if (taxable > 0 && Math.abs(taxable - expectedTaxable) > 2) {
-        issues.push(`"${l.medicineName || "?"}": taxableValue ₹${taxable.toFixed(2)} != unitPrice ₹${unitPrice.toFixed(2)} × qty ${qtyBilled} × (1 - ${cdPercent}%) = ₹${expectedTaxable.toFixed(2)} (taxableValue or unitPrice/qty/CD% misread)`);
+        informational.push(`"${l.medicineName || "?"}": taxableValue ₹${taxable.toFixed(2)} != unitPrice ₹${unitPrice.toFixed(2)} × qty ${qtyBilled} × (1 - ${cdPercent}%) = ₹${expectedTaxable.toFixed(2)} (reference only)`);
       }
     }
   }
 
-  return issues;
+  return { fixable, informational };
 }
 // ─── Shared Gemini extraction pipeline ──────────────────────────────────────
 // ONE canonical prompt + ONE extraction routine, used by both extractInvoice
@@ -326,6 +333,7 @@ Return ONLY valid JSON matching this exact schema — no markdown, no explanatio
   "pageNumber": number,
   "totalPages": number,
   "looksLikeContinuationPage": boolean,
+  "printedPagination": "string (echo the literal printed pagination/continuation line VERBATIM, e.g. 'Page: 1 of 2', 'Page No. 1', or 'Continue Next Page...'; empty string if none is printed)",
   "captureQuality": {
     "readable": boolean,
     "issues": ["string"],
@@ -407,15 +415,16 @@ OPERATIONAL DIRECTIVES:
    - hasFooterTotals: Set to TRUE if this page contains the invoice summary/footer block with Grand Total, Cash Discount, Total GST, Sale Value, CGST/SGST amounts, and/or the tax slab breakdown table. Set to FALSE if this page only has line items and no financial summary block.
    - pageNumber: The X from the printed "Page: X of Y" indicator. If the indicator is missing, estimate: if the page has a footer/summary it is likely the LAST page; if it starts with a header/distributor name and invoice number it is page 1.
    - totalPages: The Y from the printed "Page: X of Y" indicator. If the indicator is missing, use 1 for a single-page invoice, 2 for a continuation page, or the highest pageNumber seen.
-   - looksLikeContinuationPage: TRUE if this page has NO invoice header (no "Tax Invoice", no distributor name at top), NO invoice number at top, and appears to be a continuation of line items from a previous page. FALSE if it looks like the first/main page of an invoice.
+    - looksLikeContinuationPage: TRUE if this page has NO invoice header (no "Tax Invoice", no distributor name at top), NO invoice number at top, and appears to be a continuation of line items from a previous page. FALSE if it looks like the first/main page of an invoice.
+    - printedPagination: echo the EXACT printed page-indicator text VERBATIM — e.g. "Page: 1 of 2", "Page No. 1", or "Continue Next Page...". If the page prints NO pagination or continuation line at all, return "" (empty string). NEVER invent a value — this field exists so downstream code can tell a "no printed line" page from a genuine "Continue Next Page..." continuation page.
 7. SINGLE-PAGE INVOICE: If this page contains BOTH line items AND the footer totals, set hasFooterTotals = true, pageNumber = 1, totalPages = 1, looksLikeContinuationPage = false. If it is page 1 of a multi-page invoice (line items only, no footer), set pageNumber = 1, totalPages = 2 (or the printed Y), hasFooterTotals = false.
 8. If multiple images are provided, they represent consecutive pages of the SAME invoice. Combine all line items. The footer totals are usually on the last page.
 9. confidence values are 0.0 to 1.0 per field. If the image is blurry or unreadable, set captureQuality.readable = false and list reasons in issues[].
 10. All amounts in INR as plain numbers (no ₹ symbol), typed as numbers, never strings. gstRate and cdPercent are percentages (e.g. 12, 4.00).
 11. Return ONLY valid JSON — no markdown, no explanation.
 12. SELF-CHECK before returning (this is mandatory):
-    a. sum of ALL line gstValue values should approximately equal the printed Total GST (totalGst) — within ₹1.
-    b. Verify the footer formula: saleValue − schDisc − cashDiscount + totalGst + roundOff − cnNo should approximately equal grandTotal (within ₹1). If it does not, you MISREAD a footer field — re-scan the footer summary block and CORRECT the specific misread field from the printed digits (pay special attention to the "Cash Disc." / "Sch Disc." rows — never read a printed discount as ₹0.00). Do NOT change line items to fake a match.
+    a. sum of ALL line gstValue values should approximately equal the printed Total GST (totalGst) — within ₹1 — BUT ONLY when this page is a complete single-page invoice (hasFooterTotals = true AND totalPages = 1). If this page is a continuation page (hasFooterTotals = false) or part of a multi-page invoice (totalPages > 1), the printed totals belong to the WHOLE invoice and will NOT equal this page's line sum — do NOT adjust line items to force that match; read and return the printed line digits as-is.
+    b. Verify the footer formula (saleValue − schDisc − cashDiscount + totalGst + roundOff − cnNo ≈ grandTotal) ONLY when hasFooterTotals = true. If it does not hold, you MISREAD a footer field — re-scan the footer summary block and CORRECT the specific misread field from the printed digits (pay special attention to the "Cash Disc." / "Sch Disc." rows — never read a printed discount as ₹0.00). Do NOT change line items to fake a match. When hasFooterTotals = false there is no footer on this page to verify.
     c. PER-LINE GST RATE check: for EVERY line, gstValue should be within ₹1 of (taxableValue × gstRate / 100). If a line's gstRate disagrees with its gstValue, you MISREAD the GST % column — re-scan that line and correct gstRate from the printed digits.
     d. RATE-SLAB check: the DISTINCT gstRate values across lines must match the GST % slabs shown in the footer tax table. A footer row "CGST 9% + SGST 9%" means those lines are taxed at 18%; "CGST 2.5% + SGST 2.5%" means 5%. If your lines show ONLY ONE rate but the footer shows TWO or MORE slabs, you FLATTENED the GST % column — re-scan EVERY line and read each actual per-line rate.
     e. PER-LINE NET check: for EVERY line, netValue should be within ₹1 of (taxableValue + gstValue). If a line's netValue disagrees with taxableValue + gstValue, you likely SWAPPED the Taxable and Net columns — re-scan that line and read the two printed amounts back into their correct columns.
@@ -514,7 +523,34 @@ async function runGeminiExtraction(imageParts, genAI, hints = null) {
     })`
   );
 
+  // Printed-footer assertions are only trustworthy when THIS page is the whole
+  // invoice: it carries the footer totals AND there are no other pages. A
+  // continuation page has no footer; the footer page of a multi-page invoice
+  // holds whole-invoice totals over only a subset of the lines, so asserting
+  // "sum of this page's lines == printed total" would misfire on every such
+  // invoice. Per-line arithmetic checks below still run on every page.
+  const printedContMarker = /continue|next page|cont\.?/i.test(String(parsed.printedPagination || ""));
+  const validForFooterCheck =
+    hasFooterTotals &&
+    pgTot <= 1 &&
+    !(parsed.looksLikeContinuationPage === true) &&
+    !printedContMarker;
+
+  // Corroborate the printed footer BEFORE trusting it to drive corrective turns.
+  // Gemini can set hasFooterTotals = true on a page that prints NO footer, and a
+  // hallucinated grandTotal must never be used to force the page's line sum to
+  // match it. The page's own line-net sum vs the printed Grand Total is a
+  // deterministic cross-check we can run WITHOUT Gemini.
+  const initialGrandTotal = Number(parsed.invoiceSummary?.grandTotal) || 0;
+  const lineNetSum = () =>
+    (parsed.lineItems || []).reduce((s, l) => s + (Number(l.netValue) || 0), 0);
+  const footerCorroborated =
+    validForFooterCheck &&
+    initialGrandTotal > 0 &&
+    Math.abs(lineNetSum() - initialGrandTotal) <= Math.max(2, initialGrandTotal * 0.02);
+
   let gstIssues = [];
+  let gstInformational = [];
   let gstAttempts = 0;
   {
     // Deterministic GST enforcement: validate the arithmetic ourselves and, if it
@@ -523,27 +559,54 @@ async function runGeminiExtraction(imageParts, genAI, hints = null) {
     // what makes mixed-rate invoices (5/12/18 etc.) reliable.
     for (let attempt = 0; attempt <= 4; attempt++) {
       repairColumnSwaps(parsed);
-      gstIssues = checkGstConsistency(parsed);
+      const { fixable, informational } = checkGstConsistency(parsed);
+      gstIssues = fixable;
+      gstInformational = informational;
       gstAttempts = attempt + 1;
       if (gstIssues.length === 0) break;
       if (attempt === 4) break; // correction budget exhausted; final state already checked
 
       logger.warn(`[gemini] GST check failed (attempt ${attempt + 1}): ${gstIssues.join(" | ")}`);
-      const lineGstSum = (parsed.lineItems || []).reduce((s, l) => s + (Number(l.gstValue) || 0), 0);
-      const refsInfo = [];
-      const totalGst = Number(parsed.invoiceSummary?.totalGst) || 0;
-      const cst =
-        (Number(parsed.invoiceSummary?.totalCGST) || 0) +
-        (Number(parsed.invoiceSummary?.totalSGST) || 0) +
-        (Number(parsed.invoiceSummary?.totalIGST) || 0);
-      if (totalGst > 0) refsInfo.push(`Total GST ₹${totalGst.toFixed(2)}`);
-      if (cst > 0) refsInfo.push(`CGST+SGST+IGST ₹${cst.toFixed(2)}`);
-      const printedRef = refsInfo.length ? refsInfo.join(", ") : "not extracted";
-      const uniform = inferUniformRate(parsed.invoiceSummary || {});
-      const uniformHint = uniform
-        ? `\nIMPORTANT: the printed CGST ₹${(Number(parsed.invoiceSummary?.totalCGST) || 0).toFixed(2)} and SGST ₹${(Number(parsed.invoiceSummary?.totalSGST) || 0).toFixed(2)} are equal and together imply the ENTIRE invoice is taxed at a single ${uniform.slab}% rate (CGST = SGST = ${uniform.slab / 2}% of the discounted taxable base ₹${uniform.base.toFixed(2)}), and that reproduces the printed Total GST ₹${(Number(parsed.invoiceSummary?.totalGst) || 0).toFixed(2)}. Therefore EVERY line must have gstRate = ${uniform.slab}; any line reporting a different rate (e.g. 5) is a misread of that line's GST % column, and the sum of ALL line taxableValue must equal ₹${uniform.base.toFixed(2)}.`
-        : "";
-      const correction = `You previously returned this JSON for the invoice images:\n\n${JSON.stringify(parsed)}\n\nThe following deterministic GST checks FAILED against the printed figures:\n- ${gstIssues.join("\n- ")}\n\nThe printed footer GST totals are GROUND TRUTH and equal: ${printedRef}. Your line GST sum is ₹${lineGstSum.toFixed(2)} — it must equal the printed total within ₹1.${uniformHint}\nRe-read the ACTUAL printed digits of EVERY line: the GST % column, the GST ₹ column, and the Taxable/Net columns. If a line is internally broken (taxableValue + gstValue != netValue) the Taxable and Net columns were probably SWAPPED — swap them back from the printed digits.\nCorrect any of gstRate, gstValue, taxableValue, netValue (only to repair a column swap or rate misread) and the footer totalGst / totalCGST / totalSGST / totalIGST / saleValue / grandTotal / totalTaxable / schDisc / cashDiscount / roundOff / cnNo if misread, so that:\n1. sum of ALL line gstValue == printed Total GST (within ₹1)\n2. for EVERY line: gstValue == taxableValue x gstRate / 100 (within ₹1)\n3. for EVERY line: netValue == taxableValue + gstValue (within ₹1)\n4. the distinct gstRate values match the GST % slabs in the footer tax table.\n5. if a "Cash Disc." or "Sch Disc." row is printed in the footer, the discount must be captured — it should equal saleValue + Total GST + Round Off − CN.NO − grandTotal (the implied discount). NEVER leave a printed discount as ₹0.00; re-read the printed discount row digits.\n6. if totalTaxable is printed, sum of ALL line taxableValue == printed totalTaxable (within ₹1).\nRe-read the ACTUAL printed digits of every line's GST % column — NEVER assume or default a rate such as 12.\nDo NOT change medicineName, batchNumber, expiryDate, quantities, unitPrice, cdPercent, cdValue.\nReturn ONLY the corrected JSON with the SAME schema — no markdown, no explanation.`;
+
+      // Footer-total constraints only apply when this page is the complete
+      // invoice. On continuation pages / the footer page of a multi-page
+      // invoice the printed totals belong to the WHOLE invoice and must not be
+      // asserted against this page's line sum.
+      const constraints = [];
+      if (footerCorroborated && attempt === 0) {
+        const lineGstSum = (parsed.lineItems || []).reduce((s, l) => s + (Number(l.gstValue) || 0), 0);
+        const refsInfo = [];
+        const totalGst = Number(parsed.invoiceSummary?.totalGst) || 0;
+        const cst =
+          (Number(parsed.invoiceSummary?.totalCGST) || 0) +
+          (Number(parsed.invoiceSummary?.totalSGST) || 0) +
+          (Number(parsed.invoiceSummary?.totalIGST) || 0);
+        if (totalGst > 0) refsInfo.push(`Total GST ₹${totalGst.toFixed(2)}`);
+        if (cst > 0) refsInfo.push(`CGST+SGST+IGST ₹${cst.toFixed(2)}`);
+        const printedRef = refsInfo.length ? refsInfo.join(", ") : "not extracted";
+        const uniform = inferUniformRate(parsed.invoiceSummary || {});
+        const uniformHint = uniform
+          ? `\nIMPORTANT: the printed CGST ₹${(Number(parsed.invoiceSummary?.totalCGST) || 0).toFixed(2)} and SGST ₹${(Number(parsed.invoiceSummary?.totalSGST) || 0).toFixed(2)} are equal and together imply the ENTIRE invoice is taxed at a single ${uniform.slab}% rate (CGST = SGST = ${uniform.slab / 2}% of the discounted taxable base ₹${uniform.base.toFixed(2)}), and that reproduces the printed Total GST ₹${(Number(parsed.invoiceSummary?.totalGst) || 0).toFixed(2)}. Therefore EVERY line must have gstRate = ${uniform.slab}; any line reporting a different rate (e.g. 5) is a misread of that line's GST % column, and the sum of ALL line taxableValue must equal ₹${uniform.base.toFixed(2)}.`
+          : "";
+        constraints.push(
+          `The printed footer GST totals are GROUND TRUTH and equal: ${printedRef}. Your line GST sum is ₹${lineGstSum.toFixed(2)} — it must equal the printed total within ₹1.${uniformHint}`,
+          `sum of ALL line gstValue == printed Total GST (within ₹1)`,
+          `the distinct gstRate values match the GST % slabs in the footer tax table`,
+          `if a "Cash Disc." or "Sch Disc." row is printed in the footer, the discount must be captured — it should equal saleValue + Total GST + Round Off − CN.NO − grandTotal (the implied discount). NEVER leave a printed discount as ₹0.00; re-read the printed discount row digits`,
+          `if totalTaxable is printed, sum of ALL line taxableValue == printed totalTaxable (within ₹1)`
+        );
+      } else {
+        constraints.push(
+          footerCorroborated
+            ? `footer totals were already enforced on the first correction turn — correct only the per-line inconsistencies below`
+            : `the printed footer totals are NOT corroborated by this page's line sum (lines sum ₹${lineNetSum().toFixed(2)} vs printed Grand Total ₹${(Number(parsed.invoiceSummary?.grandTotal) || 0).toFixed(2)}) — treat them as UNRELIABLE; do NOT assert any footer-total identity, correct only the per-line inconsistencies below`
+        );
+      }
+      constraints.push(
+        `for EVERY line: gstValue == taxableValue x gstRate / 100 (within ₹1)`,
+        `for EVERY line: netValue == taxableValue + gstValue (within ₹1)`
+      );
+      const correction = `You previously returned this JSON for the invoice image:\n\n${JSON.stringify(parsed)}\n\nThe following deterministic GST checks FAILED against the parsed figures:\n- ${gstIssues.join("\n- ")}\n\nRe-read the ACTUAL printed digits of EVERY line: the GST % column, the GST ₹ column, and the Taxable/Net columns. If a line is internally broken (taxableValue + gstValue != netValue) the Taxable and Net columns were probably SWAPPED — swap them back from the printed digits.\nCorrect any of gstRate, gstValue, taxableValue, netValue (only to repair a column swap or rate misread)${footerCorroborated ? " and the footer totalGst / totalCGST / totalSGST / totalIGST / saleValue / grandTotal / totalTaxable / schDisc / cashDiscount / roundOff / cnNo if misread" : ""}, so that:\n${constraints.map((c, i) => `${i + 1}. ${c}`).join("\n")}\nRe-read the ACTUAL printed digits of every line's GST % column — NEVER assume or default a rate such as 12.\nDo NOT change medicineName, batchNumber, expiryDate, quantities, unitPrice, cdPercent, cdValue.\nReturn ONLY the corrected JSON with the SAME schema — no markdown, no explanation.`;
       try {
         const result = await generateWithModelFallback(genAI, [correction, ...imageParts]);
         const text = result.response.text();
@@ -558,14 +621,26 @@ async function runGeminiExtraction(imageParts, genAI, hints = null) {
     }
   }
 
+  logger.info(
+    `[gemini] classify pg=${pgNum}/${pgTot} footer=${hasFooterTotals} cont=${
+      parsed.looksLikeContinuationPage === true
+    } printedPagination=${JSON.stringify(parsed.printedPagination || "")} gate=${validForFooterCheck} corroborated=${footerCorroborated} grandTotal=${initialGrandTotal.toFixed(2)} lineNetSum=${lineNetSum().toFixed(2)} gstCheck=${gstIssues.length === 0 ? "PASS" : "FAIL"} attempts=${gstAttempts} fixable=[${gstIssues.join(" | ")}] informational=[${gstInformational.join(" | ")}]`
+  );
+
   return {
     ...parsed,
     distributor: normalizeDistributorName(parsed.distributor || ""),
     hasFooterTotals,
     pageNumber: pgNum,
     totalPages: pgTot,
-    looksLikeContinuationPage: parsed.looksLikeContinuationPage === true || pgNum > 1,
-    gstCheck: { pass: gstIssues.length === 0, attempts: gstAttempts, issues: gstIssues },
+    looksLikeContinuationPage:
+      parsed.looksLikeContinuationPage === true || pgNum > 1 || printedContMarker,
+    gstCheck: {
+      pass: gstIssues.length === 0,
+      attempts: gstAttempts,
+      issues: gstIssues,
+      informational: gstInformational,
+    },
     rawGeminiResponse: geminiResponse,
   };
 }
@@ -722,17 +797,41 @@ exports.saveInvoice = onCall(
       }
 
       const distName = normalizeDistributorName(safeInvoice.distributor);
-
-      // ── Server-side compound-key duplicate guard (HARD BLOCK) ────────────
-      // The invoice doc stores the NORMALIZED distributor name as distributorId
-      // (the same normalization the medicine docs use), so re-saving the same
-      // invoice — even from a different upload/queue item — is caught by the
-      // (distributorId, invoiceNumber) compound key before any write lands.
-      // This is the enforcement layer; the client-side pHash check is only a
-      // soft UX warning at upload time and is NOT enforcement. Skipped when
-      // either half of the key is empty (no number / no distributor means we
-      // cannot dedupe safely).
       const invoiceNumber = safeInvoice.invoiceNumber || "";
+      const pageHash = safeInvoice.pHash || null;
+      let duplicateWarning = null;
+
+      // ── pHash duplicate guard (HARD BLOCK) ───────────────────────────────
+      // The real dedup key is the image hash: a genuine accidental re-upload of
+      // the same page carries the same pHash. Different pages of ONE multi-page
+      // invoice are different images (different hashes), so they must be
+      // allowed to save independently even though they share the same
+      // (distributorId, invoiceNumber). Skipped when no hash is available.
+      if (pageHash) {
+        const hashSnap = await db
+          .collection("pharmacies")
+          .doc(pharmacyId)
+          .collection("invoices")
+          .where("pHash", "==", pageHash)
+          .limit(1)
+          .get();
+        if (!hashSnap.empty) {
+          const dup = hashSnap.docs[0];
+          const dupData = dup.data();
+          throw new HttpsError(
+            "already-exists",
+            `This image was already saved as invoice ${dupData.invoiceNumber || "?"} from ${dupData.distributor || distName} (${dup.id}).`
+          );
+        }
+      }
+
+      // ── (distributorId, invoiceNumber) SOFT check (NOT a hard block) ────
+      // Multi-page invoices legitimately save one doc per page under the same
+      // compound key, so this can never hard-block. It only surfaces as a
+      // soft warning on the success response so the caller can flag a possible
+      // re-upload of an invoice we already hold (the hard proof of a true
+      // re-upload is the pHash check above). Skipped when either half of the
+      // key is empty (no number / no distributor means we cannot compare).
       if (distName && invoiceNumber) {
         const dupSnap = await db
           .collection("pharmacies")
@@ -745,25 +844,40 @@ exports.saveInvoice = onCall(
         if (!dupSnap.empty) {
           const dup = dupSnap.docs[0];
           const dupData = dup.data();
-          throw new HttpsError(
-            "already-exists",
-            `Invoice ${invoiceNumber} from ${dupData.distributor || distName} was already saved (${dup.id}).`
-          );
+          duplicateWarning = {
+            invoiceId: dup.id,
+            invoiceNumber,
+            distributor: dupData.distributor || distName,
+            partial: dupData.partial === true,
+          };
         }
       }
+
+      // A page only carries an authoritative invoiceTotal when it contains the
+      // printed footer summary. Continuation pages are stored with
+      // partial=true and invoiceTotal 0 so the reporting layer sums totals only
+      // from the footer page(s) of an invoice and never double-counts across
+      // the independently-saved pages of a multi-page invoice.
+      const hasFooterTotals = safeInvoice.hasFooterTotals === true;
+      const partial = !hasFooterTotals;
 
       const invoiceRef = await db.collection("pharmacies").doc(pharmacyId).collection("invoices").add({
         distributor: distName,
         distributorId: distName,
         invoiceNumber,
         invoiceDate: safeInvoice.invoiceDate || "",
-        invoiceTotal: safeInvoice.invoiceTotal || 0,
+        invoiceTotal: partial ? 0 : safeInvoice.invoiceTotal || 0,
         invoiceSummary: safeInvoice.invoiceSummary || {},
         lineItems: safeLineItems,
         captureQuality: safeInvoice.captureQuality || {},
         gstCheck: safeInvoice.gstCheck || {},
         rawGeminiResponse: safeInvoice.rawGeminiResponse || "",
-        pHash: safeInvoice.pHash || null,
+        pHash: pageHash,
+        hasFooterTotals,
+        partial,
+        pageNumber: Number(safeInvoice.pageNumber) || 1,
+        totalPages: Number(safeInvoice.totalPages) || 1,
+        looksLikeContinuationPage: safeInvoice.looksLikeContinuationPage === true,
         confirmedBy: confirmedBy || request.auth.uid,
         confirmedAt: FieldValue.serverTimestamp(),
         createdAt: FieldValue.serverTimestamp(),
@@ -832,7 +946,7 @@ exports.saveInvoice = onCall(
 
       logger.info(`[saveInvoice] Saved invoice ${invoiceRef.id} with ${safeLineItems.length} items for pharmacy=${pharmacyId}`);
 
-      return { success: true, invoiceId: invoiceRef.id };
+      return { success: true, invoiceId: invoiceRef.id, duplicateWarning };
     } catch (err) {
       logger.error("[saveInvoice] Write failed:", err.message);
       // The queue guard flipped the item to "saving" above; revert it so the
