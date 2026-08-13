@@ -98,6 +98,7 @@ let importQueueBusy = false;
 // chaining review modals). On a resume-from-disk load this stays false so the
 // app lands on Home with the queue list and never auto-opens review modals.
 let importQueueAuto = false;
+let reviewChainActive = false; // true while the one-by-one review chain is open
 
 // ─── DOM Helpers ──────────────────────────────────────────────────────────────
 
@@ -430,6 +431,7 @@ function showLoadingOverlay(show, message = "Processing...") {
 function openReviewPanel(extracted) {
   const panel = $("extraction-review-panel");
   panel.classList.remove("hidden");
+  panel.style.display = "flex"; // defensive: no CSS specificity/order surprise can keep it hidden
 
   // Show image or PDF with pagination
   const pagEl = $("review-pagination");
@@ -447,13 +449,39 @@ function openReviewPanel(extracted) {
   // Invoice summary (cash discount, round-off, etc.)
   const summary = extracted.invoiceSummary;
   window._invoiceSummary = summary || null;
+  // Printed-footer assertions (printed GST, grand-total formula) are only valid
+  // when THIS page IS the complete invoice: it carries the footer totals AND no
+  // other pages exist. On a continuation page — or the footer page of a
+  // multi-page invoice, where the printed totals cover the WHOLE invoice over
+  // only a subset of the lines — comparing the printed footer against this
+  // page's line sum fires a permanent false "GST mismatch" (see multi-page
+  // invoices). Per-line arithmetic checks still run on every page below.
+  const printedContMarker = /continue|next page|cont\.?/i.test(extracted.printedPagination || "");
+  window._footerChecksValid =
+    extracted.hasFooterTotals === true &&
+    !(extracted.looksLikeContinuationPage === true) &&
+    !printedContMarker &&
+    (Number(extracted.totalPages) || 1) <= 1;
+  console.log(
+    "[review] footer gate:", {
+      hasFooterTotals: extracted.hasFooterTotals,
+      looksLikeContinuationPage: extracted.looksLikeContinuationPage,
+      totalPages: extracted.totalPages,
+      pageNumber: extracted.pageNumber,
+      printedPagination: extracted.printedPagination,
+      printedContMarker,
+      _footerChecksValid: window._footerChecksValid,
+      grandTotal: summary?.grandTotal ?? summary?.invoiceTotal,
+      gstCheck: extracted.gstCheck,
+    }
+  );
   const cashDiscRow = $("review-cash-disc-row");
   const schDiscRow = $("review-sch-disc-row");
   const cnNoRow = $("review-cn-no-row");
   const roundOffRow = $("review-round-off-row");
   const printedGstRow = $("review-printed-gst-row");
   const printedCdRow = $("review-printed-cd-row");
-  if (summary) {
+  if (summary && window._footerChecksValid) {
     $("review-declared-total-input").value = (summary.grandTotal || 0).toFixed(2);
     cashDiscRow.classList.remove("hidden");
     $("review-cash-disc-val").textContent = "-₹" + (summary.cashDiscount || 0).toFixed(2);
@@ -498,8 +526,15 @@ function openReviewPanel(extracted) {
       }
     }
   } else {
-    $("review-declared-total-input").value = (extracted.invoiceTotal || 0).toFixed(2);
+    // Partial / continuation page: any summary block (if present) belongs to
+    // the WHOLE invoice, not this page, so it is not asserted here. The
+    // declared-total input is this page's own line subtotal, recomputed by
+    // recalculate() below, and is saved as partial (invoiceTotal 0) so
+    // reporting never double-counts across the pages of one invoice.
+    $("review-declared-total-input").value = "0.00";
     cashDiscRow.classList.add("hidden");
+    if (schDiscRow) schDiscRow.classList.add("hidden");
+    if (cnNoRow) cnNoRow.classList.add("hidden");
     roundOffRow.classList.add("hidden");
     if (printedGstRow) printedGstRow.classList.add("hidden");
     if (printedCdRow) printedCdRow.classList.add("hidden");
@@ -514,6 +549,11 @@ function openReviewPanel(extracted) {
     </div>`;
   }
   const gstCheck = extracted.gstCheck;
+  if (window._footerChecksValid === false) {
+    alertsEl.innerHTML += `<div class="bg-indigo-500/10 border border-indigo-500/30 rounded-lg p-2 text-[10px] text-indigo-300 font-semibold">
+      ℹ Partial page — line items only (no printed footer totals asserted on this page). Saved as partial; the invoice total is not counted on this page.
+    </div>`;
+  }
   if (gstCheck && gstCheck.pass === false) {
     const detail = (gstCheck.issues || []).slice(0, 3).map((i) => `• ${i}`).join("<br>");
     alertsEl.innerHTML += `<div class="bg-rose-500/10 border border-rose-500/40 rounded-lg p-2 text-[10px] text-rose-300 font-semibold">
@@ -528,13 +568,31 @@ function openReviewPanel(extracted) {
   // Arithmetic check
   recalculate();
 
+  // Cancel button — keep the invoice in the queue (NOT discarded) so it can be
+  // reviewed again later; move it to the end so the one-by-one chain visits the
+  // other images first, then advance to the next ready review.
+  $("btn-review-cancel").onclick = () => {
+    const qid = reviewSession.queueId;
+    if (qid) {
+      const item = importQueue.find((i) => i.imageId === qid);
+      if (item) {
+        item.status = "extracted";
+        const others = importQueue.filter((i) => i.imageId !== qid);
+        others.push(item);
+        importQueue.splice(0, importQueue.length, ...others);
+      }
+    }
+    closeReviewPanel();
+    showToast("Kept in queue — review later.", "info");
+    advanceImportQueue();
+  };
+
   // Reject button — permanent discard: deletes the queue doc + raw image.
   $("btn-review-reject").onclick = async () => {
-    panel.classList.add("hidden");
     const qid = reviewSession.queueId;
     // Pending-invoice reviews have no queueId — clean up their page images here.
     const pathsToDelete = qid ? [] : reviewSession.storagePaths;
-    revokeReviewSession();
+    closeReviewPanel();
     showToast("Invoice discarded", "warning");
     if (qid) {
       await discardQueueItem(qid, { silent: true });
@@ -655,14 +713,21 @@ function recalculate() {
   $("review-subtotal-val").textContent = "₹" + totalNet.toFixed(2);
   $("review-gst-val").textContent = "₹" + totalGst.toFixed(2);
 
-  const declaredTotal = parseFloat($("review-declared-total-input").value) || 0;
+  const footerChecksValid = window._footerChecksValid === true;
+  let declaredTotal = parseFloat($("review-declared-total-input").value) || 0;
   let computedTotal, diff, match;
 
   const summary = window._invoiceSummary;
 
   // 1) GRAND TOTAL check — printed footer formula (REFERENCE ONLY, non-blocking):
   //    Grand Total = Sale Value − Sch Disc − Cash Disc + Total GST + Round Off − CN.NO
-  if (summary && summary.saleValue) {
+  //    Only asserted when this page IS the complete invoice. On a partial page
+  //    the declared total is this page's own line subtotal and matches by
+  //    construction — no footer identity is asserted.
+  if (!footerChecksValid) {
+    computedTotal = totalNet + totalGst;
+    $("review-declared-total-input").value = computedTotal.toFixed(2);
+  } else if (summary && summary.saleValue) {
     const sVal = summary.saleValue || 0;
     const sch = summary.schDisc || 0;
     const cash = summary.cashDiscount || 0;
@@ -670,18 +735,39 @@ function recalculate() {
     const ro = summary.roundOff || 0;
     const cn = summary.cnNo || 0;
     computedTotal = sVal - sch - cash + gstSum + ro - cn;
-  } else if (summary) {
-    computedTotal = totalNet + totalGst;
   } else {
     computedTotal = totalNet + totalGst;
   }
+  declaredTotal = parseFloat($("review-declared-total-input").value) || 0;
   diff = Math.abs(computedTotal - declaredTotal);
   match = diff <= 2;
 
-  // 2) Independent GST cross-check vs printed footer totals (REFERENCE ONLY, non-blocking)
+  if (footerChecksValid) {
+    console.log(
+      "[recalc] TOTAL check:", {
+        gate: footerChecksValid,
+        declaredTotal: declaredTotal.toFixed(2),
+        computedTotal: (computedTotal || 0).toFixed(2),
+        diff: diff.toFixed(2),
+        badge: match ? "OK" : "WARN Total " + diff.toFixed(2),
+        lineSumNet: totalNet.toFixed(2),
+        summary: summary ? {
+          saleValue: summary.saleValue,
+          schDisc: summary.schDisc,
+          cashDiscount: summary.cashDiscount,
+          totalGst: summary.totalGst,
+          roundOff: summary.roundOff,
+          cnNo: summary.cnNo,
+        } : null,
+      }
+    );
+  }
+
+  // 2) Independent GST cross-check vs printed footer totals (REFERENCE ONLY,
+  //    non-blocking) — only when this page carries trustworthy footer totals.
   const printedGst = summary && (summary.totalGst ?? ((summary.totalCGST || 0) + (summary.totalSGST || 0) + (summary.totalIGST || 0)));
   let gstDiff = 0;
-  if (printedGst) {
+  if (footerChecksValid && printedGst) {
     gstDiff = Math.abs(totalGst - printedGst);
   }
 
@@ -754,7 +840,7 @@ function recalculate() {
   // Update badges (reference only)
   styleBadge(badge, match, "✓ Totals Match (ref)", `⚠ Total ₹${diff.toFixed(2)} (ref)`);
   if (gstBadge) {
-    if (!printedGst) {
+    if (!footerChecksValid || !printedGst) {
       gstBadge.classList.add("hidden");
     } else {
       gstBadge.classList.remove("hidden");
@@ -773,8 +859,8 @@ function recalculate() {
     warning.classList.remove("hidden");
     if (warningDetail) {
       const fails = [];
-      if (!match) fails.push(`Grand total mismatch ₹${diff.toFixed(2)} (reference)`);
-      if (printedGst && gstDiff > 1) fails.push(`GST: sum ₹${totalGst.toFixed(2)} ≠ printed ₹${printedGst.toFixed(2)} (reference)`);
+      if (footerChecksValid && !match) fails.push(`Grand total mismatch ₹${diff.toFixed(2)} (reference)`);
+      if (footerChecksValid && printedGst && gstDiff > 1) fails.push(`GST: sum ₹${totalGst.toFixed(2)} ≠ printed ₹${printedGst.toFixed(2)} (reference)`);
       if (arithmeticIssues.length > 0) fails.push(...arithmeticIssues);
       if (lowConfLines.length > 0) {
         fails.push(`⚠ ${lowConfLines.length} line(s) below 90% confidence — review required`);
@@ -807,7 +893,6 @@ function styleBadge(el, ok, okText, failText) {
 
 async function confirmAndSave(originalExtracted) {
   console.log("[Save] confirmAndSave called", originalExtracted && { invoiceNumber: originalExtracted.invoiceNumber, distributor: originalExtracted.distributor });
-  const panel = $("extraction-review-panel");
 
   try {
     // Build a map of user edits from DOM (only for fields the user actually edited)
@@ -874,8 +959,6 @@ async function confirmAndSave(originalExtracted) {
       throw new Error("Not signed in. Please log in again and retry.");
     }
 
-    showLoadingOverlay(true, "Saving to Firestore...");
-
     console.log("[Save] calling saveInvoice callable...");
     const saveFn = httpsCallable(functions, "saveInvoice");
     const payload = sanitizeForCallable({
@@ -885,56 +968,89 @@ async function confirmAndSave(originalExtracted) {
         distributor: originalExtracted.distributor || "",
         invoiceNumber: originalExtracted.invoiceNumber || "",
         invoiceDate: originalExtracted.invoiceDate || "",
-        invoiceTotal,
+        // A partial (continuation) page carries no authoritative total — the
+        // server writes invoiceTotal 0 + partial=true so reporting only sums
+        // the page(s) that actually hold the printed footer totals.
+        invoiceTotal: window._footerChecksValid === true ? invoiceTotal : null,
         invoiceSummary: originalExtracted.invoiceSummary || {},
         captureQuality: originalExtracted.captureQuality || {},
         gstCheck: originalExtracted.gstCheck || {},
         rawGeminiResponse: originalExtracted.rawGeminiResponse || "",
         pHash: reviewSession.pHash || null,
+        hasFooterTotals: originalExtracted.hasFooterTotals === true,
+        pageNumber: Number(originalExtracted.pageNumber) || 1,
+        totalPages: Number(originalExtracted.totalPages) || 1,
+        looksLikeContinuationPage: originalExtracted.looksLikeContinuationPage === true,
       },
       lineItems,
       confirmedBy: currentUser.uid,
     });
-    const resp = await saveFn(payload);
-    console.log("[Save] saveInvoice callable succeeded", resp && resp.data);
 
-    // Delete raw files from Storage
-    if (reviewSession.storagePaths && reviewSession.storagePaths.length > 0) {
-      for (const p of reviewSession.storagePaths) {
-        try {
-          await deleteObject(ref(storage, p));
-        } catch (delErr) {
-          console.warn("Could not delete raw file (non-fatal):", delErr.message);
-        }
-      }
-    }
-
-    showLoadingOverlay(false);
-    panel.classList.add("hidden");
-    // Remove the saved item from the local queue (its queue doc + image were
-    // already cleaned up server-side by saveInvoice), so the list never shows a
-    // stale "Ready for review" after a successful save.
+    // Capture review-session refs BEFORE the panel closes (closeReviewPanel
+    // resets reviewSession), then close + advance IMMEDIATELY — the owner is
+    // never blocked on the "Saving to Firestore..." overlay. The save runs in
+    // the background and toasts when it resolves; on failure the item is put
+    // back in the queue for a retry.
     const qid = reviewSession.queueId;
     const stagedNumber = reviewSession.pendingInvoiceNumber;
-    revokeReviewSession();
+    const rawPaths = (reviewSession.storagePaths || []).slice();
+    let removedItem = null;
     if (qid) {
+      const idx = importQueue.findIndex((i) => i.imageId === qid);
+      if (idx >= 0) removedItem = importQueue[idx];
       importQueue = importQueue.filter((i) => i.imageId !== qid);
       if (importQueueCursor >= importQueue.length) {
         importQueueCursor = Math.max(0, importQueue.length - 1);
       }
     }
-    if (stagedNumber) {
-      try {
-        const delFn = httpsCallable(functions, "deletePendingInvoice", { timeout: 30000 });
-        await delFn({ pharmacyId: currentPharmacyId, invoiceNumber: stagedNumber });
-      } catch (cleanupErr) {
-        console.warn("[Save] could not remove staged invoice (non-fatal):", cleanupErr.message);
-      }
-    }
-    showToast(`Saved! ${lineItems.length} medicine(s) recorded.`, "success");
-    console.log("[Save] done — advancing to next review");
-
+    closeReviewPanel();
     advanceImportQueue();
+
+    (async () => {
+      try {
+        const resp = await saveFn(payload);
+        console.log("[Save] saveInvoice callable succeeded", resp && resp.data);
+        if (rawPaths.length > 0) {
+          for (const p of rawPaths) {
+            try {
+              await deleteObject(ref(storage, p));
+            } catch (delErr) {
+              console.warn("Could not delete raw file (non-fatal):", delErr.message);
+            }
+          }
+        }
+        if (stagedNumber) {
+          try {
+            const delFn = httpsCallable(functions, "deletePendingInvoice", { timeout: 30000 });
+            await delFn({ pharmacyId: currentPharmacyId, invoiceNumber: stagedNumber });
+          } catch (cleanupErr) {
+            console.warn("[Save] could not remove staged invoice (non-fatal):", cleanupErr.message);
+          }
+        }
+        if (resp.data && resp.data.duplicateWarning) {
+          const w = resp.data.duplicateWarning;
+          showToast(
+            `Saved! ${lineItems.length} medicine(s). Note: invoice ${w.invoiceNumber} from ${w.distributor} was already saved — this may be a duplicate page or a re-upload.`,
+            "warning"
+          );
+        } else {
+          showToast(`Saved! ${lineItems.length} medicine(s) recorded.`, "success");
+        }
+        console.log("[Save] done — saved in background while the next review was shown");
+      } catch (err) {
+        console.error("[Save] FAILED", {
+          code: err && err.code,
+          message: err && err.message,
+          details: err && err.details,
+          error: err,
+        });
+        if (removedItem) {
+          importQueue.push(removedItem);
+          renderImportQueueStatus();
+        }
+        showToast("Save failed: " + (err && err.message ? err.message : String(err)), "error");
+      }
+    })();
 
   } catch (err) {
     console.error("[Save] FAILED", {
@@ -953,6 +1069,23 @@ function revokeReviewSession() {
     reviewSession.objectUrls.forEach(url => URL.revokeObjectURL(url));
   }
   reviewSession = { storagePaths: [], objectUrls: [], currentPageIndex: 0, fileType: 'image', extracted: null, queueId: null, pendingInvoiceNumber: null };
+}
+
+// Hard-close the review drawer: guarantees the panel is gone (inline display
+// beats any CSS ordering issue), blanks the old image/PDF sources so a reused
+// element never flashes the previously-saved invoice, and revokes object URLs.
+// Used after save AND discard so the extracted-data screen never lingers.
+function closeReviewPanel() {
+  const panel = $("extraction-review-panel");
+  if (panel) {
+    panel.classList.add("hidden");
+    panel.style.display = "none";
+  }
+  const imgEl = $("review-invoice-img");
+  if (imgEl) imgEl.removeAttribute("src");
+  const pdfEl = $("review-invoice-pdf");
+  if (pdfEl) pdfEl.removeAttribute("src");
+  revokeReviewSession();
 }
 
 // ─── Expiring Medicines List (live) ──────────────────────────────────────────
@@ -1314,6 +1447,13 @@ window.openPendingReview = async (invoiceNumber) => {
       pendingInvoiceNumber: invoiceNumber,
     };
 
+    // Legacy merged-pending invoices already combine ALL pages + the footer
+    // summary, so treat them as a complete single invoice for validation.
+    data.hasFooterTotals = true;
+    data.looksLikeContinuationPage = false;
+    data.pageNumber = 1;
+    data.totalPages = 1;
+
     openReviewPanel(data);
     showLoadingOverlay(false);
     showToast(
@@ -1475,6 +1615,7 @@ async function enqueueFile(file, fileIndex = 0, hints = null) {
     pdfPageNumber: hints && Number(hints.pageNumber) >= 1 ? Number(hints.pageNumber) : null,
     pdfTotalPages: hints && Number(hints.totalPages) >= 1 ? Number(hints.totalPages) : null,
     pHash,
+    uploadedAt: new Date(),
     file,
   };
 }
@@ -1513,16 +1654,35 @@ function startImportQueue() {
   processNextQueueItem();
 }
 
+// Open the next "Ready for review" item, chaining one-by-one. Returns false
+// (and clears the chain) when nothing is left to review.
+function tryOpenNextReview() {
+  const panel = $("extraction-review-panel");
+  if (panel && !panel.classList.contains("hidden")) return false; // a review is already open
+  const next = importQueue.find((i) => i.status === "extracted" && i.extracted);
+  if (!next) {
+    reviewChainActive = false;
+    renderImportQueueStatus();
+    return false;
+  }
+  reviewChainActive = true;
+  openQueueReview(next, next.extracted);
+  return true;
+}
+
 async function processNextQueueItem() {
+  // Phase 1 — extract EVERY queued item in the background (no review panel).
+  // This is what makes the whole batch "Ready for review" as soon as the upload
+  // finishes, instead of stopping at the first image like the old flow did
+  // (which left every later item stuck at "Queued").
   while (importQueueCursor < importQueue.length) {
     const item = importQueue[importQueueCursor];
     renderImportQueueStatus();
-    const outcome = await processQueueItem(item);
-    if (outcome === "awaiting-review") {
-      importQueueBusy = false;
-      renderImportQueueStatus();
-      return; // review panel open — advanceImportQueue() resumes after save/reject
+    if (item.status === "extracted") {
+      importQueueCursor++;
+      continue; // already ready — never block the batch on a review panel
     }
+    const outcome = await processQueueItem(item, false);
     if (outcome === "retry") {
       renderImportQueueStatus();
       continue; // transient — re-attempt the same item
@@ -1530,21 +1690,20 @@ async function processNextQueueItem() {
     importQueueCursor++;
   }
   importQueueBusy = false;
-  renderImportQueueStatus();
+
+  // Phase 2 — once everything is ready (or on resume), open the first item so
+  // the owner reviews the images one by one with no extraction wait.
+  tryOpenNextReview();
 }
 
-// Move on from a finished/saved/discarded item. In a live upload batch this
-// chains straight into the next review; on a resume-from-disk load it just
-// refreshes the queue list so the user can tap each item explicitly.
+// Move on from a finished/saved/cancelled/discarded item: re-extract anything
+// still queued, then open the next ready review. On a live batch this chains
+// straight through every image; on resume it re-opens the first ready item.
 function advanceImportQueue() {
-  if (!importQueueAuto) {
-    renderImportQueueStatus();
-    return;
-  }
   startImportQueue();
 }
 
-async function processQueueItem(item) {
+async function processQueueItem(item, openReview = true) {
   // Fast paths that need no re-extraction (resume-safe).
   let qData = null;
   try {
@@ -1557,8 +1716,11 @@ async function processQueueItem(item) {
       item.status = "extracted";
       const extracted = qData.extracted;
       item.extracted = extracted;
-      await openQueueReview(item, extracted);
-      return "awaiting-review";
+      if (openReview) {
+        await openQueueReview(item, extracted);
+        return "awaiting-review";
+      }
+      return "done";
     }
     if (qs === "ingested" || qs === "ingested-partial") {
       item.status = qs;
@@ -1594,8 +1756,11 @@ async function processQueueItem(item) {
     item.status = "extracted";
     const extracted = data.extracted || {};
     item.extracted = extracted;
-    await openQueueReview(item, extracted);
-    return "awaiting-review";
+    if (openReview) {
+      await openQueueReview(item, extracted);
+      return "awaiting-review";
+    }
+    return "done";
   }
   if (status === "ingested") {
     item.status = "ingested";
@@ -1687,6 +1852,7 @@ async function resumeImportQueue() {
         pdfTotalPages: dta.pdfTotalPages || null,
         extracted: dta.extracted || null,
         pHash: dta.pHash || null,
+        uploadedAt: dta.createdAt || null,
       };
     });
     if (items.length > 0) {
@@ -1694,11 +1860,33 @@ async function resumeImportQueue() {
       importQueueCursor = 0;
       importQueueAuto = false;
       renderImportQueueStatus();
-      showToast(`${items.length} pending import(s) in queue — review or discard below.`, "info");
+      showToast(`${items.length} pending import(s) in queue — preparing for review.`, "info");
+      // Auto-extract anything not yet "extracted", then open the first ready
+      // review so the owner reviews images one by one with no waiting.
+      startImportQueue();
     }
   } catch (err) {
     console.error("[resumeImportQueue] ERROR:", err.code, err.message, err);
   }
+}
+
+// Human-readable upload time for a queue item. Accepts a Firestore Timestamp
+// (from a queue doc createdAt), a JS Date, epoch ms, or an ISO string; returns
+// "" when unknown so the caller can hide the line entirely.
+function formatUploadedAt(value) {
+  if (value == null) return "";
+  let d = null;
+  if (typeof value.toDate === "function") d = value.toDate();
+  else if (value instanceof Date) d = value;
+  else if (typeof value === "number") d = new Date(value);
+  else if (typeof value === "string") d = new Date(value);
+  if (!d || isNaN(d.getTime())) return "";
+  const now = new Date();
+  const diffMin = Math.max(0, Math.floor((now - d.getTime()) / 60000));
+  const rel = diffMin < 1 ? "just now" : diffMin < 60 ? `${diffMin}m ago` : diffMin < 1440 ? `${Math.floor(diffMin / 60)}h ago` : `${Math.floor(diffMin / 1440)}d ago`;
+  const time = d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const sameDay = d.toDateString() === now.toDateString();
+  return `Uploaded ${time}${sameDay ? "" : " " + d.toLocaleDateString()} · ${rel}`;
 }
 
 function renderImportQueueStatus() {
@@ -1760,6 +1948,7 @@ function renderImportQueueStatus() {
       <div class="min-w-0">
         <p class="text-[10px] font-mono text-slate-300 truncate">${esc(item.fileName || item.imageId)}</p>
         <p class="text-[9px] text-slate-500 truncate">${esc(item.storagePath)}</p>
+        ${item.uploadedAt ? `<p class="text-[9px] text-slate-500 truncate">${esc(formatUploadedAt(item.uploadedAt))}</p>` : ""}
       </div>
       <span class="text-[9px] px-1.5 py-0.5 rounded font-bold shrink-0 ${badgeClass}">${label}</span>
       ${actions}
