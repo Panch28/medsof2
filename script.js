@@ -406,7 +406,7 @@ function showLoadingOverlay(show, message = "Processing...") {
   if (!overlay) {
     overlay = document.createElement("div");
     overlay.id = "loading-overlay";
-    overlay.className = "fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-[100] flex flex-col items-center justify-center gap-4";
+    overlay.className = "fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-[100] flex flex-col items-center justify-center gap-4 cursor-pointer";
     overlay.innerHTML = `
       <div class="w-16 h-16 rounded-2xl bg-indigo-600/20 border border-indigo-500/30 flex items-center justify-center">
         <svg class="w-8 h-8 text-indigo-400 animate-spin" fill="none" viewBox="0 0 24 24">
@@ -415,7 +415,13 @@ function showLoadingOverlay(show, message = "Processing...") {
         </svg>
       </div>
       <p id="loading-msg" class="text-sm font-semibold text-slate-300"></p>
+      <button id="loading-dismiss" type="button" class="px-3 py-1.5 rounded-lg bg-slate-800/80 border border-slate-700 text-slate-300 text-[10px] font-bold hover:bg-slate-700 hover:text-white transition-all">✕ Continue in background</button>
     `;
+    // Never trap the owner on a blocking screen: clicking the backdrop or the
+    // button hides it. The underlying job (upload / extraction) keeps running —
+    // the import queue is persisted in Firestore, so a refresh or navigation is
+    // always safe and the resume flow re-extracts any leftovers.
+    overlay.addEventListener("click", () => overlay.classList.add("hidden"));
     document.body.appendChild(overlay);
   }
   if (show) {
@@ -1732,7 +1738,11 @@ async function processQueueItem(item, openReview = true) {
     }
   }
 
-  // Let the server claim (leased) and extract.
+  // Let the server claim (leased) and extract. Reflect the live status in the
+  // queue list immediately so the owner sees "Processing…" instead of "Queued"
+  // while Gemini runs.
+  item.status = "processing";
+  renderImportQueueStatus();
   console.log("[processQueueItem] Calling processImportQueueItem for", item.imageId, { pharmacyId: currentPharmacyId, pdfPageNumber: item.pdfPageNumber, pdfTotalPages: item.pdfTotalPages });
   const processFn = httpsCallable(functions, "processImportQueueItem", { timeout: 120000 });
   let result;
@@ -1983,7 +1993,10 @@ window.reviewQueueItem = async (imageId) => {
   }
 
   if (["uploaded", "processing", "saving"].includes(item.status)) {
-    showLoadingOverlay(true, "Extracting invoice…");
+    // No full-screen blocker — extraction runs in the background while the
+    // queue item shows "Processing…". The review panel opens when it's ready;
+    // the owner can refresh or navigate freely (the queue is persisted).
+    showToast("Extracting invoice…", "info");
     try {
       let outcome = "retry";
       let attempts = 0;
@@ -1998,8 +2011,6 @@ window.reviewQueueItem = async (imageId) => {
     } catch (err) {
       console.error("[reviewQueueItem] failed:", err);
       showToast("Processing failed: " + err.message, "error");
-    } finally {
-      showLoadingOverlay(false);
     }
     return;
   }
