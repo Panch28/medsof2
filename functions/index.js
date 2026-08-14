@@ -1346,6 +1346,7 @@ exports.bulkUpdateMedicineStatus = onCall(
     if (credit && typeof credit === "object") {
       update.creditNote = {
         creditNoteNo: String(credit.creditNoteNo || "").trim(),
+        distributor: typeof credit.distributor === "string" ? credit.distributor.trim().slice(0, 200) : "",
         creditAmount: Number(credit.creditAmount) || 0,
         returnedDate: credit.returnedDate || "",
       };

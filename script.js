@@ -1549,6 +1549,7 @@ function expiryCard(item) {
     const metaBits = [];
     if (cn && cn.creditNoteNo) {
       metaBits.push(`<span class="text-indigo-400">CN ${escapeHtml(cn.creditNoteNo)}</span>`);
+      if (cn.distributor) metaBits.push(`<span class="text-slate-500">→ ${escapeHtml(cn.distributor)}</span>`);
       if (cn.creditAmount) metaBits.push(`<span class="text-slate-400">${fmtINR(cn.creditAmount)}</span>`);
     }
     if (item.disposalCertRef) {
@@ -1651,6 +1652,7 @@ function openReturnCreditModal() {
   const rows = selectedExpiryRows();
   if (!rows.length) return;
   $("cn-number").value = "";
+  $("cn-distributor").value = "";
   $("cn-date").value = new Date().toISOString().slice(0, 10);
   $("cn-amount").value = "";
   $("cn-error").classList.add("hidden");
@@ -1750,6 +1752,7 @@ function initExpiryBulkActions() {
     }
     const credit = {
       creditNoteNo: cnNumber,
+      distributor: $("cn-distributor").value.trim(),
       returnedDate: $("cn-date").value,
       creditAmount: Number($("cn-amount").value) || 0,
     };
