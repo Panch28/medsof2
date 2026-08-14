@@ -241,6 +241,7 @@ function initApp() {
   subscribeExpiringMedicines();
   subscribeDistributors();
   subscribePendingInvoices();
+  initPurchaseReports();
   resumeImportQueue();
 }
 
@@ -2177,3 +2178,178 @@ async function checkDuplicateByHash(file, pharmacyId) {
 // hard-blocks on (distributorId, invoiceNumber) before writing, so it cannot be
 // bypassed by client bugs. The pHash check above (Layer 1) remains as the only
 // client-side duplicate guard, purely as an upload-time UX warning.
+
+// ─── Purchase Summary (Reports tab) ───────────────────────────────────────────
+// Lightweight monthly Purchase Summary. Builds ONLY on the invoiceSummary fields
+// already persisted by saveInvoice — no new schema, no GSTR-3B. Aggregation is
+// done server-side by the purchaseSummary callable; this view renders the
+// distributor → tax-slab breakdown and offers a CA-ready CSV export.
+
+let lastPurchaseSummary = null; // raw response from purchaseSummary, for CSV export
+
+function initPurchaseReports() {
+  const monthInput = $("report-month");
+  if (!monthInput) return;
+  const now = new Date();
+  monthInput.value = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+  $("btn-report-load").addEventListener("click", loadPurchaseReport);
+  $("btn-report-export").addEventListener("click", exportPurchaseCSV);
+}
+
+function monthRange(ym) {
+  const [y, m] = String(ym).split("-").map((n) => Number(n));
+  if (!y || !m) return null;
+  const from = new Date(Date.UTC(y, m - 1, 1));
+  const to = new Date(Date.UTC(y, m, 1));
+  return { from: from.toISOString(), to: to.toISOString() };
+}
+
+async function loadPurchaseReport() {
+  const monthInput = $("report-month");
+  const range = monthRange(monthInput.value || "");
+  if (!range) {
+    showToast("Pick a valid month first.", "warning");
+    return;
+  }
+  if (!currentUser) {
+    showToast("Not signed in.", "error");
+    return;
+  }
+  const btn = $("btn-report-load");
+  btn.disabled = true;
+  btn.textContent = "Loading…";
+  $("report-body").innerHTML = `<div class="text-center py-8 text-xs text-slate-500">Loading summary…</div>`;
+  try {
+    const fn = httpsCallable(functions, "purchaseSummary", { timeout: 60000 });
+    const resp = await fn({ pharmacyId: currentPharmacyId, from: range.from, to: range.to });
+    lastPurchaseSummary = resp.data;
+    renderPurchaseSummary(resp.data);
+  } catch (err) {
+    console.error("[purchaseSummary] ERROR:", err);
+    $("report-body").innerHTML = `<div class="text-center py-8 text-xs text-rose-400">Failed to load: ${err.message}</div>`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "Load";
+  }
+}
+
+const fmtINR = (n) => "₹" + Number(n || 0).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+function renderPurchaseSummary(data) {
+  const g = data.grandTotals || {};
+  $("report-total-purchases").textContent = fmtINR(g.taxable || 0);
+  $("report-total-gst").textContent = fmtINR(g.gst || 0);
+  $("report-total-invoices").textContent = String(g.invoiceCount || 0);
+
+  const dists = data.distributors || [];
+  const body = $("report-body");
+  if (dists.length === 0) {
+    body.innerHTML = `<div class="text-center py-8 text-xs text-slate-500">No saved invoices in this month.</div>`;
+    return;
+  }
+
+  body.innerHTML = dists.map((d) => {
+    const slabsRows = (d.slabs || []).map((s) => `
+      <tr class="border-t border-slate-800/60">
+        <td class="px-3 py-1.5 text-[10px] text-slate-400 pl-8">${s.rate > 0 ? s.rate + "%" : "0% / Exempt"}</td>
+        <td class="px-3 py-1.5 text-[10px] text-right font-mono text-slate-200">${fmtINR(s.taxable)}</td>
+        <td class="px-3 py-1.5 text-[10px] text-right font-mono text-slate-400">${fmtINR(s.cgst)}</td>
+        <td class="px-3 py-1.5 text-[10px] text-right font-mono text-slate-400">${fmtINR(s.sgst)}</td>
+        <td class="px-3 py-1.5 text-[10px] text-right font-mono text-slate-400">${fmtINR(s.igst)}</td>
+        <td class="px-3 py-1.5 text-[10px] text-right font-mono text-indigo-400 font-bold">${fmtINR(s.gst)}</td>
+      </tr>`).join("");
+    const totalRow = `
+      <tr class="border-t border-slate-700">
+        <td class="px-3 py-1.5 text-[10px] font-bold text-slate-200 pl-8">Total</td>
+        <td class="px-3 py-1.5 text-[10px] text-right font-mono font-bold text-slate-100">${fmtINR(d.taxable)}</td>
+        <td class="px-3 py-1.5 text-[10px] text-right font-mono text-slate-300">${fmtINR(d.cgst)}</td>
+        <td class="px-3 py-1.5 text-[10px] text-right font-mono text-slate-300">${fmtINR(d.sgst)}</td>
+        <td class="px-3 py-1.5 text-[10px] text-right font-mono text-slate-300">${fmtINR(d.igst)}</td>
+        <td class="px-3 py-1.5 text-[10px] text-right font-mono font-bold text-indigo-300">${fmtINR(d.gst)}</td>
+      </tr>`;
+    return `
+      <div class="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden">
+        <div class="px-4 py-2.5 flex items-center justify-between bg-slate-800/40">
+          <span class="text-xs font-heading font-bold text-slate-100">${escapeHtml(d.name)}</span>
+          <span class="text-[9px] text-slate-400 font-mono">${d.invoiceCount} invoice(s) · Grand total ${fmtINR(d.grandTotal)}</span>
+        </div>
+        <div class="overflow-x-auto">
+          <table class="w-full text-left">
+            <thead>
+              <tr class="text-[9px] uppercase tracking-wider text-slate-500">
+                <th class="px-3 py-1.5 pl-8">Slab</th>
+                <th class="px-3 py-1.5 text-right">Taxable</th>
+                <th class="px-3 py-1.5 text-right">CGST</th>
+                <th class="px-3 py-1.5 text-right">SGST</th>
+                <th class="px-3 py-1.5 text-right">IGST</th>
+                <th class="px-3 py-1.5 text-right">GST Total</th>
+              </tr>
+            </thead>
+            <tbody>${slabsRows}${totalRow}</tbody>
+          </table>
+        </div>
+      </div>`;
+  }).join("");
+}
+
+// Escape a string for safe injection into innerHTML (distributor names come from
+// OCR, so they must never break out of the rendered markup).
+function escapeHtml(s) {
+  return String(s == null ? "" : s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+function exportPurchaseCSV() {
+  if (!lastPurchaseSummary) {
+    showToast("Load a month first.", "warning");
+    return;
+  }
+  const data = lastPurchaseSummary;
+  const period = data.period || {};
+  const monthLabel = (period.from || "").slice(0, 7);
+
+  const rows = [];
+  rows.push(["Pharmacy Purchase Summary - " + monthLabel]);
+  rows.push([""]);
+  rows.push(["Distributor", "Slab %", "Taxable Rs", "CGST Rs", "SGST Rs", "IGST Rs", "Total GST Rs"]);
+  const g = data.grandTotals || {};
+  for (const d of data.distributors || []) {
+    for (const s of d.slabs || []) {
+      rows.push([
+        d.name,
+        s.rate > 0 ? s.rate : "Exempt",
+        numCSV(s.taxable), numCSV(s.cgst), numCSV(s.sgst), numCSV(s.igst), numCSV(s.gst),
+      ]);
+    }
+    rows.push([
+      d.name + " - TOTAL", "",
+      numCSV(d.taxable), numCSV(d.cgst), numCSV(d.sgst), numCSV(d.igst), numCSV(d.gst),
+    ]);
+  }
+  rows.push([
+    "GRAND TOTAL", "",
+    numCSV(g.taxable), numCSV(g.cgst), numCSV(g.sgst), numCSV(g.igst), numCSV(g.gst),
+  ]);
+  rows.push([""]);
+  rows.push(["Invoices in month", String(g.invoiceCount || 0)]);
+
+  const csv = rows.map((r) => r.map((cell) => `"${String(cell == null ? "" : cell).replace(/"/g, '""')}"`).join(",")).join("\r\n");
+  const blob = new Blob(["\ufeff" + csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `purchase-summary-${monthLabel}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+  showToast("CSV exported.", "success");
+}
+
+function numCSV(n) {
+  return Number(n || 0).toFixed(2);
+}

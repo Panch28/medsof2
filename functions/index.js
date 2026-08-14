@@ -1325,6 +1325,170 @@ exports.listPendingInvoices = onCall(
   }
 );
 
+// ─── purchaseSummary ─────────────────────────────────────────────────────────
+// Lightweight monthly Purchase Summary for the pharmacy owner. Builds ONLY on
+// data already persisted by saveInvoice — no new schema fields, no GSTR-3B.
+// Aggregates the footer invoiceSummary totals (Taxable + GST) grouped by
+// Distributor Name, then splits each distributor's GST into tax slabs (5/12/18/
+// 28/0) from the per-line gstRate/gstValue. CGST/SGST/IGST is inferred per
+// invoice from the printed footer: totalIGST > 0 means inter-state (all GST is
+// IGST); otherwise the line GST splits half CGST / half SGST (intra-state).
+// Multi-page continuation docs (partial=true, invoiceTotal 0) are skipped so a
+// multi-page invoice is never double-counted.
+
+exports.purchaseSummary = onCall(
+  {
+    region: "us-central1",
+    memory: "256MiB",
+    timeoutSeconds: 30,
+  },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Login required.");
+    }
+    const { pharmacyId, from, to } = request.data;
+    if (!pharmacyId) throw new HttpsError("invalid-argument", "pharmacyId is required");
+
+    const db = getFirestore();
+    const fromDate = new Date(from);
+    const toDate = new Date(to);
+    if (isNaN(fromDate.getTime()) || isNaN(toDate.getTime()) || fromDate >= toDate) {
+      throw new HttpsError("invalid-argument", "from/to must be valid timestamps with from < to");
+    }
+
+    const snap = await db
+      .collection("pharmacies")
+      .doc(pharmacyId)
+      .collection("invoices")
+      .where("createdAt", ">=", fromDate)
+      .where("createdAt", "<", toDate)
+      .get();
+
+    const byDist = new Map(); // normalized distributor name → agg
+
+    const ensureDist = (name) => {
+      if (!byDist.has(name)) {
+        byDist.set(name, {
+          name,
+          invoiceCount: 0,
+          grandTotal: 0,
+          taxable: 0,
+          gst: 0,
+          cgst: 0,
+          sgst: 0,
+          igst: 0,
+          slabs: new Map(), // rate → { rate, taxable, gst, cgst, sgst, igst }
+        });
+      }
+      return byDist.get(name);
+    };
+
+    for (const doc of snap.docs) {
+      const d = doc.data();
+      // Skip continuation pages of multi-page invoices — the footer page is the
+      // only doc carrying authoritative totals, and it always has partial=false.
+      if (d.partial === true) continue;
+
+      const dist = ensureDist(normalizeDistributorName(d.distributor) || "UNKNOWN");
+      dist.invoiceCount++;
+
+      const summary = d.invoiceSummary || {};
+      dist.grandTotal += Number(summary.grandTotal) || Number(d.invoiceTotal) || 0;
+
+      // Inter-state iff the printed footer shows IGST.
+      const interState = Number(summary.totalIGST || 0) > 0;
+
+      const lines = Array.isArray(d.lineItems) ? d.lineItems : [];
+      for (const l of lines) {
+        const rate = Math.round(Number(l.gstRate) || 0);
+        const taxable = Number(l.taxableValue) || 0;
+        const gst = Number(l.gstValue) || 0;
+        if (taxable <= 0 && gst <= 0) continue;
+
+        const slabKey = String(rate);
+        if (!dist.slabs.has(slabKey)) {
+          dist.slabs.set(slabKey, { rate, taxable: 0, gst: 0, cgst: 0, sgst: 0, igst: 0 });
+        }
+        const slab = dist.slabs.get(slabKey);
+        slab.taxable += taxable;
+        slab.gst += gst;
+        dist.taxable += taxable;
+        dist.gst += gst;
+
+        if (interState) {
+          slab.igst += gst;
+          dist.igst += gst;
+        } else {
+          const half = gst / 2;
+          slab.cgst += half;
+          slab.sgst += half;
+          dist.cgst += half;
+          dist.sgst += half;
+        }
+      }
+    }
+
+    const distributors = [];
+    let grandTotals = {
+      invoiceCount: 0,
+      grandTotal: 0,
+      taxable: 0,
+      gst: 0,
+      cgst: 0,
+      sgst: 0,
+      igst: 0,
+    };
+
+    for (const agg of byDist.values()) {
+      const slabs = [...agg.slabs.values()]
+        .map((s) => ({
+          rate: s.rate,
+          taxable: round2(s.taxable),
+          gst: round2(s.gst),
+          cgst: round2(s.cgst),
+          sgst: round2(s.sgst),
+          igst: round2(s.igst),
+        }))
+        .sort((a, b) => a.rate - b.rate);
+      const d = {
+        name: agg.name,
+        invoiceCount: agg.invoiceCount,
+        grandTotal: round2(agg.grandTotal),
+        taxable: round2(agg.taxable),
+        gst: round2(agg.gst),
+        cgst: round2(agg.cgst),
+        sgst: round2(agg.sgst),
+        igst: round2(agg.igst),
+        slabs,
+      };
+      distributors.push(d);
+      grandTotals.invoiceCount += d.invoiceCount;
+      grandTotals.grandTotal += agg.grandTotal;
+      grandTotals.taxable += agg.taxable;
+      grandTotals.gst += agg.gst;
+      grandTotals.cgst += agg.cgst;
+      grandTotals.sgst += agg.sgst;
+      grandTotals.igst += agg.igst;
+    }
+
+    distributors.sort((a, b) => a.name.localeCompare(b.name));
+
+    return {
+      period: { from: fromDate.toISOString(), to: toDate.toISOString() },
+      distributors,
+      grandTotals: {
+        invoiceCount: grandTotals.invoiceCount,
+        grandTotal: round2(grandTotals.grandTotal),
+        taxable: round2(grandTotals.taxable),
+        gst: round2(grandTotals.gst),
+        cgst: round2(grandTotals.cgst),
+        sgst: round2(grandTotals.sgst),
+        igst: round2(grandTotals.igst),
+      },
+    };
+  }
+);
+
 // ─── getPendingInvoice ───────────────────────────────────────────────────────
 // Returns the full merged contents of a staged (partial) invoice so the UI can
 // open it in the review panel: all buffered pages, merged line items, the page
