@@ -1125,11 +1125,15 @@ function expiryBucketOf(daysLeft) {
   return "safe";
 }
 
-const EXPIRY_BUCKET_ORDER = { expired: 0, critical: 1, warning: 2, watch: 3, safe: 4 };
+const EXPIRY_BUCKET_ORDER = { critical: 0, warning: 1, watch: 2, safe: 3, expired: 4 };
 
 let expirySortMode = "urgency";
 let expiryBucketFilter = "all"; // all | expired | critical | warning | watch | safe
 let lastExpiryRows = []; // last aggregated rows, for chip/sort re-render without refetch
+let expirySearchQuery = ""; // debounced medicine/batch search
+let expiryDistributorFilter = ""; // "" = all
+let expiryVisibleCount = 0; // pagination: how many rows are currently rendered
+const EXPIRY_PAGE_SIZE = 40;
 
 function subscribeExpiringMedicines() {
   if (expiringUnsub) return;
@@ -1140,6 +1144,40 @@ function subscribeExpiringMedicines() {
   if (sortEl) {
     sortEl.addEventListener("change", () => {
       expirySortMode = sortEl.value;
+      expiryVisibleCount = 0;
+      renderExpiryList();
+    });
+  }
+
+  // Search-first: debounced name/batch search.
+  const searchEl = $("expiry-search");
+  if (searchEl) {
+    let debounceTimer = null;
+    searchEl.addEventListener("input", () => {
+      clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        expirySearchQuery = searchEl.value.trim().toLowerCase();
+        expiryVisibleCount = 0;
+        renderExpiryList();
+      }, 250);
+    });
+  }
+
+  // Distributor filter dropdown (populated from live data).
+  const distEl = $("expiry-distributor-filter");
+  if (distEl) {
+    distEl.addEventListener("change", () => {
+      expiryDistributorFilter = distEl.value;
+      expiryVisibleCount = 0;
+      renderExpiryList();
+    });
+  }
+
+  // Pagination: reveal more rows instead of painting every batch at once.
+  const moreBtn = $("expiry-load-more");
+  if (moreBtn) {
+    moreBtn.addEventListener("click", () => {
+      expiryVisibleCount += EXPIRY_PAGE_SIZE;
       renderExpiryList();
     });
   }
@@ -1210,30 +1248,65 @@ function subscribeExpiringMedicines() {
   );
 }
 
-// Sort + filter the aggregated rows per the current sort mode / bucket chip,
-// then paint the chip bar and the list. Expired rows stay in their own chip —
-// never mixed into the main action list.
+// Populate the distributor filter dropdown from the aggregated rows. Preserves
+// the currently-selected distributor across re-renders.
+function populateExpiryDistributors() {
+  const distEl = $("expiry-distributor-filter");
+  if (!distEl) return;
+  const names = [...new Set(lastExpiryRows.flatMap((r) => r.distributors))].sort((a, b) =>
+    a.localeCompare(b)
+  );
+  const current = expiryDistributorFilter;
+  distEl.innerHTML =
+    `<option value="">All distributors (${names.length})</option>` +
+    names
+      .map((n) => `<option value="${escapeHtml(n)}" ${n === current ? "selected" : ""}>${escapeHtml(n)}</option>`)
+      .join("");
+}
+
+// Sort + filter the aggregated rows per the current sort mode / bucket chip /
+// search query / distributor filter, then paint the chip bar + a paginated
+// slice of the list. Expired rows stay in their own chip — never mixed into
+// the main action list.
 function renderExpiryList() {
   const listEl = $("expiring-list");
   if (!listEl) return;
   const now = new Date();
 
-  const rows = lastExpiryRows
-    .map((r) => {
-      const daysLeft = r.expDate ? Math.ceil((r.expDate - now) / (1000 * 60 * 60 * 24)) : null;
-      return { ...r, daysLeft, bucket: expiryBucketOf(daysLeft) };
-    })
-    .filter((r) => expiryBucketFilter === "all" || r.bucket === expiryBucketFilter);
+  // Base: all aggregated rows, mapped to their current bucket.
+  const all = lastExpiryRows.map((r) => {
+    const daysLeft = r.expDate ? Math.ceil((r.expDate - now) / (1000 * 60 * 60 * 24)) : null;
+    return { ...r, daysLeft, bucket: expiryBucketOf(daysLeft) };
+  });
+
+  // Filters: bucket chip → search query → distributor. "all" excludes expired —
+  // dead stock lives in its own chip so the main scroll leads with live batches.
+  let rows = all.filter(
+    (r) => (expiryBucketFilter === "all" ? r.bucket !== "expired" : r.bucket === expiryBucketFilter)
+  );
+  if (expirySearchQuery) {
+    rows = rows.filter(
+      (r) =>
+        r.name.toLowerCase().includes(expirySearchQuery) ||
+        r.batch.toLowerCase().includes(expirySearchQuery)
+    );
+  }
+  if (expiryDistributorFilter) {
+    rows = rows.filter((r) => r.distributors.includes(expiryDistributorFilter));
+  }
 
   const sorters = {
     urgency: (a, b) =>
-      EXPIRY_BUCKET_ORDER[b.bucket] - EXPIRY_BUCKET_ORDER[a.bucket] || // action order
+      EXPIRY_BUCKET_ORDER[a.bucket] - EXPIRY_BUCKET_ORDER[b.bucket] || // action order
       (a.expDate || 0) - (b.expDate || 0), // then soonest
     expiry: (a, b) => (a.expDate || 0) - (b.expDate || 0),
     recent: (a, b) => (b.newestCreatedAt || 0) - (a.newestCreatedAt || 0),
     alpha: (a, b) => a.name.localeCompare(b.name) || a.batch.localeCompare(b.batch),
   };
   rows.sort(sorters[expirySortMode] || sorters.urgency);
+
+  // Distributor dropdown reflects the underlying data (not the filtered slice).
+  populateExpiryDistributors();
 
   // Bucket chips with live counts (computed from ALL rows, not the filtered set)
   const bucketCounts = {};
@@ -1258,11 +1331,25 @@ function renderExpiryList() {
     return;
   }
   if (rows.length === 0) {
-    listEl.innerHTML = `<div class="text-center py-6 text-xs text-slate-500">No items in this bucket.</div>`;
+    listEl.innerHTML = `<div class="text-center py-6 text-xs text-slate-500">No items match the current filters.</div>`;
     return;
   }
 
-  listEl.innerHTML = rows.map((item) => expiryCard(item)).join("");
+  // Pagination: render only a windowed slice; "Show more" reveals the next page.
+  if (expiryVisibleCount <= 0) expiryVisibleCount = EXPIRY_PAGE_SIZE;
+  const visible = rows.slice(0, expiryVisibleCount);
+  listEl.innerHTML = visible.map((item) => expiryCard(item)).join("");
+
+  const moreBtn = $("expiry-load-more");
+  if (moreBtn) {
+    const remaining = rows.length - visible.length;
+    if (remaining > 0) {
+      moreBtn.classList.remove("hidden");
+      moreBtn.textContent = `Show ${Math.min(remaining, EXPIRY_PAGE_SIZE)} more (${remaining} remaining)`;
+    } else {
+      moreBtn.classList.add("hidden");
+    }
+  }
 }
 
 function renderExpiryChips(bucketCounts, totalBatches) {
@@ -1289,6 +1376,7 @@ function renderExpiryChips(bucketCounts, totalBatches) {
   wrap.querySelectorAll("button[data-bucket]").forEach((btn) => {
     btn.addEventListener("click", () => {
       expiryBucketFilter = btn.dataset.bucket;
+      expiryVisibleCount = 0;
       renderExpiryList();
     });
   });
