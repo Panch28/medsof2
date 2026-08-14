@@ -1104,82 +1104,249 @@ function closeReviewPanel() {
 
 let expiringUnsub = null;
 
+// Expiry bucket thresholds (days until expiry).
+const EXPIRY_BUCKETS = [
+  { id: "expired", label: "Expired", max: -1, color: "bg-slate-700 text-slate-400" },
+  { id: "critical", label: "Critical (0-30d)", min: 0, max: 30, color: "bg-rose-500/20 text-rose-400" },
+  { id: "warning", label: "Warning (31-90d)", min: 31, max: 90, color: "bg-amber-500/20 text-amber-400" },
+  { id: "watch", label: "Watch (91-180d)", min: 91, max: 180, color: "bg-sky-500/20 text-sky-400" },
+  { id: "safe", label: "Safe (180d+)", min: 181, color: "bg-emerald-500/15 text-emerald-400" },
+];
+
+// Group an item's days-left into an action bucket. `expired` sorts LAST so the
+// main view leads with what still needs action; the owner never scrolls past
+// dead stock to reach live batches.
+function expiryBucketOf(daysLeft) {
+  if (daysLeft == null) return "safe"; // no date → treat as safe, not urgent
+  if (daysLeft < 0) return "expired";
+  if (daysLeft <= 30) return "critical";
+  if (daysLeft <= 90) return "warning";
+  if (daysLeft <= 180) return "watch";
+  return "safe";
+}
+
+const EXPIRY_BUCKET_ORDER = { expired: 0, critical: 1, warning: 2, watch: 3, safe: 4 };
+
+let expirySortMode = "urgency";
+let expiryBucketFilter = "all"; // all | expired | critical | warning | watch | safe
+let lastExpiryRows = []; // last aggregated rows, for chip/sort re-render without refetch
+
 function subscribeExpiringMedicines() {
   if (expiringUnsub) return;
   const listEl = $("expiring-list");
   if (!listEl) return;
 
+  const sortEl = $("expiry-sort");
+  if (sortEl) {
+    sortEl.addEventListener("change", () => {
+      expirySortMode = sortEl.value;
+      renderExpiryList();
+    });
+  }
+
   expiringUnsub = onSnapshot(
     collection(db, "pharmacies", currentPharmacyId, "medicines"),
     (snapshot) => {
       const now = new Date();
-      const ninetyDaysOut = new Date(now.getTime() + 90 * 24 * 60 * 60 * 1000);
-      const withDate = [];
-      const noDate = [];
+      // Aggregate: group raw medicine docs by medicineName + batchNumber so the
+      // same batch scanned on N invoices renders as ONE row with summed qty.
+      // The audit trail (one doc per invoice line) is untouched in Firestore.
+      const aggMap = new Map();
+      let noName = 0;
 
       snapshot.forEach((docSnap) => {
         const d = docSnap.data();
+        const name = String(d.medicineName || "").trim();
+        const batch = String(d.batchNumber || "").trim();
+        const key = name.toUpperCase() + "|" + batch.toUpperCase();
+        if (!name && !batch) {
+          noName++;
+          return; // unlabeled row — skip aggregation, not useful in the list
+        }
         const expDate = parseExpiryDate(d.expiryDate);
-        const row = { id: docSnap.id, ...d, expDate };
-        if (expDate) withDate.push(row);
-        else noDate.push(row);
+        const daysLeft = expDate ? Math.ceil((expDate - now) / (1000 * 60 * 60 * 24)) : null;
+        const bucket = expiryBucketOf(daysLeft);
+
+        const agg = aggMap.get(key) || {
+          name,
+          batch,
+          expiryDate: d.expiryDate || "",
+          expDate,
+          bucket,
+          qty: 0,
+          qtyFree: 0,
+          distributors: new Set(),
+          invoiceCount: 0,
+          newestCreatedAt: null,
+          ids: [],
+        };
+        agg.qty += Number(d.remainingQty ?? d.quantityBilled) || 0;
+        agg.qtyFree += Number(d.quantityFree) || 0;
+        const dist = normalizeDistributorName(d.distributor);
+        if (dist) agg.distributors.add(dist);
+        agg.invoiceCount++;
+        agg.ids.push(docSnap.id);
+        // For display keep the EARLIEST expiry across merged rows (safest).
+        if (expDate && (!agg.expDate || expDate < agg.expDate)) {
+          agg.expDate = expDate;
+          agg.expiryDate = d.expiryDate;
+          agg.bucket = bucket;
+        }
+        const ct = d.createdAt && d.createdAt.toMillis ? d.createdAt.toMillis() : 0;
+        if (ct > (agg.newestCreatedAt || 0)) agg.newestCreatedAt = ct;
+        aggMap.set(key, agg);
       });
 
-      withDate.sort((a, b) => a.expDate - b.expDate);
-      const items = [...withDate, ...noDate];
-
-      // True database count — every batch stored in the medicines collection,
-      // not just the expiring subset.
-      const countEl = $("expiring-count");
-      if (countEl) countEl.textContent = `${items.length} record${items.length !== 1 ? "s" : ""}`;
-
-      if (items.length === 0) {
-        listEl.innerHTML = `<div class="text-center py-6 text-xs text-slate-500">No batches recorded yet. Save an invoice to populate.</div>`;
-        return;
-      }
-
-      listEl.innerHTML = items.map((item) => {
-        const daysLeft = item.expDate ? Math.ceil((item.expDate - now) / (1000 * 60 * 60 * 24)) : null;
-        const urgency = !item.expDate
-          ? "border-slate-700/60 bg-slate-800/40"
-          : daysLeft <= 30 ? "border-rose-500/40 bg-rose-500/5"
-          : daysLeft <= 60 ? "border-amber-500/40 bg-amber-500/5"
-          : daysLeft <= 90 ? "border-amber-500/30 bg-amber-500/5"
-          : "border-slate-700/60 bg-slate-800/40";
-        const badgeClass = !item.expDate
-          ? "bg-slate-700 text-slate-400"
-          : daysLeft <= 0 ? "bg-rose-500/20 text-rose-400"
-          : daysLeft <= 30 ? "bg-rose-500/20 text-rose-400"
-          : daysLeft <= 60 ? "bg-amber-500/20 text-amber-400"
-          : daysLeft <= 90 ? "bg-amber-500/15 text-amber-400"
-          : "bg-slate-700 text-slate-400";
-        const badge = !item.expDate
-          ? "NO EXPIRY"
-          : daysLeft <= 0 ? "EXPIRED" : `${daysLeft}d left`;
-        return `
-          <div class="border ${urgency} rounded-xl p-3 space-y-1.5">
-            <div class="flex justify-between items-start">
-              <div>
-                <p class="text-xs font-bold text-slate-100 leading-tight">${item.medicineName}</p>
-                <p class="text-[9px] font-mono text-slate-500">Batch: ${item.batchNumber}</p>
-              </div>
-              <span class="text-[9px] px-2 py-0.5 rounded-full font-bold ${badgeClass}">
-                ${badge}
-              </span>
-            </div>
-            <div class="flex items-center justify-between text-[10px] text-slate-400">
-              <span>Exp: ${item.expiryDate || "—"}</span>
-              <span>Qty: ${item.remainingQty ?? item.quantityBilled}</span>
-              <span class="text-slate-500">${normalizeDistributorName(item.distributor) || "—"}</span>
-            </div>
-          </div>
-        `;
-      }).join("");
+      lastExpiryRows = [...aggMap.values()].map((a) => ({
+        ...a,
+        distributors: [...a.distributors].sort((x, y) => x.localeCompare(y)),
+        // qty summed across all invoices of that batch
+      }));
+      renderExpiryList();
     },
     (err) => {
       listEl.innerHTML = `<div class="text-center py-6 text-xs text-rose-400">Error loading: ${err.message}</div>`;
     }
   );
+}
+
+// Sort + filter the aggregated rows per the current sort mode / bucket chip,
+// then paint the chip bar and the list. Expired rows stay in their own chip —
+// never mixed into the main action list.
+function renderExpiryList() {
+  const listEl = $("expiring-list");
+  if (!listEl) return;
+  const now = new Date();
+
+  const rows = lastExpiryRows
+    .map((r) => {
+      const daysLeft = r.expDate ? Math.ceil((r.expDate - now) / (1000 * 60 * 60 * 24)) : null;
+      return { ...r, daysLeft, bucket: expiryBucketOf(daysLeft) };
+    })
+    .filter((r) => expiryBucketFilter === "all" || r.bucket === expiryBucketFilter);
+
+  const sorters = {
+    urgency: (a, b) =>
+      EXPIRY_BUCKET_ORDER[b.bucket] - EXPIRY_BUCKET_ORDER[a.bucket] || // action order
+      (a.expDate || 0) - (b.expDate || 0), // then soonest
+    expiry: (a, b) => (a.expDate || 0) - (b.expDate || 0),
+    recent: (a, b) => (b.newestCreatedAt || 0) - (a.newestCreatedAt || 0),
+    alpha: (a, b) => a.name.localeCompare(b.name) || a.batch.localeCompare(b.batch),
+  };
+  rows.sort(sorters[expirySortMode] || sorters.urgency);
+
+  // Bucket chips with live counts (computed from ALL rows, not the filtered set)
+  const bucketCounts = {};
+  lastExpiryRows.forEach((r) => {
+    const dl = r.expDate ? Math.ceil((r.expDate - now) / (1000 * 60 * 60 * 24)) : null;
+    const b = expiryBucketOf(dl);
+    bucketCounts[b] = (bucketCounts[b] || 0) + 1;
+  });
+  const totalBatches = lastExpiryRows.length;
+  renderExpiryChips(bucketCounts, totalBatches);
+
+  const countEl = $("expiring-count");
+  if (countEl) {
+    const activeCount = lastExpiryRows.filter(
+      (r) => r.expDate && Math.ceil((r.expDate - now) / (1000 * 60 * 60 * 24)) >= 0
+    ).length;
+    countEl.textContent = `${activeCount} active · ${bucketCounts.expired || 0} expired`;
+  }
+
+  if (lastExpiryRows.length === 0) {
+    listEl.innerHTML = `<div class="text-center py-6 text-xs text-slate-500">No batches recorded yet. Record an invoice to populate.</div>`;
+    return;
+  }
+  if (rows.length === 0) {
+    listEl.innerHTML = `<div class="text-center py-6 text-xs text-slate-500">No items in this bucket.</div>`;
+    return;
+  }
+
+  listEl.innerHTML = rows.map((item) => expiryCard(item)).join("");
+}
+
+function renderExpiryChips(bucketCounts, totalBatches) {
+  const wrap = $("expiry-buckets");
+  if (!wrap) return;
+  const chips = [
+    { id: "all", label: `All (${totalBatches})` },
+    { id: "critical", label: `Critical ${bucketCounts.critical || 0}` },
+    { id: "warning", label: `Warning ${bucketCounts.warning || 0}` },
+    { id: "watch", label: `Watch ${bucketCounts.watch || 0}` },
+    { id: "safe", label: `Safe ${bucketCounts.safe || 0}` },
+    { id: "expired", label: `Expired ${bucketCounts.expired || 0}` },
+  ];
+  wrap.innerHTML = chips
+    .map((c) => {
+      const active = expiryBucketFilter === c.id;
+      return `<button data-bucket="${c.id}" class="shrink-0 px-2.5 py-1 rounded-full text-[9px] font-bold border transition-all ${
+        active
+          ? "bg-indigo-600 border-indigo-500 text-white"
+          : "bg-slate-800 border-slate-700/60 text-slate-400 hover:bg-slate-700/60"
+      }">${c.label}</button>`;
+    })
+    .join("");
+  wrap.querySelectorAll("button[data-bucket]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      expiryBucketFilter = btn.dataset.bucket;
+      renderExpiryList();
+    });
+  });
+}
+
+// One aggregated batch card. Distinguishes CRITICAL (action) from EXPIRED
+// (dead stock, written off) so the owner's eye goes straight to what matters.
+function expiryCard(item) {
+  const daysLeft = item.daysLeft;
+  const b = item.bucket;
+  const border =
+    b === "expired"
+      ? "border-slate-700/50 bg-slate-800/30"
+      : b === "critical"
+      ? "border-rose-500/50 bg-rose-500/5"
+      : b === "warning"
+      ? "border-amber-500/40 bg-amber-500/5"
+      : b === "watch"
+      ? "border-sky-500/30 bg-sky-500/5"
+      : "border-slate-700/60 bg-slate-800/40";
+  const badgeClass =
+    b === "expired"
+      ? "bg-slate-700 text-slate-400"
+      : b === "critical"
+      ? "bg-rose-500/20 text-rose-400"
+      : b === "warning"
+      ? "bg-amber-500/20 text-amber-400"
+      : b === "watch"
+      ? "bg-sky-500/15 text-sky-400"
+      : "bg-emerald-500/10 text-emerald-400";
+  const badge =
+    b === "expired"
+      ? `EXPIRED ${Math.abs(daysLeft)}d ago`
+      : daysLeft == null
+      ? "NO EXPIRY"
+      : `${daysLeft}d left`;
+  const dists = item.distributors.length
+    ? item.distributors.slice(0, 2).join(", ") + (item.distributors.length > 2 ? " +" + (item.distributors.length - 2) : "")
+    : "—";
+  const multi = item.invoiceCount > 1
+    ? ` <span class="text-indigo-400/80">(${item.invoiceCount} scans)</span>`
+    : "";
+  return `
+    <div class="border ${border} rounded-xl p-3 space-y-1.5">
+      <div class="flex justify-between items-start gap-2">
+        <div class="min-w-0">
+          <p class="text-xs font-bold text-slate-100 leading-tight truncate">${escapeHtml(item.name)}</p>
+          <p class="text-[9px] font-mono text-slate-500">Batch: ${escapeHtml(item.batch || "—")}</p>
+        </div>
+        <span class="text-[9px] px-2 py-0.5 rounded-full font-bold ${badgeClass} shrink-0">${badge}</span>
+      </div>
+      <div class="flex items-center justify-between text-[10px] text-slate-400">
+        <span>Exp: ${escapeHtml(item.expiryDate || "—")}</span>
+        <span class="font-mono font-bold text-slate-300">Qty: ${item.qty}</span>
+        <span class="text-slate-500 truncate max-w-[38%]">${escapeHtml(dists)}${multi}</span>
+      </div>
+    </div>
+  `;
 }
 
 // Tolerant expiry-date parser covering every format the Gemini pipeline may

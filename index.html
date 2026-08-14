@@ -368,20 +368,34 @@
                         </div>
                     </div>
 
-                    <!-- Expiring Soon Header -->
+                    <!-- Stock Expiry (bucket-based, aggregated view) -->
                     <div class="space-y-2">
                         <div class="flex justify-between items-baseline">
                             <h3 class="text-sm font-heading font-extrabold text-slate-100 flex items-center gap-1.5">
                                 <span class="w-1.5 h-1.5 rounded-full bg-brand-danger animate-pulse"></span>
-                                High Alert Expiry Batches
+                                Stock Expiry
                             </h3>
                             <span id="expiring-count" class="text-[10px] text-slate-400 font-bold">0 records</span>
                         </div>
-                        
-                        <!-- List Wrapper -->
+
+                        <!-- Sort toggle (action-oriented default) -->
+                        <div class="flex items-center gap-2">
+                            <span class="text-[9px] font-bold uppercase tracking-wider text-slate-500 shrink-0">Sort</span>
+                            <select id="expiry-sort" class="flex-1 bg-slate-900 border border-slate-700/60 rounded-lg px-2 py-1.5 text-[10px] text-slate-300 focus:outline-none focus:border-indigo-500">
+                                <option value="urgency">Action needed first</option>
+                                <option value="expiry">Soonest expiry</option>
+                                <option value="recent">Most recent addition</option>
+                                <option value="alpha">Alphabetical</option>
+                            </select>
+                        </div>
+
+                        <!-- Expiry bucket chips (expired stays separate) -->
+                        <div id="expiry-buckets" class="flex gap-1.5 overflow-x-auto pb-0.5 -mx-1 px-1"></div>
+
+                        <!-- Aggregated Batch List (grouped by medicine + batch) -->
                         <div id="expiring-list" class="space-y-2.5">
                             <!-- Items populated dynamically by JS -->
-                            <div class="text-center py-6 text-xs text-slate-500">No expiring items. Record an invoice to populate.</div>
+                            <div class="text-center py-6 text-xs text-slate-500">No batches recorded yet. Record an invoice to populate.</div>
                         </div>
                     </div>
                 </div>
