@@ -387,6 +387,9 @@
                                 <option value="recent">Most recent addition</option>
                                 <option value="alpha">Alphabetical</option>
                             </select>
+                            <button id="btn-expiry-select" class="shrink-0 px-3 py-1.5 rounded-lg border text-[9px] font-bold uppercase tracking-wider transition-all bg-slate-800 border-slate-700/60 text-slate-300 hover:bg-slate-700/60">
+                                Select
+                            </button>
                         </div>
 
                         <!-- Search + filter (search-first above ~500 SKUs) -->
@@ -409,6 +412,64 @@
                             <div class="text-center py-6 text-xs text-slate-500">No batches recorded yet. Record an invoice to populate.</div>
                         </div>
                         <button id="expiry-load-more" class="hidden w-full py-2.5 bg-slate-800 border border-slate-700/60 rounded-xl text-[10px] font-bold text-slate-300 hover:bg-slate-700/60 transition-all">Show more…</button>
+                    </div>
+                </div>
+
+                <!-- Bulk-actions bar for the expiry list (sticky above bottom nav) -->
+                <div id="expiry-bulk-bar" class="hidden fixed left-1/2 -translate-x-1/2 bottom-20 z-40 w-full max-w-md px-3">
+                    <div class="bg-slate-800/95 backdrop-blur-md border border-slate-700/70 rounded-2xl p-2.5 shadow-2xl space-y-2">
+                        <div class="flex justify-between items-center">
+                            <span id="expiry-bulk-count" class="text-[10px] font-bold text-slate-300">0 selected</span>
+                            <button id="btn-expiry-bulk-select-all" class="text-[9px] font-bold text-indigo-400 hover:text-indigo-300">Select all shown</button>
+                            <button id="btn-expiry-bulk-clear" class="text-[9px] font-bold text-slate-400 hover:text-slate-200">Clear</button>
+                        </div>
+                        <div class="grid grid-cols-3 gap-1.5">
+                            <button id="btn-bulk-return-pending" class="px-2 py-1.5 rounded-lg text-[9px] font-bold text-slate-200 bg-slate-700/70 hover:bg-slate-600/70 transition-all">Return Pending</button>
+                            <button id="btn-bulk-returned" class="px-2 py-1.5 rounded-lg text-[9px] font-bold text-white bg-indigo-600 hover:bg-indigo-500 transition-all">Returned (CN)</button>
+                            <button id="btn-bulk-disposed" class="px-2 py-1.5 rounded-lg text-[9px] font-bold text-white bg-amber-600 hover:bg-amber-500 transition-all">Disposed</button>
+                            <button id="btn-bulk-writeoff" class="px-2 py-1.5 rounded-lg text-[9px] font-bold text-white bg-rose-600 hover:bg-rose-500 transition-all">Write Off</button>
+                            <button id="btn-bulk-active" class="px-2 py-1.5 rounded-lg text-[9px] font-bold text-slate-200 bg-emerald-600/80 hover:bg-emerald-500/80 transition-all">Restore</button>
+                            <button id="btn-bulk-delete" class="px-2 py-1.5 rounded-lg text-[9px] font-bold text-white bg-slate-700 hover:bg-slate-600 transition-all">Delete</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Return / Credit-note modal -->
+                <div id="return-credit-modal" class="hidden fixed inset-0 bg-slate-950/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
+                    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-sm p-4 space-y-3 shadow-2xl">
+                        <div>
+                            <h3 class="text-sm font-heading font-extrabold text-slate-100">Return to Distributor</h3>
+                            <p class="text-[10px] text-slate-500">Credit-note details for CA tracking.</p>
+                        </div>
+                        <div class="space-y-2">
+                            <label class="block text-[9px] font-bold uppercase tracking-wider text-slate-500">Credit note no *</label>
+                            <input id="cn-number" type="text" placeholder="e.g. CN/24/123" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-[11px] text-slate-200 placeholder-slate-500 focus:outline-none focus:border-indigo-500">
+                            <label class="block text-[9px] font-bold uppercase tracking-wider text-slate-500">Return date</label>
+                            <input id="cn-date" type="date" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-[11px] text-slate-200 focus:outline-none focus:border-indigo-500">
+                            <label class="block text-[9px] font-bold uppercase tracking-wider text-slate-500">Credit amount (₹)</label>
+                            <input id="cn-amount" type="number" min="0" step="0.01" placeholder="0.00" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-[11px] text-slate-200 placeholder-slate-500 focus:outline-none focus:border-indigo-500">
+                            <p id="cn-error" class="hidden text-[9px] text-rose-400 font-bold">Credit note number is required.</p>
+                        </div>
+                        <div class="flex gap-2">
+                            <button id="btn-cn-cancel" class="flex-1 py-2 rounded-lg text-[10px] font-bold text-slate-400 bg-slate-800 hover:bg-slate-700 transition-all">Cancel</button>
+                            <button id="btn-cn-confirm" class="flex-1 py-2 rounded-lg text-[10px] font-bold text-white bg-indigo-600 hover:bg-indigo-500 transition-all">Mark Returned</button>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Disposal / confirm modal -->
+                <div id="expiry-confirm-modal" class="hidden fixed inset-0 bg-slate-950/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
+                    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-sm p-4 space-y-3 shadow-2xl">
+                        <h3 id="expiry-confirm-title" class="text-sm font-heading font-extrabold text-slate-100">Confirm</h3>
+                        <p id="expiry-confirm-msg" class="text-[10px] text-slate-400 leading-relaxed"></p>
+                        <div id="expiry-confirm-input-wrap" class="hidden space-y-2">
+                            <label class="block text-[9px] font-bold uppercase tracking-wider text-slate-500">Disposal certificate reference</label>
+                            <input id="expiry-confirm-input" type="text" placeholder="Optional — e.g. DC/24/011" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-[11px] text-slate-200 placeholder-slate-500 focus:outline-none focus:border-indigo-500">
+                        </div>
+                        <div class="flex gap-2">
+                            <button id="btn-expiry-confirm-cancel" class="flex-1 py-2 rounded-lg text-[10px] font-bold text-slate-400 bg-slate-800 hover:bg-slate-700 transition-all">Cancel</button>
+                            <button id="btn-expiry-confirm-ok" class="flex-1 py-2 rounded-lg text-[10px] font-bold text-white bg-rose-600 hover:bg-rose-500 transition-all">Confirm</button>
+                        </div>
                     </div>
                 </div>
 

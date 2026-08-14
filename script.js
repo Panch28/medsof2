@@ -239,6 +239,7 @@ function initApp() {
   initThemeToggle();
   initUploadHandlers();
   subscribeExpiringMedicines();
+  initExpiryBulkActions();
   subscribeDistributors();
   subscribePendingInvoices();
   initPurchaseReports();
@@ -1127,12 +1128,32 @@ function expiryBucketOf(daysLeft) {
 
 const EXPIRY_BUCKET_ORDER = { critical: 0, warning: 1, watch: 2, safe: 3, expired: 4 };
 
+// Lifecycle status of a batch, mirrored from the cloud function. "deleted" is a
+// soft-delete (30-day grace window, purged by scheduledCleanup). Historical docs
+// without the field count as "active".
+const EXPIRY_STATUS_PRIORITY = {
+  active: 0,
+  return_pending: 1,
+  returned_to_distributor: 2,
+  disposed: 3,
+  written_off: 4,
+  deleted: 5,
+};
+const TERMINAL_EXPIRY_STATUSES = new Set([
+  "returned_to_distributor",
+  "disposed",
+  "written_off",
+  "deleted",
+]);
+
 let expirySortMode = "urgency";
-let expiryBucketFilter = "all"; // all | expired | critical | warning | watch | safe
+let expiryBucketFilter = "all"; // all | expired | critical | warning | watch | safe | archived
 let lastExpiryRows = []; // last aggregated rows, for chip/sort re-render without refetch
 let expirySearchQuery = ""; // debounced medicine/batch search
 let expiryDistributorFilter = ""; // "" = all
 let expiryVisibleCount = 0; // pagination: how many rows are currently rendered
+let expirySelectionMode = false; // bulk-select mode
+const expirySelectedKeys = new Set(); // aggregated keys picked for a bulk action
 const EXPIRY_PAGE_SIZE = 40;
 
 function subscribeExpiringMedicines() {
@@ -1182,6 +1203,38 @@ function subscribeExpiringMedicines() {
     });
   }
 
+  // Bulk-select mode toggle (same button toggles off).
+  const selectBtn = $("btn-expiry-select");
+  if (selectBtn) {
+    selectBtn.addEventListener("click", () => {
+      expirySelectionMode = !expirySelectionMode;
+      if (!expirySelectionMode) expirySelectedKeys.clear();
+      selectBtn.textContent = expirySelectionMode ? "Done" : "Select";
+      renderExpiryList();
+    });
+  }
+
+  // Card-level selection + per-row restore (event delegation — cards re-render).
+  listEl.addEventListener("click", (e) => {
+    const selBtn = e.target.closest("button[data-select]");
+    if (selBtn) {
+      e.stopPropagation();
+      const key = selBtn.dataset.select;
+      if (expirySelectedKeys.has(key)) expirySelectedKeys.delete(key);
+      else expirySelectedKeys.add(key);
+      updateExpiryBulkBar();
+      renderExpiryList();
+      return;
+    }
+    const restoreBtn = e.target.closest("button[data-restore]");
+    if (restoreBtn) {
+      e.stopPropagation();
+      const key = restoreBtn.dataset.restore;
+      const row = lastExpiryRows.find((r) => r.key === key);
+      if (row) restoreExpiryBatch([row]);
+    }
+  });
+
   expiringUnsub = onSnapshot(
     collection(db, "pharmacies", currentPharmacyId, "medicines"),
     (snapshot) => {
@@ -1206,6 +1259,7 @@ function subscribeExpiringMedicines() {
         const bucket = expiryBucketOf(daysLeft);
 
         const agg = aggMap.get(key) || {
+          key,
           name,
           batch,
           expiryDate: d.expiryDate || "",
@@ -1216,7 +1270,12 @@ function subscribeExpiringMedicines() {
           distributors: new Set(),
           invoiceCount: 0,
           newestCreatedAt: null,
+          newestUpdatedAt: null,
           ids: [],
+          statusPrio: -1,
+          status: "active",
+          creditNote: null,
+          disposalCertRef: "",
         };
         agg.qty += Number(d.remainingQty ?? d.quantityBilled) || 0;
         agg.qtyFree += Number(d.quantityFree) || 0;
@@ -1224,6 +1283,18 @@ function subscribeExpiringMedicines() {
         if (dist) agg.distributors.add(dist);
         agg.invoiceCount++;
         agg.ids.push(docSnap.id);
+        // Effective status: highest-priority status across the batch's member
+        // docs (bulk actions write the same status to every doc of a batch).
+        const st = d.status || "active";
+        const prio = EXPIRY_STATUS_PRIORITY[st] ?? 0;
+        if (prio > agg.statusPrio) {
+          agg.statusPrio = prio;
+          agg.status = st;
+        }
+        if (d.creditNote && typeof d.creditNote === "object") {
+          agg.creditNote = d.creditNote;
+        }
+        if (d.disposalCertRef) agg.disposalCertRef = d.disposalCertRef;
         // For display keep the EARLIEST expiry across merged rows (safest).
         if (expDate && (!agg.expDate || expDate < agg.expDate)) {
           agg.expDate = expDate;
@@ -1232,6 +1303,8 @@ function subscribeExpiringMedicines() {
         }
         const ct = d.createdAt && d.createdAt.toMillis ? d.createdAt.toMillis() : 0;
         if (ct > (agg.newestCreatedAt || 0)) agg.newestCreatedAt = ct;
+        const ut = d.updatedAt && d.updatedAt.toMillis ? d.updatedAt.toMillis() : 0;
+        if (ut > (agg.newestUpdatedAt || 0)) agg.newestUpdatedAt = ut;
         aggMap.set(key, agg);
       });
 
@@ -1267,7 +1340,9 @@ function populateExpiryDistributors() {
 // Sort + filter the aggregated rows per the current sort mode / bucket chip /
 // search query / distributor filter, then paint the chip bar + a paginated
 // slice of the list. Expired rows stay in their own chip — never mixed into
-// the main action list.
+// the main action list. Batches with a terminal status (returned / disposed /
+// written off / soft-deleted) are hidden from the main buckets and shown only
+// in the "Archived" chip.
 function renderExpiryList() {
   const listEl = $("expiring-list");
   if (!listEl) return;
@@ -1279,11 +1354,20 @@ function renderExpiryList() {
     return { ...r, daysLeft, bucket: expiryBucketOf(daysLeft) };
   });
 
-  // Filters: bucket chip → search query → distributor. "all" excludes expired —
-  // dead stock lives in its own chip so the main scroll leads with live batches.
-  let rows = all.filter(
-    (r) => (expiryBucketFilter === "all" ? r.bucket !== "expired" : r.bucket === expiryBucketFilter)
-  );
+  // Terminal-status batches only appear in the "archived" chip. Everything else
+  // stays out of the main buckets so the daily view never surfaces stock that
+  // already left the shelf.
+  let rows;
+  if (expiryBucketFilter === "archived") {
+    rows = all.filter((r) => TERMINAL_EXPIRY_STATUSES.has(r.status));
+  } else {
+    rows = all.filter((r) => !TERMINAL_EXPIRY_STATUSES.has(r.status));
+    // "all" excludes expired — dead stock lives in its own chip so the main
+    // scroll leads with live batches.
+    rows = rows.filter(
+      (r) => (expiryBucketFilter === "all" ? r.bucket !== "expired" : r.bucket === expiryBucketFilter)
+    );
+  }
   if (expirySearchQuery) {
     rows = rows.filter(
       (r) =>
@@ -1308,23 +1392,37 @@ function renderExpiryList() {
   // Distributor dropdown reflects the underlying data (not the filtered slice).
   populateExpiryDistributors();
 
-  // Bucket chips with live counts (computed from ALL rows, not the filtered set)
+  // Bucket chips with live counts. Terminal-status batches are counted only in
+  // the "archived" chip — they never inflate an expiry bucket.
   const bucketCounts = {};
+  let archivedCount = 0;
   lastExpiryRows.forEach((r) => {
+    if (TERMINAL_EXPIRY_STATUSES.has(r.status)) {
+      archivedCount++;
+      return;
+    }
     const dl = r.expDate ? Math.ceil((r.expDate - now) / (1000 * 60 * 60 * 24)) : null;
     const b = expiryBucketOf(dl);
     bucketCounts[b] = (bucketCounts[b] || 0) + 1;
   });
-  const totalBatches = lastExpiryRows.length;
-  renderExpiryChips(bucketCounts, totalBatches);
+  const totalBatches = lastExpiryRows.length - archivedCount;
+  renderExpiryChips(bucketCounts, totalBatches, archivedCount);
 
   const countEl = $("expiring-count");
   if (countEl) {
     const activeCount = lastExpiryRows.filter(
-      (r) => r.expDate && Math.ceil((r.expDate - now) / (1000 * 60 * 60 * 24)) >= 0
+      (r) =>
+        !TERMINAL_EXPIRY_STATUSES.has(r.status) &&
+        r.expDate &&
+        Math.ceil((r.expDate - now) / (1000 * 60 * 60 * 24)) >= 0
     ).length;
-    countEl.textContent = `${activeCount} active · ${bucketCounts.expired || 0} expired`;
+    let parts = [`${activeCount} active`, `${bucketCounts.expired || 0} expired`];
+    if (archivedCount) parts.push(`${archivedCount} archived`);
+    countEl.textContent = parts.join(" · ");
   }
+
+  // Bulk-select bar visibility.
+  updateExpiryBulkBar();
 
   if (lastExpiryRows.length === 0) {
     listEl.innerHTML = `<div class="text-center py-6 text-xs text-slate-500">No batches recorded yet. Record an invoice to populate.</div>`;
@@ -1352,7 +1450,7 @@ function renderExpiryList() {
   }
 }
 
-function renderExpiryChips(bucketCounts, totalBatches) {
+function renderExpiryChips(bucketCounts, totalBatches, archivedCount) {
   const wrap = $("expiry-buckets");
   if (!wrap) return;
   const chips = [
@@ -1362,6 +1460,7 @@ function renderExpiryChips(bucketCounts, totalBatches) {
     { id: "watch", label: `Watch ${bucketCounts.watch || 0}` },
     { id: "safe", label: `Safe ${bucketCounts.safe || 0}` },
     { id: "expired", label: `Expired ${bucketCounts.expired || 0}` },
+    { id: "archived", label: `Archived ${archivedCount || 0}` },
   ];
   wrap.innerHTML = chips
     .map((c) => {
@@ -1384,19 +1483,26 @@ function renderExpiryChips(bucketCounts, totalBatches) {
 
 // One aggregated batch card. Distinguishes CRITICAL (action) from EXPIRED
 // (dead stock, written off) so the owner's eye goes straight to what matters.
+// In selection mode the card gains a checkbox + border highlight; archived rows
+// get a status badge, credit-note/disposal meta, and a Restore button.
 function expiryCard(item) {
   const daysLeft = item.daysLeft;
   const b = item.bucket;
-  const border =
-    b === "expired"
-      ? "border-slate-700/50 bg-slate-800/30"
-      : b === "critical"
-      ? "border-rose-500/50 bg-rose-500/5"
-      : b === "warning"
-      ? "border-amber-500/40 bg-amber-500/5"
-      : b === "watch"
-      ? "border-sky-500/30 bg-sky-500/5"
-      : "border-slate-700/60 bg-slate-800/40";
+  const terminal = TERMINAL_EXPIRY_STATUSES.has(item.status);
+  const selected = expirySelectionMode && expirySelectedKeys.has(item.key);
+  const border = selected
+    ? "border-indigo-400 ring-2 ring-indigo-500/30 bg-indigo-500/10"
+    : terminal
+    ? "border-slate-800 bg-slate-800/20"
+    : b === "expired"
+    ? "border-slate-700/50 bg-slate-800/30"
+    : b === "critical"
+    ? "border-rose-500/50 bg-rose-500/5"
+    : b === "warning"
+    ? "border-amber-500/40 bg-amber-500/5"
+    : b === "watch"
+    ? "border-sky-500/30 bg-sky-500/5"
+    : "border-slate-700/60 bg-slate-800/40";
   const badgeClass =
     b === "expired"
       ? "bg-slate-700 text-slate-400"
@@ -1419,13 +1525,51 @@ function expiryCard(item) {
   const multi = item.invoiceCount > 1
     ? ` <span class="text-indigo-400/80">(${item.invoiceCount} scans)</span>`
     : "";
+
+  // Status badge for archived / non-active rows.
+  const statusBadges = {
+    return_pending: `<span class="text-[8px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wider bg-amber-500/20 text-amber-400 shrink-0">Return pending</span>`,
+    returned_to_distributor: `<span class="text-[8px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wider bg-indigo-500/20 text-indigo-400 shrink-0">Returned</span>`,
+    disposed: `<span class="text-[8px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wider bg-amber-600/20 text-amber-500 shrink-0">Disposed</span>`,
+    written_off: `<span class="text-[8px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wider bg-rose-500/20 text-rose-400 shrink-0">Written off</span>`,
+    deleted: `<span class="text-[8px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wider bg-slate-600/30 text-slate-400 shrink-0">Deleted</span>`,
+  };
+
+  // Selection checkbox (leading), only in selection mode.
+  const check = expirySelectionMode
+    ? `<button data-select="${escapeHtml(item.key)}" class="shrink-0 w-5 h-5 rounded-md border flex items-center justify-center text-[10px] font-bold transition-all ${
+        selected ? "bg-indigo-500 border-indigo-400 text-white" : "border-slate-600 text-transparent"
+      }">${selected ? "✓" : ""}</button>`
+    : "";
+
+  // Meta row for terminal rows: credit note / disposal cert reference.
+  let metaRow = "";
+  if (terminal) {
+    const cn = item.creditNote;
+    const metaBits = [];
+    if (cn && cn.creditNoteNo) {
+      metaBits.push(`<span class="text-indigo-400">CN ${escapeHtml(cn.creditNoteNo)}</span>`);
+      if (cn.creditAmount) metaBits.push(`<span class="text-slate-400">${fmtINR(cn.creditAmount)}</span>`);
+    }
+    if (item.disposalCertRef) {
+      metaBits.push(`<span class="text-amber-400">DC ${escapeHtml(item.disposalCertRef)}</span>`);
+    }
+    if (metaBits.length) {
+      metaRow = `<div class="text-[9px] font-mono flex items-center gap-1.5 flex-wrap">${metaBits.join("")}</div>`;
+    }
+    // Restore affordance (archived chip only).
+    metaRow += `<div class="pt-1"><button data-restore="${escapeHtml(item.key)}" class="text-[9px] font-bold text-emerald-400 hover:text-emerald-300">↺ Restore to active</button></div>`;
+  }
+
   return `
     <div class="border ${border} rounded-xl p-3 space-y-1.5">
       <div class="flex justify-between items-start gap-2">
-        <div class="min-w-0">
+        ${check}
+        <div class="min-w-0 flex-1">
           <p class="text-xs font-bold text-slate-100 leading-tight truncate">${escapeHtml(item.name)}</p>
           <p class="text-[9px] font-mono text-slate-500">Batch: ${escapeHtml(item.batch || "—")}</p>
         </div>
+        ${statusBadges[item.status] || ""}
         <span class="text-[9px] px-2 py-0.5 rounded-full font-bold ${badgeClass} shrink-0">${badge}</span>
       </div>
       <div class="flex items-center justify-between text-[10px] text-slate-400">
@@ -1433,8 +1577,197 @@ function expiryCard(item) {
         <span class="font-mono font-bold text-slate-300">Qty: ${item.qty}</span>
         <span class="text-slate-500 truncate max-w-[38%]">${escapeHtml(dists)}${multi}</span>
       </div>
+      ${metaRow}
     </div>
   `;
+}
+
+// ─── Expiry bulk actions (status lifecycle, replaces hard delete) ────────────
+// Every action writes a status via the bulkUpdateMedicineStatus callable. All
+// member docs of each selected batch are updated atomically. Hard delete is NOT
+// offered — "Delete" is a soft-delete (status "deleted") purged 30 days later.
+
+let expiryConfirmAction = null; // pending confirm-modal closure
+
+function selectedExpiryRows() {
+  return lastExpiryRows.filter((r) => expirySelectedKeys.has(r.key));
+}
+
+function updateExpiryBulkBar() {
+  const bar = $("expiry-bulk-bar");
+  if (!bar) return;
+  const count = expirySelectionMode ? expirySelectedKeys.size : 0;
+  const countEl = $("expiry-bulk-count");
+  if (countEl) countEl.textContent = `${count} selected`;
+  bar.classList.toggle("hidden", !expirySelectionMode || count === 0);
+}
+
+async function runBulkStatus(status, extra = {}) {
+  const rows = selectedExpiryRows();
+  if (!rows.length) return;
+  const ids = rows.flatMap((r) => r.ids);
+  const btnLabel = {
+    return_pending: "Return Pending",
+    returned_to_distributor: "Mark Returned",
+    disposed: "Mark Disposed",
+    written_off: "Write Off",
+    deleted: "Delete",
+    active: "Restore",
+  }[status] || status;
+  showToast(`${btnLabel}: updating ${rows.length} batch(es)…`, "info");
+  try {
+    const fn = httpsCallable(functions, "bulkUpdateMedicineStatus", { timeout: 60000 });
+    const resp = await fn({
+      pharmacyId: currentPharmacyId,
+      ids,
+      status,
+      ...extra,
+    });
+    expirySelectedKeys.clear();
+    updateExpiryBulkBar();
+    showToast(`${btnLabel}: ${resp.data.updated} batch(es) updated`, "success");
+  } catch (err) {
+    console.error("[bulkUpdateMedicineStatus] ERROR:", err);
+    showToast(`Update failed: ${err.message}`, "error");
+  }
+}
+
+function restoreExpiryBatch(rows) {
+  if (!rows.length) return;
+  expirySelectedKeys.clear();
+  rows.forEach((r) => expirySelectedKeys.add(r.key));
+  showConfirm(
+    "Restore to active?",
+    `This returns ${rows.length} batch(es) (${rows
+      .map((r) => r.name)
+      .slice(0, 3)
+      .join(", ")}) to the live stock view.`,
+    () => runBulkStatus("active")
+  );
+}
+
+// Open the credit-note modal for a "returned to distributor" action.
+function openReturnCreditModal() {
+  const rows = selectedExpiryRows();
+  if (!rows.length) return;
+  $("cn-number").value = "";
+  $("cn-date").value = new Date().toISOString().slice(0, 10);
+  $("cn-amount").value = "";
+  $("cn-error").classList.add("hidden");
+  $("return-credit-modal").classList.remove("hidden");
+  $("cn-number").focus();
+}
+
+// Open the confirm modal. `opts.input` renders an optional text field whose
+// value is passed to the action (used for the disposal cert ref).
+function showConfirm(title, msg, action, opts = {}) {
+  expiryConfirmAction = action;
+  $("expiry-confirm-title").textContent = title;
+  $("expiry-confirm-msg").textContent = msg;
+  const wrap = $("expiry-confirm-input-wrap");
+  if (opts.input) {
+    $("expiry-confirm-input").value = "";
+    wrap.classList.remove("hidden");
+  } else {
+    wrap.classList.add("hidden");
+  }
+  $("expiry-confirm-modal").classList.remove("hidden");
+}
+
+// Wire the bulk-action bar + modals. Runs once at app init (buttons persist in
+// the DOM across tab switches).
+function initExpiryBulkActions() {
+  // Select all currently-rendered rows.
+  const selectAll = $("btn-expiry-bulk-select-all");
+  if (selectAll) {
+    selectAll.addEventListener("click", () => {
+      const listEl = $("expiring-list");
+      if (!listEl) return;
+      const keys = [...listEl.querySelectorAll("button[data-select]")].map((b) => b.dataset.select);
+      keys.forEach((k) => expirySelectedKeys.add(k));
+      renderExpiryList();
+    });
+  }
+
+  const clearSel = $("btn-expiry-bulk-clear");
+  if (clearSel) {
+    clearSel.addEventListener("click", () => {
+      expirySelectedKeys.clear();
+      renderExpiryList();
+    });
+  }
+
+  const onBulk = (status) => () => {
+    if (selectedExpiryRows().length) runBulkStatus(status);
+  };
+  const bind = (id, fn) => {
+    const el = $(id);
+    if (el) el.addEventListener("click", fn);
+  };
+
+  bind("btn-bulk-return-pending", onBulk("return_pending"));
+  bind("btn-bulk-returned", () => openReturnCreditModal());
+  bind("btn-bulk-disposed", () =>
+    showConfirm(
+      "Mark Disposed?",
+      `These ${selectedExpiryRows().length} batch(es) will be marked as physically disposed and hidden from the live view. You can add a disposal certificate reference.`,
+      () => {
+        const ref = $("expiry-confirm-input").value.trim();
+        runBulkStatus("disposed", ref ? { disposalCertRef: ref } : {});
+      },
+      { input: true }
+    )
+  );
+  bind("btn-bulk-writeoff", () =>
+    showConfirm(
+      "Write Off?",
+      `These ${selectedExpiryRows().length} batch(es) will be written off as a loss (no credit expected) and hidden from the live view.`,
+      () => runBulkStatus("written_off")
+    )
+  );
+  bind("btn-bulk-active", () =>
+    showConfirm(
+      "Restore to active?",
+      `These ${selectedExpiryRows().length} batch(es) will return to the live stock view as active.`,
+      () => runBulkStatus("active")
+    )
+  );
+  bind("btn-bulk-delete", () =>
+    showConfirm(
+      "Delete batch(es)?",
+      `Soft-delete: these ${selectedExpiryRows().length} batch(es) leave the live view now and are permanently purged after 30 days. Use for genuine data-entry mistakes only — returns/disposals should use their proper actions.`,
+      () => runBulkStatus("deleted", { returnNote: "soft delete from expiry view" })
+    )
+  );
+
+  // Credit-note modal.
+  bind("btn-cn-cancel", () => $("return-credit-modal").classList.add("hidden"));
+  bind("btn-cn-confirm", async () => {
+    const cnNumber = $("cn-number").value.trim();
+    if (!cnNumber) {
+      $("cn-error").classList.remove("hidden");
+      return;
+    }
+    const credit = {
+      creditNoteNo: cnNumber,
+      returnedDate: $("cn-date").value,
+      creditAmount: Number($("cn-amount").value) || 0,
+    };
+    $("return-credit-modal").classList.add("hidden");
+    await runBulkStatus("returned_to_distributor", { credit });
+  });
+
+  // Generic confirm modal.
+  bind("btn-expiry-confirm-cancel", () => {
+    expiryConfirmAction = null;
+    $("expiry-confirm-modal").classList.add("hidden");
+  });
+  bind("btn-expiry-confirm-ok", () => {
+    const action = expiryConfirmAction;
+    expiryConfirmAction = null;
+    $("expiry-confirm-modal").classList.add("hidden");
+    if (action) action();
+  });
 }
 
 // Tolerant expiry-date parser covering every format the Gemini pipeline may

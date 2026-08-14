@@ -1273,6 +1273,108 @@ exports.mutateImportQueue = onCall(
     return { ok: true, imageId };
   }
 );
+// ─── bulkUpdateMedicineStatus ────────────────────────────────────────────────
+// Lifecycle status update for medicine batch docs (the "return/credit/archive"
+// model — NOT hard deletion). A batch may span multiple medicines docs (one per
+// invoice scan), so this updates every doc in `ids` atomically in one batch.
+//
+// Allowed transitions (status field on each medicines/{id} doc):
+//   "active"                 default (no field / historical rows)
+//   "return_pending"         flagged to return, waiting on distributor
+//   "returned_to_distributor" returned; credit-note details recorded
+//   "disposed"               physically disposed (cert ref optional)
+//   "written_off"            written off as a loss (no credit expected)
+//   "deleted"                soft-delete for genuine data-entry mistakes; the
+//                            scheduledCleanup job purges these after 30 days.
+//
+// When status is "returned_to_distributor", the caller should supply the
+// `credit` object (creditNoteNo, creditAmount, returnedDate) — the paper trail
+// a CA / return-tracking feature needs. When status is "disposed", an optional
+// `disposalCertRef` can be attached.
+
+const MEDICINE_STATUSES = new Set([
+  "active",
+  "return_pending",
+  "returned_to_distributor",
+  "disposed",
+  "written_off",
+  "deleted",
+]);
+
+exports.bulkUpdateMedicineStatus = onCall(
+  {
+    region: "us-central1",
+    memory: "128MiB",
+    timeoutSeconds: 30,
+  },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Login required.");
+    }
+    const { pharmacyId, ids, status, credit, disposalCertRef, returnNote } = request.data || {};
+    if (!pharmacyId) throw new HttpsError("invalid-argument", "pharmacyId is required");
+    if (!Array.isArray(ids) || ids.length === 0) {
+      throw new HttpsError("invalid-argument", "ids must be a non-empty array");
+    }
+    if (ids.length > 500) {
+      throw new HttpsError("invalid-argument", "Too many docs per update (max 500)");
+    }
+    if (!MEDICINE_STATUSES.has(status)) {
+      throw new HttpsError("invalid-argument", `Unknown status: ${status}`);
+    }
+    if (status === "returned_to_distributor" && credit) {
+      const cn = String(credit.creditNoteNo || "").trim();
+      if (!cn) {
+        throw new HttpsError("invalid-argument", "Credit note number is required when marking returned.");
+      }
+    }
+
+    const db = getFirestore();
+    const batch = db.batch();
+    const medColl = db.collection("pharmacies").doc(pharmacyId).collection("medicines");
+    const now = FieldValue.serverTimestamp();
+
+    // Guard: only touch docs that actually exist in this pharmacy (never create
+    // phantom docs from stale ids). Reads are cheap and keep the batch honest.
+    const update = {};
+    update.status = status;
+    update.updatedAt = now;
+    if (status === "deleted") {
+      update.deletedAt = now;
+      update.deletedReason = typeof returnNote === "string" ? returnNote.slice(0, 500) : "owner";
+    }
+    if (credit && typeof credit === "object") {
+      update.creditNote = {
+        creditNoteNo: String(credit.creditNoteNo || "").trim(),
+        creditAmount: Number(credit.creditAmount) || 0,
+        returnedDate: credit.returnedDate || "",
+      };
+    }
+    if (disposalCertRef && typeof disposalCertRef === "string") {
+      update.disposalCertRef = disposalCertRef.slice(0, 500);
+    }
+    if (status === "return_pending" && typeof returnNote === "string") {
+      update.returnNote = returnNote.slice(0, 500);
+    }
+
+    let updated = 0;
+    for (const id of ids) {
+      const ref = medColl.doc(id);
+      const snap = await ref.get();
+      if (!snap.exists) continue;
+      batch.set(ref, update, { merge: true });
+      updated++;
+    }
+    if (updated > 0) {
+      await batch.commit();
+    }
+
+    logger.info(
+      `[bulkUpdateMedicineStatus] ${status} x${updated} in ${pharmacyId} by ${request.auth.uid}`
+    );
+    return { updated };
+  }
+);
 // ─── listPendingInvoices ────────────────────────────────────────────────────
 // Returns all pending (partial) invoices for a pharmacy so the UI can show
 // staging status.
@@ -1733,6 +1835,29 @@ exports.scheduledCleanup = onSchedule(
         }
       } catch (ingestedErr) {
         console.error("Cleanup ingested-queue error:", ingestedErr.message);
+      }
+
+      // Purge medicines docs soft-deleted (status "deleted") more than 30 days
+      // ago. Soft-delete keeps a grace window so accidental deletions can be
+      // undone in the UI; after 30 days the data is permanently gone.
+      try {
+        const softCutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+        const softSnap = await db
+          .collectionGroup("medicines")
+          .where("status", "==", "deleted")
+          .where("deletedAt", "<=", softCutoff)
+          .limit(300)
+          .get();
+        let softPurged = 0;
+        for (const doc of softSnap.docs) {
+          await doc.ref.delete();
+          softPurged++;
+        }
+        if (softPurged > 0) {
+          console.log(`Cleanup: purged ${softPurged} soft-deleted medicine doc(s).`);
+        }
+      } catch (softErr) {
+        console.error("Cleanup soft-delete error:", softErr.message);
       }
     } catch (err) {
       console.error("Cleanup error:", err);
