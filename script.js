@@ -100,6 +100,21 @@ let importQueueBusy = false;
 let importQueueAuto = false;
 let reviewChainActive = false; // true while the one-by-one review chain is open
 
+// Which document type the Home upload card is currently pointed at. The owner
+// picks EXPLICITLY with the segmented toggle — there is no auto-detection. A
+// "return_receipt" is a distributor credit note; it is staged via the SAME
+// importQueue (queue doc carries documentType) but routed to
+// processReturnReceipt → pending_returns, never the invoice pipeline.
+let documentType = "invoice"; // "invoice" | "return_receipt"
+
+// Return-receipt review/confirm session state. Each item is an importQueue
+// entry with documentType "return_receipt"; its staged extraction lives in
+// /pharmacies/{id}/pending_returns/{pendingReturnId}.
+let returnReviewSession = null; // { item, staged, pendingReturnId, allMedicines: [] }
+let returnConfirmSession = null; // { item, staged, pendingReturnId, matches, matchSummary }
+const returnLineUi = {}; // lineIndex → { medicineName, batchNumber, expiryDate, returnQty, netAmount }
+const returnConfirmSelections = {}; // lineIndex → { medicineId, qtyReturned, netAmount }
+
 // ─── DOM Helpers ──────────────────────────────────────────────────────────────
 
 const $ = (id) => document.getElementById(id);
@@ -243,6 +258,7 @@ function initApp() {
   subscribeDistributors();
   subscribePendingInvoices();
   initPurchaseReports();
+  initReturnActions();
   resumeImportQueue();
 }
 
@@ -284,8 +300,51 @@ function initUploadHandlers() {
   const btnCapture = $("btn-camera-capture");
   const videoEl = $("camera-stream");
 
-  // Camera open
-  btnCameraScan?.addEventListener("click", async () => {
+  function updateCameraGuide(title, sub) {
+    const t = $("camera-guide-title");
+    const s = $("camera-guide-sub");
+    if (t) t.textContent = title;
+    if (s) s.textContent = sub;
+  }
+
+  // Segmented document-type toggle on the upload card. The owner explicitly
+  // picks "Upload Invoice" or "Upload Return Receipt" BEFORE capturing — a
+  // return receipt must never go down the invoice/GST pipeline (and vice versa).
+  function setDocumentType(type) {
+    documentType = type === "return_receipt" ? "return_receipt" : "invoice";
+    const invBtn = $("btn-upload-mode-invoice");
+    const retBtn = $("btn-upload-mode-return");
+    if (invBtn) {
+      const active = documentType === "invoice";
+      invBtn.className = `py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all ${
+        active ? "bg-indigo-500/25 text-indigo-300 border border-indigo-500/40" : "text-slate-500 hover:text-slate-300"
+      }`;
+    }
+    if (retBtn) {
+      const active = documentType === "return_receipt";
+      retBtn.className = `py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all ${
+        active ? "bg-emerald-500/25 text-emerald-300 border border-emerald-500/40" : "text-slate-500 hover:text-slate-300"
+      }`;
+    }
+    // Reflect the mode in the surrounding card copy + capture button.
+    const isReturn = documentType === "return_receipt";
+    const title = $("upload-card-title");
+    const sub = $("upload-card-sub");
+    const camLabel = $("upload-camera-label");
+    const galleryLabel = $("upload-gallery-label");
+    const pdfLabel = $("upload-pdf-label");
+    if (title) title.textContent = isReturn ? "Upload Return Receipt / Credit Note" : "Upload Counter Invoice";
+    if (sub) sub.textContent = isReturn
+      ? "Record returns the right way — only a confirmed receipt writes \"returned\""
+      : "Instantly catalog medicine expiry & batch details";
+    if (camLabel) camLabel.textContent = isReturn ? "Camera Capture — Return Receipt" : "Camera Capture Scan";
+    if (galleryLabel) galleryLabel.textContent = isReturn ? "Return Receipt Photos" : "Gallery Photos";
+    if (pdfLabel) pdfLabel.textContent = isReturn ? "Return Receipt PDFs" : "Invoice PDFs";
+  }
+  $("btn-upload-mode-invoice")?.addEventListener("click", () => setDocumentType("invoice"));
+  $("btn-upload-mode-return")?.addEventListener("click", () => setDocumentType("return_receipt"));
+
+  async function openCamera() {
     try {
       cameraStream = await navigator.mediaDevices.getUserMedia({
         video: { facingMode: "environment", width: { ideal: 1920 }, height: { ideal: 1080 } },
@@ -295,6 +354,16 @@ function initUploadHandlers() {
     } catch (err) {
       showToast("Camera access denied: " + err.message, "error");
     }
+  }
+
+  // Camera scan — the captured page feeds whichever pipeline the toggle points at.
+  btnCameraScan?.addEventListener("click", () => {
+    const isReturn = documentType === "return_receipt";
+    updateCameraGuide(
+      isReturn ? "Align Return Receipt Flat & Center" : "Align Invoice Flat & Center",
+      isReturn ? "RxExpiry Return Receipt Framing Guide" : "RxExpiry Live Framing Guide"
+    );
+    openCamera();
   });
 
   // Camera close
@@ -387,7 +456,7 @@ async function handleFileSelected(file) {
   showLoadingOverlay(true, "Uploading...");
   let item;
   try {
-    item = await enqueueFile(file);
+    item = await enqueueFile(file, 0, null, documentType);
     console.log("[handleFileSelected] Upload succeeded, queue item:", item);
   } catch (err) {
     console.error("[handleFileSelected] Upload FAILED:", err.code, err.message, err);
@@ -1133,13 +1202,17 @@ const EXPIRY_BUCKET_ORDER = { critical: 0, warning: 1, watch: 2, safe: 3, expire
 // without the field count as "active".
 const EXPIRY_STATUS_PRIORITY = {
   active: 0,
-  return_pending: 1,
-  returned_to_distributor: 2,
+  pending_return: 1,
+  returned: 2,
   disposed: 3,
   written_off: 4,
   deleted: 5,
+  // Legacy values on older docs are still recognized (render + archive filters).
+  return_pending: 1,
+  returned_to_distributor: 2,
 };
 const TERMINAL_EXPIRY_STATUSES = new Set([
+  "returned",
   "returned_to_distributor",
   "disposed",
   "written_off",
@@ -1249,7 +1322,12 @@ function subscribeExpiringMedicines() {
         const d = docSnap.data();
         const name = String(d.medicineName || "").trim();
         const batch = String(d.batchNumber || "").trim();
-        const key = name.toUpperCase() + "|" + batch.toUpperCase();
+        // A returnedSplit doc is the "returned portion" of a partial return —
+        // it shares name+batch with the live remainder but MUST aggregate as a
+        // separate archived row (so the live row keeps the remaining stock and
+        // the returned portion shows its own qty in the Archived chip).
+        const splitSuffix = d.returnedSplit === true ? "|#split" : "";
+        const key = name.toUpperCase() + "|" + batch.toUpperCase() + splitSuffix;
         if (!name && !batch) {
           noName++;
           return; // unlabeled row — skip aggregation, not useful in the list
@@ -1277,7 +1355,7 @@ function subscribeExpiringMedicines() {
           creditNote: null,
           disposalCertRef: "",
         };
-        agg.qty += Number(d.remainingQty ?? d.quantityBilled) || 0;
+        agg.qty += Number(d.returnedSplit === true ? (d.returnedQty ?? 0) : (d.remainingQty ?? d.quantityBilled)) || 0;
         agg.qtyFree += Number(d.quantityFree) || 0;
         const dist = normalizeDistributorName(d.distributor);
         if (dist) agg.distributors.add(dist);
@@ -1528,11 +1606,14 @@ function expiryCard(item) {
 
   // Status badge for archived / non-active rows.
   const statusBadges = {
-    return_pending: `<span class="text-[8px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wider bg-amber-500/20 text-amber-400 shrink-0">Return pending</span>`,
-    returned_to_distributor: `<span class="text-[8px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wider bg-indigo-500/20 text-indigo-400 shrink-0">Returned</span>`,
+    pending_return: `<span class="text-[8px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wider bg-amber-500/20 text-amber-400 shrink-0">Pending return</span>`,
+    returned: `<span class="text-[8px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wider bg-emerald-500/20 text-emerald-400 shrink-0">Returned</span>`,
     disposed: `<span class="text-[8px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wider bg-amber-600/20 text-amber-500 shrink-0">Disposed</span>`,
     written_off: `<span class="text-[8px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wider bg-rose-500/20 text-rose-400 shrink-0">Written off</span>`,
     deleted: `<span class="text-[8px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wider bg-slate-600/30 text-slate-400 shrink-0">Deleted</span>`,
+    // Legacy values on older docs render like their modern equivalents.
+    return_pending: `<span class="text-[8px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wider bg-amber-500/20 text-amber-400 shrink-0">Pending return</span>`,
+    returned_to_distributor: `<span class="text-[8px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wider bg-emerald-500/20 text-emerald-400 shrink-0">Returned</span>`,
   };
 
   // Selection checkbox (leading), only in selection mode.
@@ -1608,8 +1689,7 @@ async function runBulkStatus(status, extra = {}) {
   if (!rows.length) return;
   const ids = rows.flatMap((r) => r.ids);
   const btnLabel = {
-    return_pending: "Return Pending",
-    returned_to_distributor: "Mark Returned",
+    pending_return: "Mark Pending Return",
     disposed: "Mark Disposed",
     written_off: "Write Off",
     deleted: "Delete",
@@ -1645,19 +1725,6 @@ function restoreExpiryBatch(rows) {
       .join(", ")}) to the live stock view.`,
     () => runBulkStatus("active")
   );
-}
-
-// Open the credit-note modal for a "returned to distributor" action.
-function openReturnCreditModal() {
-  const rows = selectedExpiryRows();
-  if (!rows.length) return;
-  $("cn-number").value = "";
-  $("cn-distributor").value = "";
-  $("cn-date").value = new Date().toISOString().slice(0, 10);
-  $("cn-amount").value = "";
-  $("cn-error").classList.add("hidden");
-  $("return-credit-modal").classList.remove("hidden");
-  $("cn-number").focus();
 }
 
 // Open the confirm modal. `opts.input` renders an optional text field whose
@@ -1707,8 +1774,7 @@ function initExpiryBulkActions() {
     if (el) el.addEventListener("click", fn);
   };
 
-  bind("btn-bulk-return-pending", onBulk("return_pending"));
-  bind("btn-bulk-returned", () => openReturnCreditModal());
+  bind("btn-bulk-return-pending", onBulk("pending_return"));
   bind("btn-bulk-disposed", () =>
     showConfirm(
       "Mark Disposed?",
@@ -1741,24 +1807,6 @@ function initExpiryBulkActions() {
       () => runBulkStatus("deleted", { returnNote: "soft delete from expiry view" })
     )
   );
-
-  // Credit-note modal.
-  bind("btn-cn-cancel", () => $("return-credit-modal").classList.add("hidden"));
-  bind("btn-cn-confirm", async () => {
-    const cnNumber = $("cn-number").value.trim();
-    if (!cnNumber) {
-      $("cn-error").classList.remove("hidden");
-      return;
-    }
-    const credit = {
-      creditNoteNo: cnNumber,
-      distributor: $("cn-distributor").value.trim(),
-      returnedDate: $("cn-date").value,
-      creditAmount: Number($("cn-amount").value) || 0,
-    };
-    $("return-credit-modal").classList.add("hidden");
-    await runBulkStatus("returned_to_distributor", { credit });
-  });
 
   // Generic confirm modal.
   bind("btn-expiry-confirm-cancel", () => {
@@ -2134,10 +2182,11 @@ function sanitizeForCallable(obj) {
 // hints = { pageNumber, totalPages } — authoritative pagination captured from
 // the source file metadata (e.g. pdf.numPages for split PDF pages) and stored
 // on the queue doc so the worker can never misclassify a multi-page invoice.
-async function enqueueFile(file, fileIndex = 0, hints = null) {
+async function enqueueFile(file, fileIndex = 0, hints = null, docType = "invoice") {
+  const isReturn = docType === "return_receipt";
   const ext = file.type === "application/pdf" ? "pdf" : "jpg";
   const imageId = `${Date.now()}_${fileIndex}_${Math.random().toString(36).slice(2)}`;
-  const storagePath = `invoices/${currentPharmacyId}/${imageId}.${ext}`;
+  const storagePath = `${isReturn ? "returns" : "invoices"}/${currentPharmacyId}/${imageId}.${ext}`;
   const storageRef = ref(storage, storagePath);
 
   // Layer 1: pHash duplicate check (soft warning, not a hard block)
@@ -2152,7 +2201,7 @@ async function enqueueFile(file, fileIndex = 0, hints = null) {
       if (dupCheck.isDuplicate) {
         const m = dupCheck.match;
         const dateStr = m.createdAt?.toDate ? m.createdAt.toDate().toLocaleDateString() : "recently";
-        duplicateWarning = `⚠ This image looks like invoice ${m.invoiceNumber} from ${m.distributor || "unknown distributor"} (uploaded ${dateStr}, hash distance ${m.distance}). Proceed anyway?`;
+        duplicateWarning = `⚠ This image looks like ${m.invoiceNumber ? "invoice " + m.invoiceNumber : "an already-uploaded document"} from ${m.distributor || "unknown distributor"} (uploaded ${dateStr}, hash distance ${m.distance}). Proceed anyway?`;
         if (!confirm(duplicateWarning)) {
           throw new Error("Upload cancelled by user (duplicate detected).");
         }
@@ -2192,6 +2241,7 @@ async function enqueueFile(file, fileIndex = 0, hints = null) {
       storagePath,
       fileName: file.name,
       status: "uploaded",
+      documentType: isReturn ? "return_receipt" : "invoice",
       pdfPageNumber: hints && Number(hints.pageNumber) >= 1 ? Number(hints.pageNumber) : null,
       pdfTotalPages: hints && Number(hints.totalPages) >= 1 ? Number(hints.totalPages) : null,
       pHash: pHash || null,
@@ -2208,6 +2258,7 @@ async function enqueueFile(file, fileIndex = 0, hints = null) {
     storagePath,
     fileName: file.name,
     status: "uploaded",
+    documentType: isReturn ? "return_receipt" : "invoice",
     retries: 0,
     pollCount: 0,
     pdfPageNumber: hints && Number(hints.pageNumber) >= 1 ? Number(hints.pageNumber) : null,
@@ -2230,7 +2281,7 @@ async function handleMultipleFilesSelected(entries) {
       const file = entry instanceof File ? entry : entry.file;
       const hints = entry instanceof File ? null : { pageNumber: entry.pageNumber, totalPages: entry.totalPages };
       console.log(`[handleMultipleFilesSelected] Uploading file ${i+1}/${entries.length}:`, file.name);
-      items.push(await enqueueFile(file, i, hints));
+      items.push(await enqueueFile(file, i, hints, documentType));
     } catch (err) {
       console.error(`[handleMultipleFilesSelected] Upload FAILED for file ${i}:`, err.code, err.message, err);
       showToast(`Upload failed for ${entries[i].name || "file"}: ${err.message}`, "error");
@@ -2253,18 +2304,25 @@ function startImportQueue() {
 }
 
 // Open the next "Ready for review" item, chaining one-by-one. Returns false
-// (and clears the chain) when nothing is left to review.
+// (and clears the chain) when nothing is left to review. Dispatches by the
+// queue item's documentType: invoices → the invoice review panel, return
+// receipts → the return-review modal (pending_returns staging).
 function tryOpenNextReview() {
   const panel = $("extraction-review-panel");
   if (panel && !panel.classList.contains("hidden")) return false; // a review is already open
-  const next = importQueue.find((i) => i.status === "extracted" && i.extracted);
+  if (!($("return-review-modal")?.classList.contains("hidden"))) return false; // return review open
+  const next = importQueue.find((i) => i.status === "extracted" && (i.extracted || (i.documentType === "return_receipt" && i.pendingReturnId)));
   if (!next) {
     reviewChainActive = false;
     renderImportQueueStatus();
     return false;
   }
   reviewChainActive = true;
-  openQueueReview(next, next.extracted);
+  if (next.documentType === "return_receipt") {
+    openReturnReview(next, next.returnExtracted || next.extracted, next.pendingReturnId);
+  } else {
+    openQueueReview(next, next.extracted);
+  }
   return true;
 }
 
@@ -2302,6 +2360,8 @@ function advanceImportQueue() {
 }
 
 async function processQueueItem(item, openReview = true) {
+  const isReturn = item.documentType === "return_receipt";
+
   // Fast paths that need no re-extraction (resume-safe).
   let qData = null;
   try {
@@ -2310,23 +2370,45 @@ async function processQueueItem(item, openReview = true) {
   } catch (_) {}
   if (qData) {
     const qs = qData.status || "";
-    if (qs === "extracted" && qData.extracted) {
-      item.status = "extracted";
-      const extracted = qData.extracted;
-      item.extracted = extracted;
-      if (openReview) {
-        await openQueueReview(item, extracted);
-        return "awaiting-review";
+    if (isReturn) {
+      // Return-receipt staging lives in pending_returns (NOT in the queue doc's
+      // extracted field). Status "extracted" → pull the staged doc by id.
+      if (qs === "extracted" && qData.pendingReturnId) {
+        const staged = await loadStagedReturn(qData.pendingReturnId);
+        item.status = "extracted";
+        item.pendingReturnId = qData.pendingReturnId;
+        item.returnExtracted = staged || null;
+        if (openReview && staged) {
+          await openReturnReview(item, staged, qData.pendingReturnId);
+          return "awaiting-review";
+        }
+        return "done";
       }
-      return "done";
-    }
-    if (qs === "ingested" || qs === "ingested-partial") {
-      item.status = qs;
-      return "done"; // merged already, or a staged page awaiting its footer page
-    }
-    if (["saved", "reviewed", "failed", "rejected"].includes(qs)) {
-      item.status = qs;
-      return "done";
+      if (["confirmed", "discarded", "failed", "rejected"].includes(qs)) {
+        item.status = qs;
+        item.pendingReturnId = qData.pendingReturnId || null;
+        return "done";
+      }
+      // Fall through to the server for uploaded/processing.
+    } else {
+      if (qs === "extracted" && qData.extracted) {
+        item.status = "extracted";
+        const extracted = qData.extracted;
+        item.extracted = extracted;
+        if (openReview) {
+          await openQueueReview(item, extracted);
+          return "awaiting-review";
+        }
+        return "done";
+      }
+      if (qs === "ingested" || qs === "ingested-partial") {
+        item.status = qs;
+        return "done"; // merged already, or a staged page awaiting its footer page
+      }
+      if (["saved", "reviewed", "failed", "rejected"].includes(qs)) {
+        item.status = qs;
+        return "done";
+      }
     }
   }
 
@@ -2335,19 +2417,24 @@ async function processQueueItem(item, openReview = true) {
   // while Gemini runs.
   item.status = "processing";
   renderImportQueueStatus();
-  console.log("[processQueueItem] Calling processImportQueueItem for", item.imageId, { pharmacyId: currentPharmacyId, pdfPageNumber: item.pdfPageNumber, pdfTotalPages: item.pdfTotalPages });
-  const processFn = httpsCallable(functions, "processImportQueueItem", { timeout: 120000 });
+  console.log(`[processQueueItem] Calling ${isReturn ? "processReturnReceipt" : "processImportQueueItem"} for`, item.imageId, { pharmacyId: currentPharmacyId, pdfPageNumber: item.pdfPageNumber, pdfTotalPages: item.pdfTotalPages });
+  const fnName = isReturn ? "processReturnReceipt" : "processImportQueueItem";
+  const processFn = httpsCallable(functions, fnName, { timeout: 120000 });
   let result;
   try {
     result = await processFn({
       pharmacyId: currentPharmacyId,
       imageId: item.imageId,
-      pdfPageNumber: item.pdfPageNumber || null,
-      pdfTotalPages: item.pdfTotalPages || null,
+      ...(isReturn ? {} : { pdfPageNumber: item.pdfPageNumber || null, pdfTotalPages: item.pdfTotalPages || null }),
     });
     console.log("[processQueueItem] CF response:", result.data);
   } catch (err) {
     console.error("[processQueueItem] CF ERROR:", err.code, err.message, err.details, err);
+    if (isReturn) {
+      // A failed extraction must never leave the previous receipt's data on the
+      // review screen — clear any stale sessions/DOM so the panel is blank.
+      resetReturnReviewUi();
+    }
     showToast(`Queue processing error: ${err.message}`, "error");
     return "done";
   }
@@ -2356,6 +2443,16 @@ async function processQueueItem(item, openReview = true) {
 
   if (status === "extracted") {
     item.status = "extracted";
+    if (isReturn) {
+      const staged = data.extracted || null;
+      item.pendingReturnId = data.pendingReturnId || item.imageId;
+      item.returnExtracted = staged;
+      if (openReview && staged) {
+        await openReturnReview(item, staged, item.pendingReturnId);
+        return "awaiting-review";
+      }
+      return "done";
+    }
     const extracted = data.extracted || {};
     item.extracted = extracted;
     if (openReview) {
@@ -2401,9 +2498,31 @@ async function processQueueItem(item, openReview = true) {
     await new Promise((r) => setTimeout(r, 3000));
     return "retry";
   }
-  // saved/reviewed/rejected or unknown — nothing to do.
+  // confirmed/discarded/rejected/saved/reviewed or unknown — nothing to do.
   item.status = status;
   return "done";
+}
+
+// Load a staged return-receipt doc from pending_returns (the review/confirm
+// source of truth). Returns null when missing so callers can fall back.
+async function loadStagedReturn(pendingReturnId) {
+  if (!currentPharmacyId || !pendingReturnId) return null;
+  try {
+    const snap = await getDoc(doc(db, "pharmacies", currentPharmacyId, "pending_returns", pendingReturnId));
+    if (!snap.exists) return null;
+    const d = snap.data();
+    return {
+      header: d.header || {},
+      lineItems: Array.isArray(d.lineItems) ? d.lineItems : [],
+      matches: Array.isArray(d.matches) ? d.matches : [],
+      matchSummary: d.matchSummary || { high: 0, ambiguous: 0, none: 0, candidatesPool: 0 },
+      status: d.status || "pending_review",
+      storagePath: d.storagePath || "",
+    };
+  } catch (err) {
+    console.warn("[loadStagedReturn] could not load pending_returns doc:", err.message);
+    return null;
+  }
 }
 
 async function openQueueReview(item, extracted) {
@@ -2448,6 +2567,9 @@ async function resumeImportQueue() {
         storagePath: dta.storagePath || "",
         fileName: dta.fileName || d.id,
         status: dta.status || "uploaded",
+        documentType: dta.documentType || "invoice",
+        pendingReturnId: dta.pendingReturnId || null,
+        returnExtracted: null, // staged doc is fetched on demand
         retries: 0,
         pollCount: 0,
         pdfPageNumber: dta.pdfPageNumber || null,
@@ -2508,15 +2630,18 @@ function renderImportQueueStatus() {
   list.innerHTML = importQueue.map((item, idx) => {
     const current = idx === importQueueCursor;
     const qs = item.status || "uploaded";
+    const isReturn = item.documentType === "return_receipt";
     const label = {
-      uploaded: "Queued",
-      processing: "Processing…",
+      uploaded: isReturn ? "Queued" : "Queued",
+      processing: isReturn ? "Extracting…" : "Processing…",
       saving: "Saving…",
-      extracted: "Ready for review",
+      extracted: isReturn ? "Ready to confirm" : "Ready for review",
       ingested: "Saved (merged)",
       "ingested-partial": "Staged",
       saved: "Saved",
       reviewed: "Reviewed",
+      confirmed: "Confirmed",
+      discarded: "Discarded",
       failed: "Failed",
       rejected: "Rejected",
     }[qs] || qs;
@@ -2524,7 +2649,9 @@ function renderImportQueueStatus() {
       failed: "bg-rose-500/15 text-rose-400",
       ingested: "bg-emerald-500/15 text-emerald-400",
       saved: "bg-emerald-500/15 text-emerald-400",
-      extracted: "bg-amber-500/15 text-amber-400",
+      confirmed: "bg-emerald-500/15 text-emerald-400",
+      discarded: "bg-slate-500/15 text-slate-400",
+      extracted: isReturn ? "bg-emerald-500/15 text-emerald-400" : "bg-amber-500/15 text-amber-400",
       uploaded: "bg-indigo-500/15 text-indigo-400",
       processing: "bg-indigo-500/15 text-indigo-400 animate-pulse",
       saving: "bg-indigo-500/15 text-indigo-400 animate-pulse",
@@ -2535,20 +2662,23 @@ function renderImportQueueStatus() {
 
     // Review opens (or re-extracts) the item; Discard permanently deletes it.
     const showReview = ["uploaded", "processing", "saving", "extracted"].includes(qs);
-    const showDiscard = !["saved", "reviewed", "ingested", "rejected"].includes(qs);
+    const showDiscard = !["saved", "reviewed", "ingested", "rejected", "confirmed", "discarded"].includes(qs);
+    const typeChip = isReturn
+      ? `<span class="text-[8px] px-1 py-0.5 rounded font-bold uppercase tracking-wider bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 mr-1">Return</span>`
+      : "";
     let actions = "";
     if (showReview || showDiscard) {
       actions = `<div class="flex gap-1.5 shrink-0">
-        ${showReview ? `<button onclick="window.reviewQueueItem('${item.imageId}')" class="text-[9px] px-2 py-1 bg-indigo-500/15 border border-indigo-500/30 text-indigo-300 hover:bg-indigo-500/30 rounded-md font-bold transition-all">Review</button>` : ""}
+        ${showReview ? `<button onclick="window.reviewQueueItem('${item.imageId}')" class="text-[9px] px-2 py-1 ${isReturn ? "bg-emerald-500/15 border-emerald-500/30 text-emerald-300 hover:bg-emerald-500/30" : "bg-indigo-500/15 border-indigo-500/30 text-indigo-300 hover:bg-indigo-500/30"} border rounded-md font-bold transition-all">Review</button>` : ""}
         ${showDiscard ? `<button onclick="window.discardQueueItem('${item.imageId}')" class="text-[9px] px-2 py-1 bg-slate-800 border border-slate-700 text-slate-400 hover:text-rose-400 hover:border-rose-500/30 rounded-md font-bold transition-all">Discard</button>` : ""}
       </div>`;
     }
 
     return `<div class="flex justify-between items-center gap-2 px-3 py-1.5 rounded-lg ${
-      current ? "bg-slate-800/80 border border-indigo-500/40" : "bg-slate-900/60 border border-slate-800"
+      current ? "bg-slate-800/80 border " + (isReturn ? "border-emerald-500/40" : "border-indigo-500/40") : "bg-slate-900/60 border border-slate-800"
     }">
       <div class="min-w-0">
-        <p class="text-[10px] font-mono text-slate-300 truncate">${esc(item.fileName || item.imageId)}</p>
+        <p class="text-[10px] font-mono text-slate-300 truncate">${typeChip}${esc(item.fileName || item.imageId)}</p>
         <p class="text-[9px] text-slate-500 truncate">${esc(item.storagePath)}</p>
         ${item.uploadedAt ? `<p class="text-[9px] text-slate-500 truncate">${esc(formatUploadedAt(item.uploadedAt))}</p>` : ""}
       </div>
@@ -2564,8 +2694,28 @@ function renderImportQueueStatus() {
 window.reviewQueueItem = async (imageId) => {
   const item = importQueue.find((i) => i.imageId === imageId);
   if (!item) return;
+  const isReturn = item.documentType === "return_receipt";
 
   if (item.status === "extracted") {
+    if (isReturn) {
+      let staged = item.returnExtracted || null;
+      if (!staged) {
+        if (!item.pendingReturnId) {
+          try {
+            const qSnap = await getDoc(queueItemRef(imageId));
+            if (qSnap.exists) item.pendingReturnId = qSnap.data().pendingReturnId || null;
+          } catch (_) {}
+        }
+        staged = await loadStagedReturn(item.pendingReturnId);
+        item.returnExtracted = staged;
+      }
+      if (!staged) {
+        showToast("No staged data for this return receipt yet.", "error");
+        return;
+      }
+      await openReturnReview(item, staged, item.pendingReturnId);
+      return;
+    }
     let extracted = item.extracted;
     if (!extracted) {
       try {
@@ -2588,7 +2738,7 @@ window.reviewQueueItem = async (imageId) => {
     // No full-screen blocker — extraction runs in the background while the
     // queue item shows "Processing…". The review panel opens when it's ready;
     // the owner can refresh or navigate freely (the queue is persisted).
-    showToast("Extracting invoice…", "info");
+    showToast(isReturn ? "Extracting return receipt…" : "Extracting invoice…", "info");
     try {
       let outcome = "retry";
       let attempts = 0;
@@ -2634,6 +2784,650 @@ window.discardQueueItem = async (imageId, opts = {}) => {
     showLoadingOverlay(false);
   }
 };
+
+// ─── Return Receipt pipeline (importQueue → pending_returns) ─────────────────
+// A return receipt / credit note uploads through the SAME importQueue staging
+// as invoices — its queue doc carries documentType: "return_receipt" and the
+// client routes it to processReturnReceipt (never the invoice prompt/validator).
+// Extraction is staged at /pharmacies/{id}/pending_returns/{imageId}:
+//   "pending_review" → (Confirm & Match) → "matched" → (confirm) → "confirmed"
+// The review screen reads the staged doc, lets the owner fix the header + line
+// fields, then calls matchReturnReceipt (matching runs on Confirm & Match so the
+// EDITED distributor / refInvoiceNumber are used — spec step 6). The final
+// screen calls confirmReturnMatches — the ONLY code path that writes status
+// "returned" (spec steps 7/8).
+
+// Build a datalist of known distributors (from the medicines collection) so the
+// review screen can autocomplete the distributor field.
+async function populateReturnDistributorDatalist() {
+  let datalist = $("return-distributor-datalist");
+  if (!datalist) {
+    datalist = document.createElement("datalist");
+    datalist.id = "return-distributor-datalist";
+    document.body.appendChild(datalist);
+  }
+  datalist.innerHTML = "";
+  const names = new Set();
+  try {
+    const snap = await getDocs(collection(db, "pharmacies", currentPharmacyId, "medicines"));
+    snap.forEach((docSnap) => {
+      const d = docSnap.data();
+      const n = normalizeDistributorName(d.distributor);
+      if (n) names.add(n);
+    });
+  } catch (err) {
+    console.warn("[populateReturnDistributorDatalist] failed:", err.message);
+  }
+  names.forEach((n) => {
+    const opt = document.createElement("option");
+    opt.value = n;
+    datalist.appendChild(opt);
+  });
+  return names;
+}
+
+// Open the return-receipt REVIEW screen (header + editable lines). Reads the
+// staged pending_returns doc; edits are applied on "Confirm & Match".
+async function openReturnReview(item, staged, pendingReturnId) {
+  const modal = $("return-review-modal");
+  if (!modal) return;
+  // Fresh open always starts from a blank slate — never inherit the previous
+  // receipt's DOM/state (guards against stale data when a new upload loads).
+  resetReturnReviewUi();
+  if (!staged) staged = await loadStagedReturn(pendingReturnId || item.pendingReturnId);
+  if (!staged) {
+    showToast("No staged data for this return receipt.", "error");
+    return;
+  }
+
+  // Load the pharmacy's live stock once, for the confirm screen's manual search.
+  let allMedicines = [];
+  try {
+    const snap = await getDocs(collection(db, "pharmacies", currentPharmacyId, "medicines"));
+    allMedicines = snap.docs.map((docSnap) => {
+      const d = docSnap.data();
+      const remaining = Number(d.remainingQty ?? d.quantityBilled) || 0;
+      const terminal = ["returned", "returned_to_distributor", "disposed", "written_off", "deleted"].includes(d.status || "active");
+      return {
+        id: docSnap.id,
+        medicineName: d.medicineName || "",
+        batchNumber: d.batchNumber || "",
+        remainingQty: remaining,
+        terminal,
+      };
+    }).filter((m) => !m.terminal && m.remainingQty > 0 && m.medicineName);
+  } catch (err) {
+    console.warn("[openReturnReview] could not load medicines for manual match:", err.message);
+  }
+
+  returnReviewSession = {
+    item,
+    staged,
+    pendingReturnId: pendingReturnId || item.pendingReturnId || item.imageId,
+    allMedicines,
+  };
+  returnConfirmSession = null;
+  Object.keys(returnLineUi).forEach((k) => delete returnLineUi[k]);
+  // Prefill editable line state from the staged extraction.
+  (Array.isArray(staged.lineItems) ? staged.lineItems : []).forEach((line, i) => {
+    returnLineUi[i] = {
+      medicineName: line.medicineName || "",
+      batchNumber: line.batchNumber || "",
+      expiryDate: line.expiryDate || "",
+      returnQty: Number(line.returnQty) || 0,
+      netAmount: Number(line.netAmount) || 0,
+    };
+  });
+
+  // Header fields prefilled from OCR (editable).
+  const header = staged.header || {};
+  $("return-cn-number").value = header.creditNoteNumber || "";
+  const dateRaw = String(header.date || "");
+  const dateMatch = dateRaw.match(/(\d{1,2})[/-](\d{1,2})[/-](\d{4})/);
+  $("return-cn-date").value = dateMatch
+    ? `${dateMatch[3]}-${dateMatch[2].padStart(2, "0")}-${dateMatch[1].padStart(2, "0")}`
+    : "";
+  $("return-cn-distributor").value = header.distributorName || "";
+  $("return-ref-invoice").value = header.refInvoiceNumber || "";
+  $("return-grand-total").value = header.grandTotalCreditAmount != null ? header.grandTotalCreditAmount : "";
+  $("return-reason").value = header.returnReason || "";
+  $("return-cn-error").classList.add("hidden");
+  $("return-review-file").textContent = item.fileName || item.imageId;
+
+  // Receipt image preview.
+  const imgEl = $("return-review-img");
+  try {
+    if (item.file) imgEl.src = URL.createObjectURL(item.file);
+    else imgEl.src = await getDownloadURL(ref(storage, item.storagePath));
+  } catch (_) {}
+
+  $("return-review-badge").textContent = `${staged.lineItems.length} lines · pending review`;
+  await populateReturnDistributorDatalist();
+  $("return-cn-distributor").setAttribute("list", "return-distributor-datalist");
+
+  renderReturnReviewLines();
+  modal.classList.remove("hidden");
+}
+
+// OCR-confidence badge for a review field. High (>=0.8) green, mid amber,
+// low rose, missing grey.
+function confBadge(label, c) {
+  const v = Number(c) || 0;
+  const cls = v >= 0.8 ? "text-emerald-400 bg-emerald-500/10 border-emerald-500/30"
+    : v >= 0.55 ? "text-amber-400 bg-amber-500/10 border-amber-500/30"
+    : v > 0 ? "text-rose-400 bg-rose-500/10 border-rose-500/30"
+    : "text-slate-500 bg-slate-500/10 border-slate-500/30";
+  return `<span class="text-[8px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wider border ${cls} shrink-0">${label} ${v > 0 ? Math.round(v * 100) + "%" : "—"}</span>`;
+}
+
+function renderReturnReviewLines() {
+  const wrap = $("return-review-lines");
+  if (!wrap || !returnReviewSession) return;
+  const lines = Array.isArray(returnReviewSession.staged.lineItems) ? returnReviewSession.staged.lineItems : [];
+  if (lines.length === 0) {
+    wrap.innerHTML = `<div class="text-center py-8 text-xs text-slate-500">No line items were read from this receipt. Check the image, or reject the receipt.</div>`;
+    updateReturnTotalWarning();
+    return;
+  }
+  wrap.innerHTML = lines.map((line, i) => renderReturnReviewLine(line, i)).join("");
+  updateReturnTotalWarning();
+}
+
+function renderReturnReviewLine(line, i) {
+  const ui = returnLineUi[i] || {};
+  const conf = line.confidence || {};
+  const inputCls = "w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-[11px] text-slate-200 focus:outline-none focus:border-amber-500";
+  return `
+    <div class="border border-slate-800 rounded-xl p-3 space-y-2">
+      <div class="flex items-center justify-between gap-2">
+        <p class="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Line ${i + 1}</p>
+        <div class="flex items-center gap-1 flex-wrap justify-end">
+          ${confBadge("Batch", conf.batchNumber)}
+        </div>
+      </div>
+      <label class="block">
+        <span class="text-[8px] font-bold uppercase tracking-wider text-slate-500 flex items-center gap-1.5">Medicine name ${confBadge("OCR", conf.medicineName)}</span>
+        <input data-return-name="${i}" type="text" value="${esc(ui.medicineName)}" class="${inputCls}">
+      </label>
+      <div class="grid grid-cols-2 gap-2">
+        <label class="block">
+          <span class="text-[8px] font-bold uppercase tracking-wider text-slate-500">Batch no</span>
+          <input data-return-batch="${i}" type="text" value="${esc(ui.batchNumber)}" class="${inputCls} font-mono">
+        </label>
+        <label class="block">
+          <span class="text-[8px] font-bold uppercase tracking-wider text-slate-500">Expiry (MM/YY)</span>
+          <input data-return-expiry="${i}" type="text" value="${esc(ui.expiryDate)}" class="${inputCls} font-mono">
+        </label>
+      </div>
+      <div class="grid grid-cols-2 gap-2">
+        <label class="block">
+          <span class="text-[8px] font-bold uppercase tracking-wider text-slate-500 flex items-center gap-1.5">Return qty ${confBadge("OCR", conf.returnQty)}</span>
+          <input data-return-qty="${i}" type="number" min="0" step="1" value="${ui.returnQty || 0}" class="${inputCls} font-mono">
+        </label>
+        <label class="block">
+          <span class="text-[8px] font-bold uppercase tracking-wider text-slate-500">Net amount (₹)</span>
+          <input data-return-amount="${i}" type="number" min="0" step="0.01" value="${ui.netAmount || 0}" class="${inputCls} font-mono">
+        </label>
+      </div>
+    </div>`;
+}
+
+// Soft check: sum of line net amounts vs Grand Total (spec step 5 — a warning
+// badge, NEVER a block — credit notes have no GST math to verify).
+function updateReturnTotalWarning() {
+  const wrap = $("return-total-warning");
+  const txt = $("return-total-warning-text");
+  if (!wrap || !txt || !returnReviewSession) return;
+  const grandTotal = numOr($("return-grand-total").value, 0);
+  const lines = Array.isArray(returnReviewSession.staged.lineItems) ? returnReviewSession.staged.lineItems : [];
+  const sum = lines.reduce((acc, line, i) => acc + numOr((returnLineUi[i] || {}).netAmount, 0), 0);
+  if (grandTotal > 0 && Math.abs(sum - grandTotal) > 0.01) {
+    wrap.classList.remove("hidden");
+    wrap.classList.add("flex");
+    txt.textContent = `Line amounts sum to ₹${sum.toFixed(2)} vs Grand Total ₹${grandTotal.toFixed(2)} — mismatch of ₹${Math.abs(sum - grandTotal).toFixed(2)}. Confirm the numbers are right before matching.`;
+  } else {
+    wrap.classList.add("hidden");
+    wrap.classList.remove("flex");
+  }
+}
+
+// Read the header inputs into the payload shape matchReturnReceipt expects.
+function collectReturnHeader() {
+  return {
+    creditNoteNumber: $("return-cn-number").value.trim(),
+    distributorName: $("return-cn-distributor").value.trim(),
+    date: $("return-cn-date").value,
+    refInvoiceNumber: $("return-ref-invoice").value.trim(),
+    returnReason: $("return-reason").value.trim(),
+    grandTotalCreditAmount: numOr($("return-grand-total").value, 0),
+  };
+}
+
+// Collect the edited line items from returnLineUi.
+function collectReturnLines() {
+  const staged = returnReviewSession ? returnReviewSession.staged : null;
+  const stagedLines = staged && Array.isArray(staged.lineItems) ? staged.lineItems : [];
+  return stagedLines.map((orig, i) => {
+    const ui = returnLineUi[i] || {};
+    return {
+      medicineName: ui.medicineName || "",
+      batchNumber: ui.batchNumber || "",
+      expiryDate: ui.expiryDate || "",
+      returnQty: numOr(ui.returnQty, 0),
+      netAmount: numOr(ui.netAmount, 0),
+      confidence: orig.confidence || { medicineName: 1, batchNumber: 1, returnQty: 1 },
+    };
+  });
+}
+
+// "Cancel" — close the review modal, keep the receipt in the queue, chain to
+// the next ready item.
+function closeReturnReview() {
+  resetReturnReviewUi();
+  renderImportQueueStatus();
+  if (importQueueAuto) advanceImportQueue();
+}
+
+// Hard reset of ALL return-review UI: state sessions, editable form fields,
+// line containers and image previews. Called on close AND on any extraction
+// failure so a failed upload can never leave the previous receipt's data on
+// screen (staff could mistake stale data for a live pending item).
+function resetReturnReviewUi() {
+  returnReviewSession = null;
+  returnConfirmSession = null;
+  Object.keys(returnLineUi).forEach((k) => delete returnLineUi[k]);
+  Object.keys(returnConfirmSelections).forEach((k) => delete returnConfirmSelections[k]);
+
+  const hidden = (id) => $(id)?.classList.add("hidden");
+  $("return-review-modal")?.classList.add("hidden");
+  $("return-confirm-modal")?.classList.add("hidden");
+  ["return-cn-number", "return-cn-date", "return-cn-distributor", "return-ref-invoice", "return-grand-total", "return-reason"].forEach((id) => {
+    const el = $(id);
+    if (el) el.value = "";
+  });
+  hidden("return-cn-error");
+  const tw = $("return-total-warning");
+  if (tw) {
+    tw.classList.add("hidden");
+    tw.classList.remove("flex");
+  }
+  hidden("return-confirm-error");
+  const w = $("return-review-lines");
+  if (w) w.innerHTML = "";
+  const c = $("return-confirm-lines");
+  if (c) c.innerHTML = "";
+  ["return-review-file", "return-confirm-file"].forEach((id) => {
+    const el = $(id);
+    if (el) el.textContent = "";
+  });
+  ["return-review-badge", "return-confirm-badge", "return-confirm-credit"].forEach((id) => {
+    const el = $(id);
+    if (el) el.textContent = "";
+  });
+  ["return-review-img", "return-confirm-img"].forEach((id) => {
+    const el = $(id);
+    if (el) el.removeAttribute("src");
+  });
+}
+
+// "Confirm & Match" → matchReturnReceipt (spec step 6) → open the confirm screen.
+async function handleReturnMatch() {
+  if (!returnReviewSession || !returnReviewSession.pendingReturnId) return;
+  const cnNumber = $("return-cn-number").value.trim();
+  if (!cnNumber) {
+    $("return-cn-error").classList.remove("hidden");
+    return;
+  }
+  $("return-cn-error").classList.add("hidden");
+
+  const header = collectReturnHeader();
+  const lineItems = collectReturnLines();
+  showLoadingOverlay(true, "Matching lines against your stock…");
+  try {
+    const fn = httpsCallable(functions, "matchReturnReceipt", { timeout: 60000 });
+    const resp = await fn({
+      pharmacyId: currentPharmacyId,
+      pendingReturnId: returnReviewSession.pendingReturnId,
+      header,
+      lineItems,
+    });
+    const r = resp.data || {};
+    const item = returnReviewSession.item;
+    const staged = {
+      header: r.header || header,
+      lineItems: r.lineItems || lineItems,
+      matches: Array.isArray(r.matches) ? r.matches : [],
+      matchSummary: r.matchSummary || { high: 0, ambiguous: 0, none: 0 },
+    };
+    if (item) item.returnExtracted = staged;
+    $("return-review-modal").classList.add("hidden");
+    await openReturnConfirm(item, staged, returnReviewSession.pendingReturnId);
+  } catch (err) {
+    console.error("[handleReturnMatch] ERROR:", err.code, err.message, err);
+    showToast("Matching failed: " + (err.message || err), "error");
+  } finally {
+    showLoadingOverlay(false);
+  }
+}
+
+// "Reject & Discard" — permanent discard of the receipt (pending_returns +
+// importQueue + storage), the receipt will NOT be re-offered.
+async function handleReturnReject() {
+  if (!returnReviewSession || !returnReviewSession.pendingReturnId) return;
+  const { item, pendingReturnId } = returnReviewSession;
+  const label = item ? (item.fileName || item.imageId) : pendingReturnId;
+  if (!confirm(`Reject return receipt "${label}"? The staged extraction and the uploaded image will be permanently discarded.`)) return;
+  showLoadingOverlay(true, "Discarding…");
+  try {
+    const fn = httpsCallable(functions, "discardReturnReceipt", { timeout: 30000 });
+    await fn({ pharmacyId: currentPharmacyId, pendingReturnId });
+    closeReturnReview();
+    if (item) importQueue = importQueue.filter((i) => i.imageId !== item.imageId);
+    renderImportQueueStatus();
+    showToast("Return receipt rejected & discarded.", "warning");
+  } catch (err) {
+    console.error("[handleReturnReject] ERROR:", err.code, err.message, err);
+    showToast("Reject failed: " + (err.message || err), "error");
+  } finally {
+    showLoadingOverlay(false);
+  }
+}
+
+// ─── Return Receipt CONFIRM screen ───────────────────────────────────────────
+// Matching results from matchReturnReceipt (spec step 6): green/high lines are
+// auto-selected, amber/ambiguous lines show up to 4 candidates to tap, red/none
+// lines need a manual search. Confirm calls confirmReturnMatches (spec steps
+// 7/8) — the ONLY path that writes a medicine record's status "returned".
+
+function normalizeReviewName(s) {
+  return String(s || "").toUpperCase().replace(/[^A-Z0-9]+/g, " ").trim();
+}
+
+async function openReturnConfirm(item, staged, pendingReturnId) {
+  const modal = $("return-confirm-modal");
+  if (!modal) return;
+  const matches = Array.isArray(staged.matches) ? staged.matches : [];
+  const matchSummary = staged.matchSummary || { high: 0, ambiguous: 0, none: 0 };
+
+  returnConfirmSession = {
+    item,
+    staged,
+    pendingReturnId: pendingReturnId || (item && item.pendingReturnId) || (item && item.imageId),
+    matches,
+    matchSummary,
+    allMedicines: (returnReviewSession && returnReviewSession.allMedicines) || [],
+  };
+
+  // Seed selections: every high-confidence line is auto-selected.
+  Object.keys(returnConfirmSelections).forEach((k) => delete returnConfirmSelections[k]);
+  matches.forEach((m) => {
+    if (m.match && m.match.confidence === "high" && m.match.selectedMedicineId) {
+      returnConfirmSelections[m.lineIndex] = {
+        medicineId: m.match.selectedMedicineId,
+        qtyReturned: Number(m.returnQty) || 0,
+        netAmount: Number(m.netAmount) || 0,
+      };
+    }
+  });
+
+  const header = staged.header || {};
+  $("return-confirm-file").textContent = item ? (item.fileName || item.imageId) : returnConfirmSession.pendingReturnId;
+  $("return-confirm-credit").textContent = `CN ${header.creditNoteNumber || "—"} · ${header.distributorName || "—"} · ${matches.length} line(s) · ${matchSummary.high || 0} auto, ${matchSummary.ambiguous || 0} ambiguous, ${matchSummary.none || 0} unmatched`;
+  $("return-confirm-error").classList.add("hidden");
+
+  const imgEl = $("return-confirm-img");
+  try {
+    if (item && item.file) {
+      imgEl.src = URL.createObjectURL(item.file);
+    } else {
+      const sp = (item && item.storagePath) || (returnReviewSession && returnReviewSession.staged && returnReviewSession.staged.storagePath);
+      if (sp) imgEl.src = await getDownloadURL(ref(storage, sp));
+    }
+  } catch (_) {}
+
+  renderReturnConfirmLines();
+  modal.classList.remove("hidden");
+}
+
+function renderReturnConfirmLines() {
+  const wrap = $("return-confirm-lines");
+  if (!wrap || !returnConfirmSession) return;
+  const matches = returnConfirmSession.matches || [];
+  if (matches.length === 0) {
+    wrap.innerHTML = `<div class="text-center py-8 text-xs text-slate-500">No line items were matched. Tap the red lines below to search your stock, or go back and check the extraction.</div>`;
+    updateReturnConfirmSummary();
+    return;
+  }
+  wrap.innerHTML = matches.map((m) => renderReturnConfirmLine(m)).join("");
+  updateReturnConfirmSummary();
+}
+
+function renderReturnConfirmLine(m) {
+  const idx = m.lineIndex;
+  const conf = (m.match && m.match.confidence) || "none";
+  const sel = returnConfirmSelections[idx];
+  const candidates = (m.match && m.match.candidates) || [];
+  const stateCls = sel
+    ? "border-emerald-500/40 bg-emerald-500/5"
+    : conf === "ambiguous" ? "border-amber-500/40 bg-amber-500/5"
+    : conf === "high" ? "border-emerald-500/40 bg-emerald-500/5"
+    : "border-rose-500/40 bg-rose-500/5";
+
+  const confBadge = {
+    high: `<span class="text-[8px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wider bg-emerald-500/15 text-emerald-400 shrink-0">Auto-match</span>`,
+    ambiguous: `<span class="text-[8px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wider bg-amber-500/15 text-amber-400 shrink-0">Ambiguous</span>`,
+    none: `<span class="text-[8px] px-1.5 py-0.5 rounded font-bold uppercase tracking-wider bg-rose-500/15 text-rose-400 shrink-0">Unmatched</span>`,
+  }[conf] || "";
+
+  let body = "";
+  if (conf === "high" && candidates.length) {
+    const c = candidates[0];
+    const selected = sel && sel.medicineId === c.medicineId;
+    body = `
+      <div class="flex items-center justify-between gap-2">
+        <p class="text-[9px] text-slate-400">Matched <span class="text-emerald-300 font-bold">${esc(c.medicineName || "")}</span>${c.batchNumber ? ` · batch <span class="font-mono">${esc(c.batchNumber)}</span>` : ""} · ${c.remainingQty} in stock</p>
+        <button data-return-confirm-pick="${idx}" data-med-id="${c.medicineId}" class="text-[9px] px-2 py-1 rounded-md font-bold border transition-all ${
+          selected ? "bg-emerald-600 border-emerald-500 text-white" : "bg-emerald-500/10 border-emerald-500/30 text-emerald-300 hover:bg-emerald-500/20"
+        }">${selected ? "Selected ✓" : "Select"}</button>
+      </div>`;
+  } else if (conf === "ambiguous" && candidates.length) {
+    const opts = candidates.map((c) =>
+      `<button data-return-confirm-pick="${idx}" data-med-id="${c.medicineId}" class="w-full text-left px-2 py-1.5 rounded-md transition-all text-[10px] border ${
+        sel && sel.medicineId === c.medicineId ? "bg-emerald-500/15 border-emerald-500/40 text-emerald-200" : "bg-slate-800 border-slate-700 text-slate-200 hover:bg-slate-700"
+      }">
+        ${esc(c.medicineName)} · <span class="font-mono">batch ${esc(c.batchNumber || "—")}</span> · ${c.remainingQty} qty · ${Math.round(c.score * 100)}%
+      </button>`).join("");
+    body = `
+      <p class="text-[9px] text-slate-400">Multiple matches — tap the right one:</p>
+      <div class="space-y-1">${opts}</div>`;
+  } else {
+    body = `
+      <input data-return-confirm-search="${idx}" type="text" placeholder="Search medicine name or batch…" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-[10px] text-slate-200 focus:outline-none focus:border-emerald-500">
+      <div data-return-confirm-results="${idx}" class="space-y-1 mt-1"></div>`;
+  }
+
+  const selInfo = sel
+    ? `<p class="text-[9px] text-emerald-300">Selected: ${sel.qtyReturned} qty · ₹${Number(sel.netAmount) || 0}</p>`
+    : "";
+  return `
+    <div class="border ${stateCls} rounded-xl p-3 space-y-2">
+      <div class="flex items-start justify-between gap-2">
+        <div class="min-w-0 flex-1">
+          <p class="text-[11px] font-bold text-slate-100 leading-tight">${esc(m.medicineName || "(no name read)")}</p>
+          <p class="text-[9px] font-mono text-slate-500">Batch: ${esc(m.batchNumber || "—")} · Exp: ${esc(m.expiryDate || "—")} · Qty: ${m.returnQty || 0} · ₹${m.netAmount || 0}</p>
+        </div>
+        ${confBadge}
+      </div>
+      ${selInfo}
+      ${body}
+    </div>`;
+}
+
+function updateReturnConfirmSummary() {
+  const selected = Object.keys(returnConfirmSelections).filter((k) => {
+    const s = returnConfirmSelections[k];
+    return s && s.medicineId && Number(s.qtyReturned) > 0;
+  }).length;
+  const btn = $("btn-return-confirm-submit");
+  if (btn) btn.textContent = selected ? `Confirm & Record Return (${selected})` : "Confirm & Record Return";
+}
+
+// "Confirm All Matched" — bulk-select every auto-matched (high) line.
+function confirmAllReturnLines() {
+  if (!returnConfirmSession) return;
+  Object.keys(returnConfirmSelections).forEach((k) => delete returnConfirmSelections[k]);
+  (returnConfirmSession.matches || []).forEach((m) => {
+    if (m.match && m.match.confidence === "high" && m.match.selectedMedicineId) {
+      returnConfirmSelections[m.lineIndex] = {
+        medicineId: m.match.selectedMedicineId,
+        qtyReturned: Number(m.returnQty) || 0,
+        netAmount: Number(m.netAmount) || 0,
+      };
+    }
+  });
+  renderReturnConfirmLines();
+  showToast("All auto-matched lines selected.", "success");
+}
+
+// "Back to Review" (and the confirm modal's close) — reopen the review screen
+// with the same receipt so fields can still be fixed.
+function returnConfirmBack() {
+  $("return-confirm-modal")?.classList.add("hidden");
+  if (returnReviewSession) {
+    $("return-review-modal")?.classList.remove("hidden");
+    renderReturnReviewLines();
+  } else {
+    closeReturnReview();
+  }
+}
+
+// "Confirm & Record Return" → confirmReturnMatches (status "returned" +
+// returnDetails on the returned record(s), spec steps 7/8).
+async function submitReturnConfirm() {
+  if (!returnConfirmSession || !returnConfirmSession.pendingReturnId) return;
+  const decisions = [];
+  (returnConfirmSession.matches || []).forEach((m) => {
+    const sel = returnConfirmSelections[m.lineIndex];
+    if (sel && sel.medicineId && Number(sel.qtyReturned) > 0) {
+      decisions.push({
+        lineIndex: m.lineIndex,
+        medicineId: sel.medicineId,
+        returnQty: Number(sel.qtyReturned) || 0,
+        netAmount: Number(sel.netAmount) || 0,
+      });
+    }
+  });
+  if (decisions.length === 0) {
+    $("return-confirm-error")?.classList.remove("hidden");
+    return;
+  }
+  $("return-confirm-error")?.classList.add("hidden");
+
+  const header = collectReturnHeader();
+  showLoadingOverlay(true, "Recording returns…");
+  try {
+    const fn = httpsCallable(functions, "confirmReturnMatches", { timeout: 60000 });
+    const resp = await fn({
+      pharmacyId: currentPharmacyId,
+      pendingReturnId: returnConfirmSession.pendingReturnId,
+      decisions,
+      header,
+    });
+    const r = resp.data || {};
+    const item = returnConfirmSession.item;
+    closeReturnReview();
+    if (item) {
+      const itemInQueue = importQueue.find((i) => i.imageId === item.imageId);
+      if (itemInQueue) {
+        itemInQueue.status = "confirmed";
+        itemInQueue.returnExtracted = null;
+      }
+    }
+    renderImportQueueStatus();
+    showToast(`Confirmed ${r.confirmed} line(s) as returned (CN ${header.creditNoteNumber}).`, "success");
+  } catch (err) {
+    console.error("[submitReturnConfirm] ERROR:", err.code, err.message, err);
+    showToast("Confirm failed: " + (err.message || err), "error");
+  } finally {
+    showLoadingOverlay(false);
+  }
+}
+
+function initReturnActions() {
+  const reviewWrap = $("return-review-lines");
+  const confirmWrap = $("return-confirm-lines");
+
+  // Review modal buttons.
+  $("btn-return-close")?.addEventListener("click", closeReturnReview);
+  $("btn-return-cancel")?.addEventListener("click", closeReturnReview);
+  $("btn-return-reject")?.addEventListener("click", handleReturnReject);
+  $("btn-return-match")?.addEventListener("click", handleReturnMatch);
+
+  // Confirm modal buttons.
+  $("btn-return-confirm-close")?.addEventListener("click", returnConfirmBack);
+  $("btn-return-confirm-back")?.addEventListener("click", returnConfirmBack);
+  $("btn-return-confirm-all")?.addEventListener("click", confirmAllReturnLines);
+  $("btn-return-confirm-submit")?.addEventListener("click", submitReturnConfirm);
+
+  // Header input → refresh the soft total-warning badge.
+  $("return-grand-total")?.addEventListener("input", updateReturnTotalWarning);
+
+  // Review line editing (event delegation; reads returnLineUi at event time).
+  reviewWrap?.addEventListener("input", (e) => {
+    const fld = e.target.closest("input[data-return-name], input[data-return-batch], input[data-return-expiry], input[data-return-qty], input[data-return-amount]");
+    if (!fld) return;
+    const idx = fld.dataset.returnName ?? fld.dataset.returnBatch ?? fld.dataset.returnExpiry ?? fld.dataset.returnQty ?? fld.dataset.returnAmount;
+    const ui = returnLineUi[idx];
+    if (!ui) return;
+    if (fld.dataset.returnName !== undefined) ui.medicineName = fld.value;
+    else if (fld.dataset.returnBatch !== undefined) ui.batchNumber = fld.value;
+    else if (fld.dataset.returnExpiry !== undefined) ui.expiryDate = fld.value;
+    else if (fld.dataset.returnQty !== undefined) ui.returnQty = numOr(fld.value, 0);
+    else if (fld.dataset.returnAmount !== undefined) ui.netAmount = numOr(fld.value, 0);
+    updateReturnTotalWarning();
+  });
+
+  // Confirm screen: candidate pick.
+  confirmWrap?.addEventListener("click", (e) => {
+    const pick = e.target.closest("button[data-return-confirm-pick]");
+    if (!pick) return;
+    const idx = pick.dataset.returnConfirmPick;
+    const medId = pick.dataset.medId;
+    if (!returnConfirmSession || !medId) return;
+    const m = (returnConfirmSession.matches || []).find((mm) => String(mm.lineIndex) === String(idx));
+    if (!m) return;
+    returnConfirmSelections[idx] = {
+      medicineId: medId,
+      qtyReturned: Number(m.returnQty) || 0,
+      netAmount: Number(m.netAmount) || 0,
+    };
+    renderReturnConfirmLines();
+  });
+
+  // Confirm screen: manual search for unmatched lines (client-side over the
+  // loaded live-stock list).
+  confirmWrap?.addEventListener("input", (e) => {
+    const search = e.target.closest("input[data-return-confirm-search]");
+    if (!search) return;
+    const idx = search.dataset.returnConfirmSearch;
+    const q = normalizeReviewName(search.value);
+    const container = confirmWrap.querySelector(`[data-return-confirm-results="${idx}"]`);
+    if (!container) return;
+    if (q.length < 2) {
+      container.innerHTML = "";
+      return;
+    }
+    const hits = (returnConfirmSession.allMedicines || [])
+      .filter((m) => normalizeReviewName(m.medicineName).includes(q) || String(m.batchNumber || "").toUpperCase().includes(q))
+      .slice(0, 5);
+    container.innerHTML = hits.length
+      ? hits.map((h) =>
+          `<button data-return-confirm-pick="${idx}" data-med-id="${h.id}" class="w-full text-left px-2 py-1.5 rounded-md bg-slate-800 hover:bg-slate-700 text-[10px] text-slate-200 transition-all">
+            ${esc(h.medicineName)} · <span class="font-mono text-slate-400">batch ${esc(h.batchNumber || "—")}</span> · ${h.remainingQty} qty
+          </button>`).join("")
+      : `<p class="text-[9px] text-slate-500">No live batch matches "${esc(search.value)}".</p>`;
+  });
+}
 
 function updateReviewVisualSource() {
   const imgEl = $("review-invoice-img");

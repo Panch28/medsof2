@@ -177,17 +177,23 @@
                         <div class="absolute -right-6 -bottom-6 w-24 h-24 bg-indigo-600/10 rounded-full blur-xl pointer-events-none"></div>
                         <div class="space-y-3 relative z-10">
                             <div>
-                                <h3 class="text-sm font-heading font-extrabold text-slate-100">Upload Counter Invoice</h3>
-                                <p class="text-[10px] text-slate-400">Instantly catalog medicine expiry & batch details</p>
+                                <h3 id="upload-card-title" class="text-sm font-heading font-extrabold text-slate-100">Upload Counter Invoice</h3>
+                                <p id="upload-card-sub" class="text-[10px] text-slate-400">Instantly catalog medicine expiry & batch details</p>
                             </div>
-                            
+
+                            <!-- Document type toggle (explicit user choice — no auto-detection) -->
+                            <div class="grid grid-cols-2 gap-1 bg-slate-950/60 border border-slate-800 rounded-xl p-1">
+                                <button id="btn-upload-mode-invoice" class="py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all bg-indigo-500/25 text-indigo-300 border border-indigo-500/40">Upload Invoice</button>
+                                <button id="btn-upload-mode-return" class="py-2 rounded-lg text-[10px] font-bold uppercase tracking-wider transition-all text-slate-500 hover:text-slate-300">Upload Return Receipt</button>
+                            </div>
+
                             <!-- Large Scan Button -->
                             <button id="btn-camera-scan" class="w-full py-4 bg-indigo-600 text-white rounded-xl font-bold flex flex-col items-center justify-center gap-1.5 shadow-lg shadow-indigo-600/30 hover:bg-indigo-500 active:scale-[0.98] transition-all">
                                 <svg class="w-7 h-7 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" />
                                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" />
                                 </svg>
-                                <span class="text-xs uppercase tracking-widest font-heading font-semibold">Camera Capture Scan</span>
+                                <span id="upload-camera-label" class="text-xs uppercase tracking-widest font-heading font-semibold">Camera Capture Scan</span>
                             </button>
 
                             <!-- Gallery & PDF Uploads -->
@@ -196,14 +202,14 @@
                                     <svg class="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
                                     </svg>
-                                    Gallery Photos
+                                    <span id="upload-gallery-label">Gallery Photos</span>
                                     <input type="file" id="upload-gallery" accept="image/*" multiple class="hidden">
                                 </label>
                                 <label class="flex items-center justify-center gap-2 py-2 px-3 bg-slate-800/80 border border-slate-700/60 rounded-lg text-xs font-semibold text-slate-300 hover:bg-slate-800 cursor-pointer active:scale-95 transition-all">
                                     <svg class="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                                         <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
                                     </svg>
-                                    Invoice PDFs
+                                    <span id="upload-pdf-label">Invoice PDFs</span>
                                     <input type="file" id="upload-pdf" accept="application/pdf" class="hidden">
                                 </label>
                             </div>
@@ -227,9 +233,9 @@
                         <video id="camera-stream" class="w-full h-full object-cover" autoplay playsinline></video>
                         <!-- Scanner Guideline Overlay -->
                         <div class="absolute inset-4 border border-dashed border-indigo-400/50 rounded-lg pointer-events-none flex flex-col justify-between items-center p-4">
-                            <span class="text-[9px] text-indigo-400/80 bg-slate-950/80 px-2 py-0.5 rounded font-mono uppercase tracking-wider">Align Invoice Flat & Center</span>
+                            <span id="camera-guide-title" class="text-[9px] text-indigo-400/80 bg-slate-950/80 px-2 py-0.5 rounded font-mono uppercase tracking-wider">Align Invoice Flat & Center</span>
                             <div class="w-full h-0.5 bg-indigo-500/50 animate-pulse"></div>
-                            <span class="text-[8px] text-indigo-400/50">RxExpiry Live Framing Guide</span>
+                            <span id="camera-guide-sub" class="text-[8px] text-indigo-400/50">RxExpiry Live Framing Guide</span>
                         </div>
                         <button id="btn-camera-capture" class="absolute bottom-3 left-1/2 -translate-x-1/2 w-12 h-12 bg-white rounded-full border-4 border-slate-800 shadow-xl flex items-center justify-center hover:scale-105 active:scale-95 transition-all">
                             <span class="w-4 h-4 rounded-full bg-indigo-600"></span>
@@ -424,37 +430,132 @@
                             <button id="btn-expiry-bulk-clear" class="text-[9px] font-bold text-slate-400 hover:text-slate-200">Clear</button>
                         </div>
                         <div class="grid grid-cols-3 gap-1.5">
-                            <button id="btn-bulk-return-pending" class="px-2 py-1.5 rounded-lg text-[9px] font-bold text-slate-200 bg-slate-700/70 hover:bg-slate-600/70 transition-all">Return Pending</button>
-                            <button id="btn-bulk-returned" class="px-2 py-1.5 rounded-lg text-[9px] font-bold text-white bg-indigo-600 hover:bg-indigo-500 transition-all">Returned (CN)</button>
+                            <button id="btn-bulk-return-pending" class="px-2 py-1.5 rounded-lg text-[9px] font-bold text-amber-200 bg-amber-600/25 border border-amber-500/30 hover:bg-amber-600/40 transition-all">Mark Pending Return</button>
                             <button id="btn-bulk-disposed" class="px-2 py-1.5 rounded-lg text-[9px] font-bold text-white bg-amber-600 hover:bg-amber-500 transition-all">Disposed</button>
                             <button id="btn-bulk-writeoff" class="px-2 py-1.5 rounded-lg text-[9px] font-bold text-white bg-rose-600 hover:bg-rose-500 transition-all">Write Off</button>
                             <button id="btn-bulk-active" class="px-2 py-1.5 rounded-lg text-[9px] font-bold text-slate-200 bg-emerald-600/80 hover:bg-emerald-500/80 transition-all">Restore</button>
                             <button id="btn-bulk-delete" class="px-2 py-1.5 rounded-lg text-[9px] font-bold text-white bg-slate-700 hover:bg-slate-600 transition-all">Delete</button>
                         </div>
+                        <p class="text-[8px] text-slate-500 leading-snug">"Mark Pending Return" only flags stock as a candidate — nothing is credited. To actually record a return, upload the distributor's return receipt / credit note from Home → <span class="text-emerald-400 font-bold">Upload Return Receipt</span>. Only a confirmed receipt writes "returned" + credit-note details.</p>
                     </div>
                 </div>
 
-                <!-- Return / Credit-note modal -->
-                <div id="return-credit-modal" class="hidden fixed inset-0 bg-slate-950/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
-                    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-sm p-4 space-y-3 shadow-2xl">
-                        <div>
-                            <h3 class="text-sm font-heading font-extrabold text-slate-100">Return to Distributor</h3>
-                            <p class="text-[10px] text-slate-500">Credit-note details for CA tracking.</p>
+                <!-- Return receipt review modal (OCR'd credit note → fix fields → Confirm & Match) -->
+                <div id="return-review-modal" class="hidden fixed inset-0 bg-slate-950/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
+                    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-4xl h-[92vh] flex flex-col md:flex-row overflow-hidden shadow-2xl">
+                        <!-- Receipt image preview (Left/Top) -->
+                        <div class="w-full md:w-1/2 h-1/3 md:h-full bg-slate-950 border-b md:border-b-0 md:border-r border-slate-800 flex flex-col relative">
+                            <div class="p-3 border-b border-slate-800 flex justify-between items-center bg-slate-900 shrink-0">
+                                <div>
+                                    <span class="text-xs font-bold text-slate-300">Return Receipt Review</span>
+                                    <p id="return-review-file" class="text-[9px] text-slate-500 font-mono truncate max-w-[220px]"></p>
+                                </div>
+                                <div class="flex items-center gap-2">
+                                    <span id="return-review-badge" class="px-2 py-0.5 text-[9px] rounded font-bold uppercase tracking-wider bg-amber-500/15 text-amber-400">Pending Review</span>
+                                    <button id="btn-return-close" class="p-1.5 rounded-full bg-slate-800 text-slate-400 hover:text-slate-100">&times;</button>
+                                </div>
+                            </div>
+                            <div class="flex-1 overflow-auto p-4 flex items-center justify-center min-h-0 bg-slate-950">
+                                <img id="return-review-img" class="max-w-full max-h-full object-contain rounded border border-slate-800" src="" alt="Return receipt scan">
+                            </div>
                         </div>
-                        <div class="space-y-2">
-                            <label class="block text-[9px] font-bold uppercase tracking-wider text-slate-500">Credit note no *</label>
-                            <input id="cn-number" type="text" placeholder="e.g. CN/24/123" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-[11px] text-slate-200 placeholder-slate-500 focus:outline-none focus:border-indigo-500">
-                            <label class="block text-[9px] font-bold uppercase tracking-wider text-slate-500">Returned to distributor</label>
-                            <input id="cn-distributor" type="text" placeholder="e.g. MCS Distributors" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-[11px] text-slate-200 placeholder-slate-500 focus:outline-none focus:border-indigo-500">
-                            <label class="block text-[9px] font-bold uppercase tracking-wider text-slate-500">Return date</label>
-                            <input id="cn-date" type="date" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-[11px] text-slate-200 focus:outline-none focus:border-indigo-500">
-                            <label class="block text-[9px] font-bold uppercase tracking-wider text-slate-500">Credit amount (₹)</label>
-                            <input id="cn-amount" type="number" min="0" step="0.01" placeholder="0.00" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-2.5 py-2 text-[11px] text-slate-200 placeholder-slate-500 focus:outline-none focus:border-indigo-500">
-                            <p id="cn-error" class="hidden text-[9px] text-rose-400 font-bold">Credit note number is required.</p>
+
+                        <!-- Review form (Right/Bottom) -->
+                        <div class="w-full md:w-1/2 h-2/3 md:h-full flex flex-col overflow-hidden bg-slate-900">
+                            <div class="p-3 border-b border-slate-800 shrink-0 space-y-1.5">
+                                <h3 class="text-xs font-heading font-extrabold text-slate-100">Review Return Receipt</h3>
+                                <p class="text-[9px] text-slate-500">Fix any misreads below, then Confirm &amp; Match. Stock is NOT marked returned until you confirm the matches on the next screen.</p>
+                            </div>
+
+                            <!-- Editable credit-note header -->
+                            <div class="px-4 pt-2 grid grid-cols-2 gap-2 shrink-0">
+                                <label class="block">
+                                    <span class="text-[8px] font-bold uppercase tracking-wider text-slate-500">Credit note no *</span>
+                                    <input id="return-cn-number" type="text" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-[11px] text-slate-200 focus:outline-none focus:border-amber-500 font-mono">
+                                </label>
+                                <label class="block">
+                                    <span class="text-[8px] font-bold uppercase tracking-wider text-slate-500">Date</span>
+                                    <input id="return-cn-date" type="date" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-[11px] text-slate-200 focus:outline-none focus:border-amber-500 font-mono">
+                                </label>
+                                <label class="block col-span-2">
+                                    <span class="text-[8px] font-bold uppercase tracking-wider text-slate-500">Distributor</span>
+                                    <input id="return-cn-distributor" type="text" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-[11px] text-slate-200 focus:outline-none focus:border-amber-500" autocomplete="off">
+                                </label>
+                                <label class="block">
+                                    <span class="text-[8px] font-bold uppercase tracking-wider text-slate-500">Ref invoice no</span>
+                                    <input id="return-ref-invoice" type="text" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-[11px] text-slate-200 focus:outline-none focus:border-amber-500 font-mono">
+                                </label>
+                                <label class="block">
+                                    <span class="text-[8px] font-bold uppercase tracking-wider text-slate-500">Grand total (₹)</span>
+                                    <input id="return-grand-total" type="number" step="0.01" min="0" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-[11px] text-slate-200 focus:outline-none focus:border-amber-500 font-mono">
+                                </label>
+                                <label class="block col-span-2">
+                                    <span class="text-[8px] font-bold uppercase tracking-wider text-slate-500">Return reason</span>
+                                    <input id="return-reason" type="text" class="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1.5 text-[11px] text-slate-200 focus:outline-none focus:border-amber-500">
+                                </label>
+                                <p id="return-cn-error" class="hidden col-span-2 text-[9px] text-rose-400 font-bold">Credit note number is required to match.</p>
+                                <div id="return-total-warning" class="hidden col-span-2 items-center gap-1.5 text-[9px] font-bold text-amber-400 bg-amber-500/10 border border-amber-500/30 rounded-lg px-2 py-1.5">
+                                    <span>&#9888;</span>
+                                    <span id="return-total-warning-text"></span>
+                                </div>
+                            </div>
+
+                            <!-- Line items -->
+                            <div id="return-review-lines" class="flex-1 overflow-y-auto px-4 py-3 space-y-2 min-h-0"></div>
+
+                            <!-- Footer actions -->
+                            <div class="p-3 border-t border-slate-800 shrink-0 flex gap-2">
+                                <button id="btn-return-cancel" class="flex-1 py-2 rounded-lg text-[10px] font-bold text-slate-400 bg-slate-800 hover:bg-slate-700 transition-all">Cancel</button>
+                                <button id="btn-return-reject" class="flex-1 py-2 rounded-lg text-[10px] font-bold text-rose-400 bg-rose-500/10 border border-rose-500/30 hover:bg-rose-500/20 transition-all">Reject &amp; Discard</button>
+                                <button id="btn-return-match" class="flex-1 py-2 rounded-lg text-[10px] font-bold text-white bg-amber-500 hover:bg-amber-400 transition-all">Confirm &amp; Match</button>
+                            </div>
                         </div>
-                        <div class="flex gap-2">
-                            <button id="btn-cn-cancel" class="flex-1 py-2 rounded-lg text-[10px] font-bold text-slate-400 bg-slate-800 hover:bg-slate-700 transition-all">Cancel</button>
-                            <button id="btn-cn-confirm" class="flex-1 py-2 rounded-lg text-[10px] font-bold text-white bg-indigo-600 hover:bg-indigo-500 transition-all">Mark Returned</button>
+                    </div>
+                </div>
+
+                <!-- Return receipt confirm modal (matching results → Confirm & Record Return) -->
+                <div id="return-confirm-modal" class="hidden fixed inset-0 bg-slate-950/80 backdrop-blur-md z-50 flex items-center justify-center p-4">
+                    <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-4xl h-[92vh] flex flex-col md:flex-row overflow-hidden shadow-2xl">
+                        <!-- Receipt image preview (Left/Top) -->
+                        <div class="w-full md:w-1/2 h-1/3 md:h-full bg-slate-950 border-b md:border-b-0 md:border-r border-slate-800 flex flex-col relative">
+                            <div class="p-3 border-b border-slate-800 flex justify-between items-center bg-slate-900 shrink-0">
+                                <div>
+                                    <span class="text-xs font-bold text-slate-300">Confirm Returned Stock</span>
+                                    <p id="return-confirm-file" class="text-[9px] text-slate-500 font-mono truncate max-w-[220px]"></p>
+                                </div>
+                                <div class="flex items-center gap-2">
+                                    <span id="return-confirm-badge" class="px-2 py-0.5 text-[9px] rounded font-bold uppercase tracking-wider bg-emerald-500/15 text-emerald-400">Confirm</span>
+                                    <button id="btn-return-confirm-close" class="p-1.5 rounded-full bg-slate-800 text-slate-400 hover:text-slate-100">&times;</button>
+                                </div>
+                            </div>
+                            <div class="flex-1 overflow-auto p-4 flex items-center justify-center min-h-0 bg-slate-950">
+                                <img id="return-confirm-img" class="max-w-full max-h-full object-contain rounded border border-slate-800" src="" alt="Return receipt scan">
+                            </div>
+                        </div>
+
+                        <!-- Confirm form (Right/Bottom) -->
+                        <div class="w-full md:w-1/2 h-2/3 md:h-full flex flex-col overflow-hidden bg-slate-900">
+                            <div class="p-3 border-b border-slate-800 shrink-0 space-y-1.5">
+                                <div class="flex items-center justify-between">
+                                    <h3 class="text-xs font-heading font-extrabold text-slate-100">Confirm Returned Stock</h3>
+                                    <button id="btn-return-confirm-all" class="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-[10px] font-bold transition-all active:scale-95">Confirm All Matched</button>
+                                </div>
+                                <p class="text-[9px] text-slate-500">Green lines are auto-matched (high confidence). Yellow lines are ambiguous — tap one to pick the right batch. Red lines need a manual selection. Only confirmed lines write "returned" + credit-note details.</p>
+                            </div>
+
+                            <div class="px-4 pt-2 shrink-0">
+                                <p id="return-confirm-credit" class="text-[9px] font-mono text-slate-400 bg-slate-950 border border-slate-800 rounded-lg px-2.5 py-1.5"></p>
+                                <p id="return-confirm-error" class="hidden text-[9px] text-rose-400 font-bold mt-1">Confirm at least one line.</p>
+                            </div>
+
+                            <!-- Match lines -->
+                            <div id="return-confirm-lines" class="flex-1 overflow-y-auto px-4 py-3 space-y-2.5 min-h-0"></div>
+
+                            <!-- Footer actions -->
+                            <div class="p-3 border-t border-slate-800 shrink-0 flex gap-2">
+                                <button id="btn-return-confirm-back" class="flex-1 py-2 rounded-lg text-[10px] font-bold text-slate-400 bg-slate-800 hover:bg-slate-700 transition-all">Back to Review</button>
+                                <button id="btn-return-confirm-submit" class="flex-1 py-2 rounded-lg text-[10px] font-bold text-white bg-emerald-600 hover:bg-emerald-500 transition-all">Confirm &amp; Record Return</button>
+                            </div>
                         </div>
                     </div>
                 </div>

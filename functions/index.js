@@ -1,4 +1,4 @@
-/**
+﻿/**
  * RxExpiry Cloud Functions
  *
  * Extraction pipeline (Gemini only — no local OCR):
@@ -41,7 +41,7 @@ const { defineSecret } = require("firebase-functions/params");
 const { logger } = require("firebase-functions/v2");
 const { initializeApp } = require("firebase-admin/app");
 const { getStorage } = require("firebase-admin/storage");
-const { getFirestore, FieldValue } = require("firebase-admin/firestore");
+const { getFirestore, FieldValue, Timestamp } = require("firebase-admin/firestore");
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 
 initializeApp();
@@ -1032,6 +1032,20 @@ exports.discardQueueItem = onCall(
         logger.warn(`[discardQueueItem] Storage delete failed (non-fatal): ${delErr.message}`);
       }
     }
+    // A discarded return-receipt item must also retire its staged pending_returns
+    // doc (mirrors discardReturnReceipt), otherwise the 24h cleanup is the only
+    // thing that would ever clear it.
+    if (data.documentType === "return_receipt" && data.pendingReturnId) {
+      try {
+        const pendingRef = db.collection("pharmacies").doc(pharmacyId).collection("pending_returns").doc(data.pendingReturnId);
+        const prSnap = await pendingRef.get();
+        if (prSnap.exists && prSnap.data().status !== "confirmed") {
+          await pendingRef.set({ status: "discarded", discardedBy: request.auth.uid, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+        }
+      } catch (pendingErr) {
+        logger.warn(`[discardQueueItem] pending_returns cleanup failed (non-fatal): ${pendingErr.message}`);
+      }
+    }
     logger.info(`[discardQueueItem] ${pharmacyId}/importQueue/${docId} discarded by ${request.auth.uid}`);
     return { success: true, discarded: docId };
   }
@@ -1206,15 +1220,19 @@ exports.processImportQueueItem = onCall(
     // Every image is a standalone invoice: persist whatever Gemini parsed from
     // THIS image (line items, totals, GST) straight to "extracted" for review.
     // No cross-page merging, no waiting for a footer-totals page.
-    await queueRef.update({
-      status: "extracted",
-      extracted,
-      invoiceNumber: extracted.invoiceNumber || "",
-      gstCheck: extracted.gstCheck || {},
-      completedAt: FieldValue.serverTimestamp(),
-      leaseExpiresAt: FieldValue.delete(),
-      updatedAt: FieldValue.serverTimestamp(),
-    });
+    try {
+      await queueRef.update({
+        status: "extracted",
+        extracted,
+        invoiceNumber: extracted.invoiceNumber || "",
+        gstCheck: extracted.gstCheck || {},
+        completedAt: FieldValue.serverTimestamp(),
+        leaseExpiresAt: FieldValue.delete(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    } catch (err) {
+      return await markFailed("stage_failed", "Failed to stage extraction: " + (err && err.message || err));
+    }
     logger.info(`[processImportQueueItem] ${imageId} → extracted (invoice ${extracted.invoiceNumber || "?"}, ${(extracted.lineItems || []).length} items)`);
     return { status: "extracted", extracted };
   }
@@ -1273,29 +1291,888 @@ exports.mutateImportQueue = onCall(
     return { ok: true, imageId };
   }
 );
+// ─── Return-receipt pipeline ─────────────────────────────────────────────────
+// DISTRIBUTOR RETURN RECEIPTS / CREDIT NOTES are a SEPARATE document type from
+// purchase invoices. They share the SAME importQueue staging as invoices (the
+// queue doc carries documentType: "return_receipt"); the client routes them to
+// processReturnReceipt (never processImportQueueItem, never the invoice prompt,
+// never the invoice GST validator). Extraction is staged to pending_returns;
+// the matching engine runs on "Confirm & Match" (matchReturnReceipt) using the
+// owner-edited header; confirmReturnMatches is the ONLY code path that writes a
+// medicine record's status "returned" — the bulk "mark returned" shortcut on
+// expired stock was removed because an already-expired batch is not the same as
+// a distributor-accepted return, and marking it returned without a receipt lies
+// about the credit.
+//
+// importQueue/{imageId} (status "uploaded" → "processing" → "extracted")
+//   → pending_returns/{imageId} (status "pending_review" → "matched" → "confirmed")
+// Terminal: "confirmed", "discarded", "failed", "rejected". Lease/crash
+// recovery is identical to the import queue.
+
+const GEMINI_RETURN_RECEIPT_PROMPT = `You are an expert AI OCR parser for Indian pharmacy distributor RETURN RECEIPTS / CREDIT NOTES (the document the distributor issues when it accepts returned medicine stock). A credit note has a COMPLETELY DIFFERENT structure to a purchase invoice — there is NO billed/free qty split, NO CD%, NO line-level CGST/SGST/IGST. Extract the credit-note header and every line item with 100% accuracy.
+
+Return ONLY valid JSON matching this exact schema — no markdown, no explanation:
+
+{
+  "creditNoteNumber": "string",
+  "distributorName": "string",
+  "distributorGSTIN": "string (optional, may be blank)",
+  "date": "string (DD/MM/YYYY or as printed)",
+  "refInvoiceNumber": "string (optional, may be blank on some receipts)",
+  "returnReason": "string (free text, e.g. Damaged / Near Expiry Stock / Expired / as printed)",
+  "grandTotalCreditAmount": number,
+  "readable": boolean,
+  "issues": ["string"],
+  "lineItems": [
+    {
+      "medicineName": "string",
+      "hsn": "string (optional)",
+      "batchNumber": "string",
+      "expiryDate": "string (MM/YY or MM/YYYY or as printed)",
+      "returnQty": number,
+      "netAmount": number,
+      "confidence": {
+        "medicineName": number,
+        "batchNumber": number,
+        "returnQty": number
+      }
+    }
+  ]
+}
+
+OPERATIONAL DIRECTIVES:
+1. ROW-LEVEL EXTRACTION — parse EVERY visible line item across the receipt columns (Medicine / Product Description | Batch No | Exp Date | Returned Qty | Rate | Net Amount / Credit Amount / Total). Read each column as printed.
+2. COPY PRINTED VALUES, DO NOT DERIVE:
+   - medicineName: the full printed medicine/product name (e.g. "VOGS GM 2/0.3MG TAB").
+   - batchNumber: the printed batch/lot number (e.g. "SGC312"). COPY IT VERBATIM — never "correct" or transcribe it (this is the primary matching key downstream). If a batch column exists but is blank on that line, return "".
+   - returnQty: the printed returned quantity for that line.
+   - netAmount: the printed credit/return amount for that line (INR, no symbol).
+   - expiryDate: printed expiry (MM/YY or MM/YYYY). If the column is blank on that line, return "".
+3. HEADER FIELDS:
+   - creditNoteNumber: the printed Credit Note No / CN No (e.g. "CN-2024-0098"). COPY VERBATIM.
+   - distributorName: the printed distributor / company name at the top of the receipt (e.g. "VARDHMAN MEDISALES").
+   - grandTotalCreditAmount: the printed Grand Total / Total Credit / Total Return amount of the credit note.
+   - returnReason: read any printed reason line (e.g. "Damaged", "Near Expiry", "Expired stock"). If none is printed, return "".
+4. CONFIDENCE SCORING: for every line set confidence.medicineName, confidence.batchNumber and confidence.returnQty to 0.0–1.0 reflecting how clearly each field was printed. LOW batch confidence (blurry, smudged, partially cut-off digits) is the MOST IMPORTANT flag — the batch is the primary matching key, so when a batch looks at all uncertain, score it below 0.8. Never score an unreadable field above 0.4.
+5. DO NOT EXTRACT OR VALIDATE (this is a credit note, NOT a purchase invoice):
+   - Qty Billed / Qty Free split — does not exist here.
+   - CD% / cash discount columns.
+   - CGST/SGST/IGST line-level or totals split.
+   - GST arithmetic tolerance checks. There is NO tax math to verify on a credit note.
+6. If the document is not a return receipt / credit note (e.g. it is a purchase invoice or something unrelated), set readable = false and list the reason in issues[].
+7. If the image is blurry or a value is unreadable, do NOT guess — set readable = false and explain in issues[].
+8. All amounts in INR as plain numbers (no ₹ symbol), typed as numbers, never strings.
+9. Return ONLY valid JSON — no markdown, no explanation.`;
+
+// ── Fuzzy-string helpers for the matching engine ─────────────────────────────
+function levenshtein(a, b) {
+  a = String(a || "");
+  b = String(b || "");
+  const m = a.length;
+  const n = b.length;
+  if (!m) return n;
+  if (!n) return m;
+  const dp = new Array(n + 1);
+  for (let j = 0; j <= n; j++) dp[j] = j;
+  for (let i = 1; i <= m; i++) {
+    let prev = dp[0];
+    dp[0] = i;
+    for (let j = 1; j <= n; j++) {
+      const cur = dp[j];
+      dp[j] = Math.min(dp[j] + 1, dp[j - 1] + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1));
+      prev = cur;
+    }
+  }
+  return dp[n];
+}
+
+// Name normalization: case-insensitive, punctuation dropped, runs collapsed.
+// "Azithral 500" and "AZITHRAL 500MG" compare on alphanumeric tokens only.
+function normMedName(s) {
+  return String(s || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, " ")
+    .trim();
+}
+
+// Batch normalization: case-insensitive, ALL non-alphanumerics stripped so
+// "MEZI015" vs "MEZ1O15" vs "MEZ1015" reduce to comparable digit-letter strings
+// (Levenshtein absorbs the 0/1 and O/0 OCR confusion the user saw in the data).
+function normBatch(s) {
+  return String(s || "")
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+}
+
+function medNameSimilarity(a, b) {
+  const na = normMedName(a);
+  const nb = normMedName(b);
+  if (!na || !nb) return 0;
+  if (na === nb) return 1;
+  const maxLen = Math.max(na.length, nb.length);
+  const sim = 1 - levenshtein(na, nb) / maxLen;
+  const ta = na.split(" ");
+  const tb = nb.split(" ");
+  const overlap = ta.filter((t) => tb.includes(t)).length / Math.max(ta.length, tb.length);
+  return Math.max(sim, overlap * 0.9);
+}
+
+function batchSimilarity(a, b) {
+  const na = normBatch(a);
+  const nb = normBatch(b);
+  if (!na || !nb) return 0;
+  if (na === nb) return 1;
+  // Spec: allow edit-distance <= 1 to absorb OCR noise (e.g. "MEZI015" vs
+  // "MEZ1015", "SGC312" vs "SGC31Z"). Treat those as a strong batch match.
+  const dist = levenshtein(na, nb);
+  if (dist <= 1) return 0.95;
+  return 1 - dist / Math.max(na.length, nb.length);
+}
+
+// Score one receipt line against one medicine doc (0..1). Batch disagreement
+// never fully sinks a strong medicine-name match, and a name-less receipt line
+// is never auto-accepted on batch alone. When the receipt carries a reference
+// invoice number, docs whose stored invoiceNumber matches it get a small boost
+// (soft signal — never required, the spec says some receipts lack it or OCR
+// garbles it).
+function scoreCandidate(line, doc, refInvoiceNumber) {
+  const nameSim = medNameSimilarity(line.medicineName, doc.medicineName);
+  const batchSim = batchSimilarity(line.batchNumber, doc.batchNumber);
+  const hasLineBatch = !!normBatch(line.batchNumber);
+  const hasDocBatch = !!normBatch(doc.batchNumber);
+  let score;
+  if (hasLineBatch && hasDocBatch) score = nameSim * 0.6 + batchSim * 0.4;
+  else score = nameSim * 0.9;
+  if (refInvoiceNumber && doc.invoiceNumber && normBatch(refInvoiceNumber) === normBatch(doc.invoiceNumber)) {
+    score = Math.min(1, score + 0.1);
+  }
+  return round2(score);
+}
+
+// Classify one receipt line against the candidate medicine docs:
+//   { confidence: "high", selectedMedicineId, candidates }
+//   { confidence: "ambiguous", candidates }   (manual pick)
+//   { confidence: "none", candidates: [] }
+function classifyLine(line, docs, refInvoiceNumber) {
+  const candidates = [];
+  for (const d of docs) {
+    const score = scoreCandidate(line, d, refInvoiceNumber);
+    if (score >= 0.55) {
+      candidates.push({
+        medicineId: d.id,
+        medicineName: d.medicineName,
+        batchNumber: d.batchNumber,
+        remainingQty: d.remainingQty,
+        score,
+      });
+    }
+  }
+  candidates.sort((a, b) => b.score - a.score || b.remainingQty - a.remainingQty);
+  if (candidates.length === 0) return { confidence: "none", candidates: [] };
+  const best = candidates[0];
+  const second = candidates[1];
+  const gap = second ? best.score - second.score : 1;
+  if (gap >= 0.18) return { confidence: "high", selectedMedicineId: best.medicineId, candidates: [best] };
+  return { confidence: "ambiguous", candidates: candidates.slice(0, 4) };
+}
+
+// Load the medicine docs that are valid match targets for a return receipt:
+// same pharmacy, not already terminal (returned/disposed/written off/deleted),
+// and holding real stock (remainingQty > 0). The returnedSplit marker excludes
+// partial-return split docs that carry no stock of their own.
+// When distributor is supplied (resolved from the receipt's distributorName),
+// restrict to that distributor's docs first — spec step 6.1. The caller falls
+// back to the full list when the distributor pool is empty.
+async function loadReturnCandidates(pharmacyId, db, distributor = "") {
+  const medColl = db.collection("pharmacies").doc(pharmacyId).collection("medicines");
+  const dist = normalizeDistributorName(distributor);
+  let snap;
+  try {
+    if (dist) {
+      const qSnap = await medColl.where("distributorId", "==", dist).limit(400).get();
+      if (!qSnap.empty) {
+        snap = qSnap;
+      } else {
+        const legacySnap = await medColl.where("distributor", "==", dist).limit(400).get();
+        if (!legacySnap.empty) snap = legacySnap;
+      }
+    }
+  } catch (err) {
+    logger.warn(`[matchReturnReceipt] distributor query failed, falling back to full scan: ${err.message}`);
+  }
+  if (!snap) {
+    snap = await medColl.get();
+  }
+  const out = [];
+  for (const doc of snap.docs) {
+    const d = doc.data();
+    if (d.returnedSplit === true) continue;
+    if (["returned", "returned_to_distributor", "disposed", "written_off", "deleted"].includes(d.status || "active")) continue;
+    const remaining = Number(d.remainingQty ?? d.quantityBilled) || 0;
+    if (remaining <= 0) continue;
+    out.push({
+      id: doc.id,
+      medicineName: d.medicineName || "",
+      batchNumber: d.batchNumber || "",
+      distributorId: normalizeDistributorName(d.distributorId || d.distributor || ""),
+      invoiceNumber: d.invoiceNumber || "",
+      remainingQty: remaining,
+    });
+  }
+  return out;
+}
+
+// The matching engine (runs on Confirm & Match — spec step 6). For each
+// reviewed receipt line, find candidate medicine docs, score them, and classify
+// by confidence: "high" (unambiguous → auto-stage for one-tap confirm),
+// "ambiguous" (top 2-4 candidates for manual pick), "none" (manual search).
+function matchReturnLines(parsed, candidates) {
+  const refInvoiceNumber = String(parsed.refInvoiceNumber || "");
+  const lines = Array.isArray(parsed.lineItems) ? parsed.lineItems : [];
+  return lines.map((line, i) => {
+    const match = classifyLine(line, candidates, refInvoiceNumber);
+    return {
+      lineIndex: i,
+      medicineName: line.medicineName || "",
+      batchNumber: line.batchNumber || "",
+      expiryDate: line.expiryDate || "",
+      returnQty: Number(line.returnQty) || 0,
+      netAmount: Number(line.netAmount) || 0,
+      confidence: (line && line.confidence) || { medicineName: 1, batchNumber: 1, returnQty: 1 },
+      match,
+    };
+  });
+}
+
+// ─── Return-receipt pipeline ─────────────────────────────────────────────────
+// processReturnReceipt / matchReturnReceipt / confirmReturnMatches / discardReturnReceipt
+//
+// DISTRIBUTOR RETURN RECEIPTS / CREDIT NOTES are a SEPARATE document type from
+// purchase invoices. They share the SAME importQueue staging as invoices (the
+// queue doc carries documentType: "return_receipt"); the client routes them to
+// processReturnReceipt (never processImportQueueItem, never the invoice prompt,
+// never the invoice GST validator).
+//
+// Flow:
+//   importQueue/{imageId}   (status "uploaded" → "processing" → "extracted")
+//     → pending_returns/{imageId}   (status "pending_review" → "matched" → "confirmed")
+//   The review screen reads pending_returns (edits header/line fields).
+//   "Confirm & Match" → matchReturnReceipt (matching engine, spec step 6).
+//   The confirm screen → confirmReturnMatches (the ONLY code path that writes a
+//   medicine record's status "returned", spec step 7/8).
+//   "Reject" → discardReturnReceipt (pending_returns + importQueue + storage).
+//
+// Staging doc: /pharmacies/{id}/pending_returns/{imageId}
+//   header:     { creditNoteNumber, distributorName, distributorGSTIN, date,
+//                 refInvoiceNumber, returnReason, grandTotalCreditAmount }
+//   lineItems:  [{ medicineName, hsn, batchNumber, expiryDate, returnQty,
+//                  netAmount, confidence }]
+//   matches:    [{ lineIndex, ..., match }]   (populated by matchReturnReceipt)
+
+// Best-effort parse of a credit-note date string into a Firestore Timestamp
+// ("DD/MM/YYYY", "YYYY-MM-DD", "D-M-YYYY"). Returns null when unparseable.
+function parseDateField(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return null;
+  let m = s.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/);
+  if (m) return Timestamp.fromDate(new Date(Number(m[3]), Number(m[2]) - 1, Number(m[1])));
+  m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (m) return Timestamp.fromDate(new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+  const t = new Date(s);
+  if (!isNaN(t.getTime())) return Timestamp.fromDate(t);
+  return null;
+}
+
+exports.processReturnReceipt = onCall(
+  {
+    timeoutSeconds: 120,
+    memory: "512MiB",
+    region: "us-central1",
+    secrets: ["GEMINI_API_KEY"],
+  },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Login required.");
+    }
+
+    const { pharmacyId, imageId } = request.data;
+    if (!pharmacyId || !imageId) {
+      throw new HttpsError("invalid-argument", "pharmacyId and imageId are required.");
+    }
+
+    const db = getFirestore();
+    const queueRef = db.collection("pharmacies").doc(pharmacyId).collection("importQueue").doc(imageId);
+
+    // ── 1. Leased claim in a transaction (identical to processImportQueueItem) ──
+    let claim;
+    try {
+      claim = await db.runTransaction(async (tx) => {
+        const snap = await tx.get(queueRef);
+        if (!snap.exists) {
+          throw new HttpsError("not-found", "Queue item not found: " + imageId);
+        }
+        const data = snap.data();
+        const status = data.status || "";
+        const terminal = ["saved", "reviewed", "ingested", "failed", "rejected", "confirmed", "discarded"].includes(status);
+        if (terminal || status === "extracted") {
+          return { claimed: false, terminal: true, data };
+        }
+        if (status === "processing") {
+          const leaseExpiresAt = Number(data.leaseExpiresAt) || 0;
+          if (leaseExpiresAt > Date.now()) {
+            return { claimed: false, busy: true, data };
+          }
+          logger.warn(`[processReturnReceipt] reclaiming ${imageId}: lease expired, status was "processing"`);
+        }
+        if (status === "saving" || status === "confirming") {
+          return { claimed: false, busy: true, data };
+        }
+        const claimAttempts = Number(data.claimAttempts) || 0;
+        tx.update(queueRef, {
+          status: "processing",
+          claimedBy: request.auth.uid,
+          claimedAt: FieldValue.serverTimestamp(),
+          leaseExpiresAt: Date.now() + QUEUE_LEASE_MS,
+          claimAttempts: claimAttempts + 1,
+          updatedAt: FieldValue.serverTimestamp(),
+        });
+        return { claimed: true, data };
+      });
+    } catch (err) {
+      if (err instanceof HttpsError) throw err;
+      throw new HttpsError("internal", "Failed to claim queue item: " + err.message);
+    }
+
+    if (!claim.claimed) {
+      const s = claim.data.status || "";
+      if (claim.busy) {
+        return { status: s, busy: true, retryAfterMs: QUEUE_LEASE_MS };
+      }
+      if (s === "extracted") {
+        // Already extracted and awaiting review — return the staged result so a
+        // resume never burns another Gemini call.
+        const prId = claim.data.pendingReturnId || imageId;
+        try {
+          const prSnap = await db.collection("pharmacies").doc(pharmacyId).collection("pending_returns").doc(prId).get();
+          if (prSnap.exists) {
+            return { status: s, skipped: true, pendingReturnId: prId, extracted: prSnap.data() };
+          }
+        } catch (_) {}
+        return { status: s, skipped: true, pendingReturnId: prId };
+      }
+      return { status: s, skipped: true };
+    }
+
+    const claimAttempts = (Number(claim.data.claimAttempts) || 0) + 1;
+
+    const markFailed = async (errorCode, message) => {
+      const fatal = claimAttempts >= MAX_EXTRACTION_ATTEMPTS;
+      logger.warn(`[processReturnReceipt] ${imageId} ${fatal ? "FAILED (attempt " + claimAttempts + ")" : "reverting to uploaded (attempt " + claimAttempts + ")"}: ${message}`);
+      await queueRef.update({
+        status: fatal ? "failed" : "uploaded",
+        error: { code: errorCode, message, at: new Date().toISOString() },
+        leaseExpiresAt: FieldValue.delete(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+      return { status: fatal ? "failed" : "uploaded", retryable: !fatal, attempt: claimAttempts, error: message };
+    };
+
+    // ── 2. Download the raw file ───────────────────────────────────────────
+    const storagePath = claim.data.storagePath || "";
+    if (!storagePath) {
+      return await markFailed("missing_storage_path", "Queue item has no storagePath.");
+    }
+    if (!storagePath.startsWith(`returns/${pharmacyId}/`) && !storagePath.startsWith(`invoices/${pharmacyId}/`)) {
+      return await markFailed("invalid_storage_path", "storagePath does not belong to this pharmacy.");
+    }
+
+    const bucket = getStorage().bucket();
+    let imageParts;
+    try {
+      imageParts = await downloadFilesToParts(bucket, [storagePath]);
+    } catch (err) {
+      return await markFailed("download_failed", "Error downloading file from storage: " + err.message);
+    }
+
+    // ── 3. Extract via the RETURN-RECEIPT prompt (never the invoice prompt) ──
+    const apiKey = GEMINI_API_KEY.value();
+    if (!apiKey) {
+      return await markFailed("missing_api_key", "GEMINI_API_KEY secret not configured.");
+    }
+    const genAI = new GoogleGenerativeAI(apiKey);
+
+    let result = null;
+    let parsed;
+    try {
+      result = await generateWithModelFallback(genAI, [GEMINI_RETURN_RECEIPT_PROMPT, ...imageParts]);
+      parsed = JSON.parse(stripMarkdown(result.response.text()));
+    } catch (err) {
+      return await markFailed("extraction_failed", err.message);
+    }
+
+    // The rest of the body runs with the lease held. Everything after extraction
+    // is funneled through markFailed (which deletes leaseExpiresAt) so a crashed
+    // invocation can never wedge the queue item in "processing".
+    // Declared at function scope because the final logger.info + return run
+    // OUTSIDE the guarded try block and must still see them.
+    let staged = null;
+    let pendingDocId = null;
+    let header = {};
+    let lineItems = [];
+    try {
+      if (parsed.readable === false) {
+        return await markFailed("not_readable", (parsed.issues || []).join("; ") || "Document not readable as a return receipt.");
+      }
+
+      header = {
+        creditNoteNumber: String(parsed.creditNoteNumber || "").trim(),
+        distributorName: normalizeDistributorName(parsed.distributorName || ""),
+        distributorGSTIN: String(parsed.distributorGSTIN || "").trim(),
+        date: String(parsed.date || ""),
+        refInvoiceNumber: String(parsed.refInvoiceNumber || "").trim(),
+        returnReason: String(parsed.returnReason || "").trim(),
+        grandTotalCreditAmount: Number(parsed.grandTotalCreditAmount) || 0,
+      };
+      lineItems = (Array.isArray(parsed.lineItems) ? parsed.lineItems : []).map((l) => ({
+        medicineName: String(l.medicineName || "").trim(),
+        hsn: String(l.hsn || "").trim(),
+        batchNumber: String(l.batchNumber || "").trim(),
+        expiryDate: String(l.expiryDate || "").trim(),
+        returnQty: Number(l.returnQty) || 0,
+        netAmount: Number(l.netAmount) || 0,
+        confidence: {
+          medicineName: Number(l.confidence && l.confidence.medicineName) || 0,
+          batchNumber: Number(l.confidence && l.confidence.batchNumber) || 0,
+          returnQty: Number(l.confidence && l.confidence.returnQty) || 0,
+        },
+      }));
+
+      // ── 4. Stage to pending_returns (raw extraction — matching runs later) ──
+      // Matching is deliberately NOT done here: it runs on "Confirm & Match" so
+      // the edited distributor / refInvoiceNumber (spec step 6) are used.
+      pendingDocId = imageId;
+      const pendingRef = db.collection("pharmacies").doc(pharmacyId).collection("pending_returns").doc(pendingDocId);
+      staged = sanitizeNumbers({ header, lineItems });
+      await pendingRef.set({
+        pharmacyId,
+        importQueueItemId: imageId,
+        storagePath,
+        status: "pending_review",
+        header,
+        lineItems,
+        matches: [],
+        matchSummary: { high: 0, ambiguous: 0, none: 0, candidatesPool: 0 },
+        rawGeminiResponse: String((result && result.response && result.response.text()) || "").slice(0, 20000),
+        readable: parsed.readable !== false,
+        issues: Array.isArray(parsed.issues) ? parsed.issues : [],
+        createdAt: FieldValue.serverTimestamp(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+
+      await queueRef.update({
+        status: "extracted",
+        documentType: "return_receipt",
+        pendingReturnId: pendingDocId,
+        completedAt: FieldValue.serverTimestamp(),
+        leaseExpiresAt: FieldValue.delete(),
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    } catch (err) {
+      return await markFailed("stage_failed", "Failed to stage return extraction: " + (err && err.message || err));
+    }
+
+    logger.info(`[processReturnReceipt] ${imageId} → extracted → pending_returns/${pendingDocId} (CN ${header.creditNoteNumber || "?"}, ${lineItems.length} items)`);
+    return { status: "extracted", pendingReturnId: pendingDocId, extracted: staged };
+  }
+);
+
+// ─── matchReturnReceipt ─────────────────────────────────────────────────────
+// The matching engine — runs on "Confirm & Match" (spec step 6), AFTER the
+// owner edits the review fields, so the edited distributor / refInvoiceNumber /
+// line fields are used. Steps:
+//   1. Resolve the distributor from distributorName and query that distributor's
+//      medicine docs first (fall back to the full pharmacy list).
+//   2. Match candidates by batchNumber (fuzzy — normalize case, strip
+//      spaces/hyphens, edit-distance <= 1) AND medicineName (fuzzy).
+//   3. refInvoiceNumber is an optional narrowing signal — never required.
+//   4. Classify each line: "high" (unambiguous, auto-staged) / "ambiguous"
+//      (top candidates for manual pick) / "none" (manual search).
+// Persists the matches onto the pending_returns doc (status "matched") and
+// returns them for the final confirm screen.
+
+exports.matchReturnReceipt = onCall(
+  {
+    region: "us-central1",
+    memory: "256MiB",
+    timeoutSeconds: 60,
+  },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Login required.");
+    }
+    const { pharmacyId, pendingReturnId, header, lineItems } = request.data || {};
+    if (!pharmacyId || !pendingReturnId) {
+      throw new HttpsError("invalid-argument", "pharmacyId and pendingReturnId are required.");
+    }
+    if (!(await isStaff(pharmacyId, request.auth.uid))) {
+      throw new HttpsError("permission-denied", "You are not staff for this pharmacy.");
+    }
+
+    const db = getFirestore();
+    const pendingRef = db.collection("pharmacies").doc(pharmacyId).collection("pending_returns").doc(pendingReturnId);
+    const prSnap = await pendingRef.get();
+    if (!prSnap.exists) {
+      throw new HttpsError("not-found", "Staged return receipt not found: " + pendingReturnId);
+    }
+    const pr = prSnap.data();
+    if (["confirmed", "discarded"].includes(pr.status || "")) {
+      throw new HttpsError("failed-precondition", `Return receipt is ${pr.status}; it can no longer be matched.`);
+    }
+
+    const prevHeader = pr.header || {};
+    const safeHeader = {
+      creditNoteNumber: String((header && header.creditNoteNumber) || prevHeader.creditNoteNumber || "").trim(),
+      distributorName: normalizeDistributorName((header && header.distributorName) || prevHeader.distributorName || ""),
+      distributorGSTIN: String((header && header.distributorGSTIN) || prevHeader.distributorGSTIN || "").trim(),
+      date: String((header && header.date) || prevHeader.date || ""),
+      refInvoiceNumber: String((header && header.refInvoiceNumber) || prevHeader.refInvoiceNumber || "").trim(),
+      returnReason: String((header && header.returnReason) || prevHeader.returnReason || "").trim(),
+      grandTotalCreditAmount: Number((header && header.grandTotalCreditAmount) != null ? header.grandTotalCreditAmount : prevHeader.grandTotalCreditAmount) || 0,
+    };
+
+    const rawLines = Array.isArray(lineItems) && lineItems.length > 0 ? lineItems : pr.lineItems;
+    const safeLines = (Array.isArray(rawLines) ? rawLines : []).map((l) => ({
+      medicineName: String(l.medicineName || "").trim(),
+      hsn: String(l.hsn || "").trim(),
+      batchNumber: String(l.batchNumber || "").trim(),
+      expiryDate: String(l.expiryDate || "").trim(),
+      returnQty: Number(l.returnQty) || 0,
+      netAmount: Number(l.netAmount) || 0,
+      confidence: {
+        medicineName: Number(l.confidence && l.confidence.medicineName) || 0,
+        batchNumber: Number(l.confidence && l.confidence.batchNumber) || 0,
+        returnQty: Number(l.confidence && l.confidence.returnQty) || 0,
+      },
+    }));
+
+    const parsed = { ...safeHeader, lineItems: safeLines };
+    const candidates = await loadReturnCandidates(pharmacyId, db, safeHeader.distributorName);
+    const matches = matchReturnLines(parsed, candidates);
+
+    const highCount = matches.filter((m) => m.match && m.match.confidence === "high").length;
+    const ambCount = matches.filter((m) => m.match && m.match.confidence === "ambiguous").length;
+    const noneCount = matches.filter((m) => !m.match || m.match.confidence === "none").length;
+    const matchSummary = { high: highCount, ambiguous: ambCount, none: noneCount, candidatesPool: candidates.length };
+
+    await pendingRef.update({
+      status: "matched",
+      header: safeHeader,
+      lineItems: safeLines,
+      matches,
+      matchSummary,
+      matchedBy: request.auth.uid,
+      matchedAt: FieldValue.serverTimestamp(),
+      updatedAt: FieldValue.serverTimestamp(),
+    });
+
+    logger.info(`[matchReturnReceipt] ${pendingReturnId} → matched (CN ${safeHeader.creditNoteNumber || "?"}, high=${highCount}, amb=${ambCount}, none=${noneCount}, pool=${candidates.length})`);
+    return { status: "matched", header: safeHeader, lineItems: safeLines, matches, matchSummary };
+  }
+);
+
+// ─── confirmReturnMatches ───────────────────────────────────────────────────
+// The FINAL confirmation for a matched return receipt. This is the ONLY code
+// path that may set a medicine record's status to "returned" (spec step 7/8) —
+// the expiry bulk bar stops at "pending_return".
+// For each line the owner approved with a medicineId:
+//   - returnQty < remaining qty  → SPLIT: reduce the live record's qty, create
+//     a returnedSplit sibling doc carrying the returned portion.
+//   - returnQty >= remaining qty → set status "returned" on the full record.
+// Writes returnDetails { creditNoteNumber, distributorName, date,
+// refInvoiceNumber, returnReason, amount } onto the returned record(s).
+//
+// decisions: [{ lineIndex, medicineId, returnQty, netAmount }]
+//   medicineId null → line skipped (owner left it unmatched).
+
+exports.confirmReturnMatches = onCall(
+  {
+    region: "us-central1",
+    memory: "256MiB",
+    timeoutSeconds: 60,
+  },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Login required.");
+    }
+
+    const { pharmacyId, pendingReturnId, decisions, header } = request.data || {};
+    if (!pharmacyId || !pendingReturnId) {
+      throw new HttpsError("invalid-argument", "pharmacyId and pendingReturnId are required.");
+    }
+    if (!Array.isArray(decisions)) {
+      throw new HttpsError("invalid-argument", "decisions must be an array.");
+    }
+    const cnNumber = String((header && header.creditNoteNumber) || "").trim();
+    if (!cnNumber) {
+      throw new HttpsError("invalid-argument", "Credit note number is required to confirm a return.");
+    }
+
+    const db = getFirestore();
+    const pendingRef = db.collection("pharmacies").doc(pharmacyId).collection("pending_returns").doc(pendingReturnId);
+
+    // ── Guard: staged doc must exist and not already be confirmed ─────────
+    const prSnap = await pendingRef.get();
+    if (!prSnap.exists) {
+      throw new HttpsError("not-found", "Staged return receipt not found: " + pendingReturnId);
+    }
+    const pr = prSnap.data();
+    if (pr.status === "confirmed") {
+      throw new HttpsError("failed-precondition", "This return receipt is already confirmed.");
+    }
+
+    const distributorName = normalizeDistributorName((header && header.distributorName) || (pr.header && pr.header.distributorName) || "");
+    const dateRaw = String((header && header.date) || (pr.header && pr.header.date) || "");
+    const refInvoiceNumber = String((header && header.refInvoiceNumber) || (pr.header && pr.header.refInvoiceNumber) || "").trim() || null;
+    const returnReason = String((header && header.returnReason) || (pr.header && pr.header.returnReason) || "").trim();
+    const dateTs = parseDateField(dateRaw);
+
+    const medColl = db.collection("pharmacies").doc(pharmacyId).collection("medicines");
+    const queueRef = db.collection("pharmacies").doc(pharmacyId).collection("importQueue").doc(pr.importQueueItemId || pendingReturnId);
+    const batch = db.batch();
+    const now = FieldValue.serverTimestamp();
+    const liveQty = new Map(); // medicineId → remainingQty as decisions apply (same doc can appear twice)
+
+    let confirmed = 0;
+    let skipped = 0;
+    const results = [];
+
+    for (const d of decisions) {
+      const medicineId = d && d.medicineId;
+      if (!medicineId) {
+        skipped++;
+        results.push({ lineIndex: d ? d.lineIndex : null, medicineId: null, applied: false, reason: "unmatched" });
+        continue;
+      }
+      const medRef = medColl.doc(medicineId);
+      const snap = await medRef.get();
+      if (!snap.exists) {
+        skipped++;
+        results.push({ lineIndex: d.lineIndex, medicineId, applied: false, reason: "not-found" });
+        continue;
+      }
+      const doc = snap.data();
+      if (["returned", "returned_to_distributor", "disposed", "written_off", "deleted"].includes(doc.status || "active")) {
+        skipped++;
+        results.push({ lineIndex: d.lineIndex, medicineId, applied: false, reason: `already ${doc.status || "active"}` });
+        continue;
+      }
+
+      const originalRemaining = liveQty.has(medicineId)
+        ? liveQty.get(medicineId)
+        : Number(doc.remainingQty ?? doc.quantityBilled) || 0;
+      const qtyReturned = Math.max(0, Math.min(Number(d.returnQty) || 0, originalRemaining));
+      if (qtyReturned <= 0) {
+        skipped++;
+        results.push({ lineIndex: d.lineIndex, medicineId, applied: false, reason: "qty 0" });
+        continue;
+      }
+
+      const netAmount = Number(d.netAmount) || 0;
+      const remainingAfter = originalRemaining - qtyReturned;
+      const fullReturn = remainingAfter <= 0;
+
+      // Spec step 7/9 returnDetails — written onto the RETURNED record(s).
+      const returnDetails = {
+        creditNoteNumber: cnNumber,
+        distributorName,
+        date: dateTs,
+        refInvoiceNumber,
+        returnReason,
+        amount: netAmount,
+      };
+      const creditNote = {
+        creditNoteNo: cnNumber,
+        distributor: distributorName,
+        creditAmount: netAmount,
+        returnedDate: dateRaw,
+      };
+
+      if (fullReturn) {
+        batch.set(medRef, {
+          status: "returned",
+          remainingQty: 0,
+          returnedQty: originalRemaining,
+          returnDetails,
+          creditNote,
+          returnedAt: now,
+          updatedAt: now,
+        }, { merge: true });
+        liveQty.set(medicineId, 0);
+      } else {
+        // Partial return → keep this doc live with the reduced stock, and
+        // create a returnedSplit sibling doc carrying the returned portion
+        // (the aggregator keys it apart from the live row). The returned
+        // record is the split doc; returnDetails live only there.
+        const cumulativeReturned = (Number(doc.returnedQty) || 0) + qtyReturned;
+        batch.set(medRef, {
+          remainingQty: remainingAfter,
+          returnedQty: cumulativeReturned,
+          creditNote,
+          updatedAt: now,
+        }, { merge: true });
+        liveQty.set(medicineId, remainingAfter);
+
+        const splitRef = medColl.doc();
+        batch.set(splitRef, {
+          medicineName: doc.medicineName || "",
+          batchNumber: doc.batchNumber || "",
+          expiryDate: doc.expiryDate || "",
+          quantityBilled: 0,
+          quantityFree: 0,
+          remainingQty: 0,
+          returnedQty: qtyReturned,
+          unitPrice: doc.unitPrice || 0,
+          netValue: doc.netValue || 0,
+          gstRate: doc.gstRate || 0,
+          gstValue: doc.gstValue || 0,
+          distributor: distributorName,
+          distributorId: distributorName,
+          invoiceId: doc.invoiceId || "",
+          invoiceNumber: doc.invoiceNumber || "",
+          invoiceDate: doc.invoiceDate || "",
+          pharmacyId,
+          status: "returned",
+          returnedSplit: true,
+          returnDetails,
+          creditNote,
+          returnedAt: now,
+          createdAt: now,
+          updatedAt: now,
+        });
+      }
+      confirmed++;
+      results.push({ lineIndex: d.lineIndex, medicineId, applied: true, fullReturn, qtyReturned });
+    }
+
+    if (confirmed > 0) {
+      await batch.commit();
+    }
+
+    // ── Lifecycle cleanup (after the write commits) ───────────────────────
+    try {
+      await pendingRef.update({
+        status: "confirmed",
+        confirmedBy: request.auth.uid,
+        confirmedAt: now,
+        updatedAt: now,
+      });
+    } catch (pendingErr) {
+      logger.warn(`[confirmReturnMatches] pending_returns update failed (non-fatal): ${pendingErr.message}`);
+    }
+    try {
+      await queueRef.update({
+        status: "confirmed",
+        confirmedBy: request.auth.uid,
+        confirmedAt: now,
+        updatedAt: now,
+      });
+    } catch (queueErr) {
+      logger.warn(`[confirmReturnMatches] importQueue update failed (non-fatal): ${queueErr.message}`);
+    }
+    const storagePath = pr.storagePath || "";
+    if (storagePath) {
+      try {
+        await getStorage().bucket().file(storagePath).delete();
+      } catch (delErr) {
+        logger.warn(`[confirmReturnMatches] Storage delete failed (non-fatal): ${delErr.message}`);
+      }
+    }
+
+    logger.info(`[confirmReturnMatches] ${pendingReturnId} → confirmed ${confirmed} line(s), skipped ${skipped} (CN ${cnNumber}) in ${pharmacyId} by ${request.auth.uid}`);
+    return { success: true, confirmed, skipped, results };
+  }
+);
+
+// ─── discardReturnReceipt ───────────────────────────────────────────────────
+// Staff-authorized permanent discard of a return receipt ("Reject" on the
+// review screen): marks the staged pending_returns doc "discarded", marks the
+// importQueue item "discarded" (terminal) and deletes the raw Storage image.
+// Refuses items that are already confirmed.
+
+exports.discardReturnReceipt = onCall(
+  {
+    region: "us-central1",
+    memory: "128MiB",
+    timeoutSeconds: 30,
+  },
+  async (request) => {
+    if (!request.auth) {
+      throw new HttpsError("unauthenticated", "Login required.");
+    }
+    const { pharmacyId, pendingReturnId } = request.data || {};
+    if (!pharmacyId || !pendingReturnId) {
+      throw new HttpsError("invalid-argument", "pharmacyId and pendingReturnId are required.");
+    }
+    if (!(await isStaff(pharmacyId, request.auth.uid))) {
+      throw new HttpsError("permission-denied", "You are not staff for this pharmacy.");
+    }
+
+    const db = getFirestore();
+    const pendingRef = db.collection("pharmacies").doc(pharmacyId).collection("pending_returns").doc(pendingReturnId);
+    const prSnap = await pendingRef.get();
+    let storagePath = "";
+    let queueItemId = pendingReturnId;
+    if (prSnap.exists) {
+      const pr = prSnap.data();
+      if (pr.status === "confirmed") {
+        throw new HttpsError("failed-precondition", "This return receipt is already confirmed and cannot be discarded.");
+      }
+      storagePath = pr.storagePath || "";
+      queueItemId = pr.importQueueItemId || pendingReturnId;
+    }
+
+    await pendingRef.set({ status: "discarded", discardedBy: request.auth.uid, updatedAt: FieldValue.serverTimestamp() }, { merge: true });
+    const queueRef = db.collection("pharmacies").doc(pharmacyId).collection("importQueue").doc(queueItemId);
+    try {
+      await queueRef.update({ status: "discarded", discardedBy: request.auth.uid, updatedAt: FieldValue.serverTimestamp() });
+    } catch (queueErr) {
+      logger.warn(`[discardReturnReceipt] importQueue update failed (non-fatal): ${queueErr.message}`);
+    }
+    if (storagePath) {
+      try {
+        await getStorage().bucket().file(storagePath).delete();
+      } catch (delErr) {
+        logger.warn(`[discardReturnReceipt] Storage delete failed (non-fatal): ${delErr.message}`);
+      }
+    }
+    logger.info(`[discardReturnReceipt] ${pendingReturnId} discarded by ${request.auth.uid}`);
+    return { success: true, discarded: pendingReturnId };
+  }
+);
 // ─── bulkUpdateMedicineStatus ────────────────────────────────────────────────
 // Lifecycle status update for medicine batch docs (the "return/credit/archive"
 // model — NOT hard deletion). A batch may span multiple medicines docs (one per
 // invoice scan), so this updates every doc in `ids` atomically in one batch.
 //
 // Allowed transitions (status field on each medicines/{id} doc):
-//   "active"                 default (no field / historical rows)
-//   "return_pending"         flagged to return, waiting on distributor
-//   "returned_to_distributor" returned; credit-note details recorded
-//   "disposed"               physically disposed (cert ref optional)
-//   "written_off"            written off as a loss (no credit expected)
-//   "deleted"                soft-delete for genuine data-entry mistakes; the
-//                            scheduledCleanup job purges these after 30 days.
+//   "active"         default (no field / historical rows)
+//   "pending_return" flagged to return, waiting on distributor acceptance
+//   "disposed"       physically disposed (cert ref optional)
+//   "written_off"    written off as a loss (no credit expected)
+//   "deleted"        soft-delete for genuine data-entry mistakes; the
+//                    scheduledCleanup job purges these after 30 days.
 //
-// When status is "returned_to_distributor", the caller should supply the
-// `credit` object (creditNoteNo, creditAmount, returnedDate) — the paper trail
-// a CA / return-tracking feature needs. When status is "disposed", an optional
-// `disposalCertRef` can be attached.
+// "returned" is deliberately NOT settable here. The ONLY path that writes a
+// medicine record's status "returned" is confirmReturnMatches (the return
+// receipt confirm flow) — the bulk "mark returned" shortcut on expired stock
+// was removed because marking it returned without a real credit note falsely
+// claims credit for stock the distributor may reject. Legacy values
+// "return_pending" / "returned_to_distributor" exist on old docs and are still
+// read by the UI, but no new write uses them.
 
 const MEDICINE_STATUSES = new Set([
   "active",
-  "return_pending",
-  "returned_to_distributor",
+  "pending_return",
   "disposed",
   "written_off",
   "deleted",
@@ -1321,12 +2198,6 @@ exports.bulkUpdateMedicineStatus = onCall(
     }
     if (!MEDICINE_STATUSES.has(status)) {
       throw new HttpsError("invalid-argument", `Unknown status: ${status}`);
-    }
-    if (status === "returned_to_distributor" && credit) {
-      const cn = String(credit.creditNoteNo || "").trim();
-      if (!cn) {
-        throw new HttpsError("invalid-argument", "Credit note number is required when marking returned.");
-      }
     }
 
     const db = getFirestore();
@@ -1354,7 +2225,7 @@ exports.bulkUpdateMedicineStatus = onCall(
     if (disposalCertRef && typeof disposalCertRef === "string") {
       update.disposalCertRef = disposalCertRef.slice(0, 500);
     }
-    if (status === "return_pending" && typeof returnNote === "string") {
+    if (status === "pending_return" && typeof returnNote === "string") {
       update.returnNote = returnNote.slice(0, 500);
     }
 
@@ -1748,6 +2619,37 @@ exports.scheduledCleanup = onSchedule(
         }
       } catch (pendingErr) {
         console.error("Cleanup pending error:", pendingErr.message);
+      }
+
+      // Clean up stale pending_returns (older than 24 hours — return receipts
+      // that were never matched/confirmed and never explicitly discarded).
+      try {
+        const returnCutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+        const returnSnap = await db
+          .collectionGroup("pending_returns")
+          .where("createdAt", "<=", returnCutoff)
+          .limit(200)
+          .get();
+        let returnDeleted = 0;
+        for (const doc of returnSnap.docs) {
+          const status = doc.data().status || "";
+          if (!["pending_review", "matched"].includes(status)) continue;
+          const storagePath = doc.data().storagePath || "";
+          await doc.ref.delete();
+          if (storagePath) {
+            try {
+              await bucket.file(storagePath).delete();
+            } catch (imgErr) {
+              console.warn(`Cleanup: could not delete return receipt image ${storagePath}: ${imgErr.message}`);
+            }
+          }
+          returnDeleted++;
+        }
+        if (returnDeleted > 0) {
+          console.log(`Cleanup: deleted ${returnDeleted} stale pending return receipt(s).`);
+        }
+      } catch (returnErr) {
+        console.error("Cleanup pending returns error:", returnErr.message);
       }
 
       // Recover importQueue items stuck in "processing" with an expired lease

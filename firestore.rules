@@ -8,6 +8,11 @@ service cloud.firestore {
     // user is signed in. Reads are auth-gated (they work); writes are opened
     // so the upload pipeline is not blocked. Tighten this once the token
     // delivery is fixed (or route writes through Cloud Functions / staff docs).
+    //
+    // Covers every per-pharmacy subcollection, including importQueue AND the
+    // return-receipt staging collection pending_returns (extraction review,
+    // matching results, and confirm decisions all live there; write access is
+    // needed for the upload/review flow exactly like importQueue).
     match /pharmacies/{pharmacyId}/{document=**} {
       allow read: if request.auth != null;
       allow write: if true;

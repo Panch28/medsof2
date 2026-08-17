@@ -9,13 +9,6 @@
       ]
     },
     {
-      "collectionGroup": "invoices",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "pHash", "order": "ASCENDING" }
-      ]
-    },
-    {
       "collectionGroup": "medicines",
       "queryScope": "COLLECTION_GROUP",
       "fields": [
