@@ -228,6 +228,13 @@ function initAuth() {
   });
 
   $("auth-logout-btn").addEventListener("click", async () => {
+    // Tear down all live Firestore listeners so they reconnect fresh on next
+    // login — without this, the old onSnapshot fires a permission error when
+    // auth drops, and subscribeExpiringMedicines() returns early on re-login
+    // because expiringUnsub is still set, leaving the stale error in the DOM.
+    if (expiringUnsub) { expiringUnsub(); expiringUnsub = null; }
+    if (distributorsUnsub) { distributorsUnsub(); distributorsUnsub = null; }
+    if (pendingUnsub) { pendingUnsub(); pendingUnsub = null; }
     await signOut(auth);
     confirmationResult = null;
     showScreen("auth-screen");
